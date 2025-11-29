@@ -7,21 +7,52 @@ namespace fs = ghc::filesystem;
 GPUS::GPUS() {
     std::set<std::string> gpu_entries;
 
+#if defined(__ANDROID__)
+    try {
+        fs::path drm_root{"/sys/class/drm"};
+
+        std::error_code ec;
+        if (!fs::exists(drm_root, ec) || ec) {
+            SPDLOG_WARN(
+                "/sys/class/drm not accessible on Android (exists={} ec={})",
+                fs::exists(drm_root) ? "true" : "false",
+                ec ? ec.message() : "none"
+            );
+            return;
+        }
+
+        for (const auto& entry : fs::directory_iterator(drm_root)) {
+            if (!entry.is_directory())
+                continue;
+
+            std::string node_name = entry.path().filename().string();
+
+            if (node_name.rfind("renderD", 0) != 0 || node_name.length() <= 7)
+                continue;
+
+            std::string render_number = node_name.substr(7);
+            if (std::all_of(render_number.begin(), render_number.end(), ::isdigit))
+                gpu_entries.insert(node_name);
+        }
+    } catch (const fs::filesystem_error& ex) {
+        SPDLOG_WARN("Android: failed to enumerate /sys/class/drm: {}", ex.what());
+        return;
+    }
+#else
     for (const auto& entry : fs::directory_iterator("/sys/class/drm")) {
         if (!entry.is_directory())
             continue;
 
         std::string node_name = entry.path().filename().string();
 
-        // Check if the directory is a render node (e.g., renderD128, renderD129, etc.)
-        if (node_name.find("renderD") == 0 && node_name.length() > 7) {
-            // Ensure the rest of the string after "renderD" is numeric
-            std::string render_number = node_name.substr(7);
-            if (std::all_of(render_number.begin(), render_number.end(), ::isdigit)) {
-                gpu_entries.insert(node_name);  // Store the render entry
-            }
-        }
+        if (node_name.rfind("renderD", 0) != 0 || node_name.length() <= 7)
+            continue;
+
+        std::string render_number = node_name.substr(7);
+        if (std::all_of(render_number.begin(), render_number.end(), ::isdigit))
+            gpu_entries.insert(node_name);
     }
+#endif
 
     // Now process the sorted GPU entries
     uint8_t idx = 0, total_active = 0;
