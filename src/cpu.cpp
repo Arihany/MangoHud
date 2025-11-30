@@ -18,6 +18,7 @@
 #include <chrono>
 #include <unistd.h>
 #include <unordered_map>
+#include <dirent.h>
 #endif
 
 #ifndef TEST_ONLY
@@ -41,11 +42,6 @@
 #endif
 
 #ifdef __ANDROID__
-
-#include <chrono>
-#include <dirent.h>
-#include <unistd.h>
-
 namespace {
 
 struct CoreCtlEntry {
@@ -212,53 +208,6 @@ static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& ou
     return true;
 }
 
-// Android: enumerate cpu cores from /sys/devices/system/cpu (cpu0, cpu1, ...)
-// (누락되었던 함수 복구)
-static bool android_enumerate_cpus(std::vector<CPUData>& out, CPUData& total)
-{
-    const char* base = "/sys/devices/system/cpu";
-    DIR* dir = opendir(base);
-    if (!dir) {
-        SPDLOG_ERROR("Android CPU: failed to open {}", base);
-        return false;
-    }
-
-    out.clear();
-    struct dirent* ent = nullptr;
-
-    while ((ent = readdir(dir)) != nullptr) {
-        const char* name = ent->d_name;
-        if (strncmp(name, "cpu", 3) != 0)
-            continue;
-
-        char* end = nullptr;
-        long id = strtol(name + 3, &end, 10);
-        if (!end || *end != '\0')
-            continue;
-        if (id < 0 || id > 1024) // sane bound
-            continue;
-
-        CPUData cpu{};
-        cpu.cpu_id     = static_cast<int>(id);
-        cpu.totalTime  = 1;
-        cpu.totalPeriod = 1;
-        out.push_back(cpu);
-    }
-
-    closedir(dir);
-
-    std::sort(out.begin(), out.end(),
-              [](const CPUData& a, const CPUData& b){ return a.cpu_id < b.cpu_id; });
-
-    total = {};
-    total.totalTime  = 1;
-    total.totalPeriod = 1;
-
-    SPDLOG_INFO("Android CPU: detected {} cores from sysfs", out.size());
-    return !out.empty();
-}
-
-
 // ===== /proc/self/stat 기반 total CPU fallback =====
 
 static long g_clk_tck = 0;
@@ -367,6 +316,7 @@ static bool android_update_total_cpu_fallback(CPUData &total,
 }
 
 } // namespace
+
 #endif // __ANDROID__
 
 static void calculateCPUData(CPUData& cpuData,
@@ -895,19 +845,19 @@ static bool find_fallback_input(const std::string& path, const char* input_prefi
 static void check_thermal_zones(std::string& path, std::string& input) {
     std::string sysfs_thermal = "/sys/class/thermal/";
 
-    if (!fs::exists(sysfs_thermal))
+    if (!ghc::filesystem::exists(sysfs_thermal))
         return;
 
-    for (auto& d : fs::directory_iterator(sysfs_thermal)) {
+    for (auto& d : ghc::filesystem::directory_iterator(sysfs_thermal)) {
         if (d.path().filename().string().substr(0, 12) != "thermal_zone")
             continue;
 
-        std::string type = read_line(d / "type");
+        std::string type = read_line(d.path() / "type");
         if (type.substr(0, 6) != "cpuss-")
             continue;
 
-        path = d.path();
-        input = d / "temp";
+        path  = d.path().string();
+        input = (d.path() / "temp").string();
 
         return;
     }
@@ -1124,7 +1074,7 @@ bool CPUStats::GetCpuFile() {
     if (path.empty()) {
         try {
             check_thermal_zones(path, input);
-        } catch (fs::filesystem_error& ex) {
+        } catch (ghc::filesystem::filesystem_error& ex) {
             SPDLOG_DEBUG("check_thermal_zones: {}", ex.what());
         }
     }
