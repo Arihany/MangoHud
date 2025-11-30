@@ -52,10 +52,10 @@ struct CoreCtlEntry {
     bool has_online = false;
 };
 
-static bool g_backend_logged_corectl   = false;
-static bool g_backend_logged_fallback  = false;
-static bool g_backend_logged_disabled  = false;
+static bool g_logged_corectl_summary = false;
+static bool g_logged_fallback_once   = false;
 
+// ANDROID: sysfs 기반 CPU 코어 enum
 // ANDROID: sysfs 기반 CPU 코어 enum
 static bool android_enumerate_cpus(std::vector<CPUData>& out, CPUData& total)
 {
@@ -101,8 +101,8 @@ static bool android_enumerate_cpus(std::vector<CPUData>& out, CPUData& total)
 
     for (int id : ids) {
         CPUData cpu{};          // zero-init
-        cpu.cpu_id     = id;
-        cpu.percent    = 0.0f;
+        cpu.cpu_id      = id;
+        cpu.percent     = 0.0f;
         cpu.totalPeriod = 0;
         out.push_back(cpu);
     }
@@ -159,7 +159,8 @@ static bool probe_core_ctl_sources()
 
         if (access(path.c_str(), R_OK) == 0) {
             CoreCtlSource src;
-            src.path = std::move(path);
+            src.path = path;
+            SPDLOG_INFO("core_ctl: discovered global_state at {}", src.path);
             g_corectl_sources.push_back(std::move(src));
         }
     }
@@ -174,6 +175,7 @@ static bool probe_core_ctl_sources()
     return true;
 }
 
+// 2) Busy% / Online 파싱 (여러 global_state를 전부 합쳐서 out에 넣는다)
 static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& out)
 {
     if (!probe_core_ctl_sources())
@@ -192,9 +194,6 @@ static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& ou
     };
 
     for (auto& src : g_corectl_sources) {
-        // 어떤 파일을 읽는지 로그
-        SPDLOG_DEBUG("core_ctl: reading global_state {}", src.path);
-
         if (!src.stream || !src.stream->is_open()) {
             src.stream = std::make_unique<std::ifstream>(src.path);
             if (!src.stream->is_open()) {
@@ -208,6 +207,8 @@ static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& ou
         file.clear();
         file.seekg(0, std::ios::beg);
 
+        SPDLOG_DEBUG("core_ctl: parsing {}", src.path);
+
         std::string line;
         int current_cpu = -1;
 
@@ -216,14 +217,8 @@ static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& ou
             if (line.empty())
                 continue;
 
-            // 일부 기기에서 "cpu0" (소문자)일 가능성도 있어서 대소문자 모두 허용
-            bool is_cpu_header = false;
-            if (line.size() >= 3) {
-                if (line.rfind("CPU", 0) == 0 || line.rfind("cpu", 0) == 0)
-                    is_cpu_header = true;
-            }
-
-            if (is_cpu_header) {
+            // "CPU0" / "CPU1" / "CPU 0" 등 허용
+            if (starts_with(line, "CPU")) {
                 std::string rest = line.substr(3);
                 trim(rest);
                 int id = -1;
@@ -236,7 +231,6 @@ static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& ou
                 current_cpu = id;
                 auto& e = out[id];
                 e.cpu_id = id;
-                SPDLOG_DEBUG("core_ctl: [{}] new CPU entry: cpu{}", src.path, id);
                 continue;
             }
 
@@ -258,29 +252,16 @@ static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& ou
             auto& e = it->second;
 
             int v = 0;
-
-            // key를 소문자로 내려서 다양한 변형 허용 (online / Online / busy% / Busy% 등)
-            std::string key_lower = key;
-            std::transform(key_lower.begin(), key_lower.end(), key_lower.begin(), ::tolower);
-
-            if (key_lower == "online") {
+            if (key == "Online") {
                 if (try_stoi(v, val)) {
                     e.online     = v;
                     e.has_online = true;
-                    SPDLOG_DEBUG("core_ctl: [{}] cpu{} Online = {} (raw='{}')",
-                                 src.path, current_cpu, v, val);
                 }
-            } else if (key_lower == "busy%") {
+            } else if (key == "Busy%") {
                 if (try_stoi(v, val)) {
                     e.busy     = v;
                     e.has_busy = true;
-                    SPDLOG_DEBUG("core_ctl: [{}] cpu{} Busy%% = {} (raw='{}')",
-                                 src.path, current_cpu, v, val);
                 }
-            } else {
-                // 나중에 패턴 분석용
-                SPDLOG_TRACE("core_ctl: [{}] cpu{} unknown key '{}' val '{}'",
-                             src.path, current_cpu, key, val);
             }
         }
     }
@@ -290,14 +271,18 @@ static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& ou
         return false;
     }
 
-    // 최종적으로 어떤 엔트리들이 있는지 한 번 정리해서 보여줌
+    int busy_cnt   = 0;
+    int online_cnt = 0;
     for (const auto& kv : out) {
         const auto& e = kv.second;
-        SPDLOG_DEBUG("core_ctl: entry cpu{} busy={} online={} has_busy={} has_online={}",
-                     e.cpu_id, e.busy, e.online, e.has_busy, e.has_online);
+        if (e.has_busy)
+            busy_cnt++;
+        if (e.has_online && e.online)
+            online_cnt++;
     }
 
-    SPDLOG_DEBUG("core_ctl: parsed {} CPU entries total", out.size());
+    SPDLOG_INFO("core_ctl: parsed {} CPU entries (has Busy%={}, online>0={})",
+                out.size(), busy_cnt, online_cnt);
     return true;
 }
 
@@ -308,6 +293,7 @@ static bool g_proc_cpu_inited = false;
 static double g_last_proc_cpu = 0.0;
 static std::chrono::steady_clock::time_point g_last_proc_ts;
 
+// /proc/self/stat에서 utime+stime을 초 단위로 읽어오기
 // /proc/self/stat에서 utime+stime을 초 단위로 읽어오기
 static bool android_read_self_cpu_time(double &out_sec)
 {
@@ -373,7 +359,7 @@ static bool android_update_total_cpu_fallback(CPUData &total,
         g_last_proc_ts    = now_ts;
         total.percent     = 0.0f;
         total.totalPeriod = 0;
-        SPDLOG_INFO("Android CPU: init /proc/self/stat fallback");
+        SPDLOG_DEBUG("Android CPU: init /proc/self/stat fallback");
         return true;
     }
 
@@ -967,13 +953,11 @@ bool CPUStats::UpdateCPUData()
     static auto last_ts = std::chrono::steady_clock::time_point{};
     auto now = std::chrono::steady_clock::now();
 
-    // 너무 자주 돌지 않게 최소 주기 제한
     if (last_ts.time_since_epoch().count() != 0) {
         auto delta_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(now - last_ts).count();
 
         if (delta_ms < ANDROID_CPU_MIN_UPDATE_MS) {
-            // 이전 값 그대로 재사용
             return m_updatedCPUs;
         }
     }
@@ -982,18 +966,13 @@ bool CPUStats::UpdateCPUData()
     std::unordered_map<int, CoreCtlEntry> corectl;
     bool have_corectl = read_core_ctl_global_state(corectl);
 
-    SPDLOG_DEBUG("Android CPU: read_core_ctl_global_state -> have_corectl={} entries={}",
-                 have_corectl, corectl.size());
-
     float total_percent = 0.0f;
     int   count_online  = 0;
 
-    // ===== 1) core_ctl Busy% 백엔드 시도 =====
     if (have_corectl) {
         for (auto &cpu : m_cpuData) {
             auto it = corectl.find(cpu.cpu_id);
             if (it == corectl.end()) {
-                SPDLOG_DEBUG("Android CPU: no core_ctl entry for cpu{}", cpu.cpu_id);
                 cpu.percent       = 0.0f;
                 cpu.totalPeriod   = 0;
                 cpu.userPeriod    = 0;
@@ -1004,18 +983,7 @@ bool CPUStats::UpdateCPUData()
             const auto &e = it->second;
             bool online = !e.has_online || e.online != 0;
 
-            if (!online) {
-                SPDLOG_DEBUG("Android CPU: cpu{} marked offline in core_ctl (online={}, has_online={})",
-                             cpu.cpu_id, e.online, e.has_online);
-                cpu.percent       = 0.0f;
-                cpu.totalPeriod   = 0;
-                cpu.userPeriod    = 0;
-                cpu.idleAllPeriod = 0;
-                continue;
-            }
-
-            if (!e.has_busy) {
-                SPDLOG_DEBUG("Android CPU: cpu{} has no Busy%% field in core_ctl", cpu.cpu_id);
+            if (!online || !e.has_busy) {
                 cpu.percent       = 0.0f;
                 cpu.totalPeriod   = 0;
                 cpu.userPeriod    = 0;
@@ -1036,27 +1004,32 @@ bool CPUStats::UpdateCPUData()
     }
 
     if (have_corectl && count_online > 0) {
-        // ★ hacky core_ctl Busy% 경로 사용 로그 (한 번만)
-        if (!g_backend_logged_corectl) {
-            g_backend_logged_corectl = true;
-            SPDLOG_INFO(
-                "Android CPU: using core_ctl Busy%% backend (online_cpus={}, sources={})",
-                count_online,
-                static_cast<int>(g_corectl_sources.size())
-            );
-            for (const auto& src : g_corectl_sources) {
-                SPDLOG_INFO("Android CPU: core_ctl source: {}", src.path);
-            }
-        }
-
         m_cpuDataTotal.percent     = total_percent / static_cast<float>(count_online);
         m_cpuDataTotal.totalPeriod = 100;
         m_cpuPeriod   = 1.0;
         m_updatedCPUs = true;
+
+        if (!g_logged_corectl_summary) {
+            SPDLOG_INFO(
+                "Android CPU: using core_ctl Busy%% path (entries={}, online+Busy%% cores={} / total cores={})",
+                corectl.size(), count_online, m_cpuData.size());
+            g_logged_corectl_summary = true;
+        }
+
         return true;
     }
 
-    // ===== 2) core_ctl 실패: per-core는 죽이고 total만 fallback =====
+    // 여기서부터는 hack fallback:
+    // per-core hack(core_ctl)이 터졌으므로 코어별 %는 전부 죽이고,
+    // total CPU만 /proc/self/stat 기반으로 근사한다.
+    if (!g_logged_fallback_once) {
+        SPDLOG_INFO(
+            "Android CPU: core_ctl unusable (have_corectl={} online+Busy%% cores={}), "
+            "switching to /proc/self/stat fallback (total-only)",
+            have_corectl, count_online);
+        g_logged_fallback_once = true;
+    }
+
     for (auto &cpu : m_cpuData) {
         cpu.percent       = 0.0f;
         cpu.totalPeriod   = 0;
@@ -1067,23 +1040,12 @@ bool CPUStats::UpdateCPUData()
     if (android_update_total_cpu_fallback(m_cpuDataTotal, m_cpuData)) {
         m_cpuPeriod   = 1.0;
         m_updatedCPUs = true;
-
-        // ★ /proc/self/stat fallback 백엔드 사용 로그 (한 번만, INFO)
-        if (!g_backend_logged_fallback) {
-            g_backend_logged_fallback = true;
-            SPDLOG_INFO("Android CPU: using /proc/self/stat fallback backend (total only)");
-        }
+        // 세부 수치는 DEBUG 로그에서만
         return true;
     }
 
-    // ===== 3) fallback도 실패: 경고 도배 대신 DEBUG 한 번만 =====
-    if (!g_backend_logged_disabled) {
-        g_backend_logged_disabled = true;
-        SPDLOG_DEBUG(
-            "Android CPU: no core_ctl and /proc/self/stat fallback failed, CPU stats disabled"
-        );
-    }
-
+    // fallback도 실패하면 이것도 DEBUG로 내려서 도배 방지
+    SPDLOG_DEBUG("Android CPU: no core_ctl and fallback failed, CPU stats disabled");
     m_cpuDataTotal.percent     = 0.0f;
     m_cpuDataTotal.totalPeriod = 0;
     m_cpuPeriod   = 0.0;
@@ -1091,7 +1053,7 @@ bool CPUStats::UpdateCPUData()
     return false;
 
 #else
-    // ===== 이하 기존 리눅스 /proc/stat 코드 그대로 =====
+    // ===== 이하 기존 리눅스 /proc/stat 코드 =====
     unsigned long long int usertime, nicetime, systemtime, idletime;
     unsigned long long int ioWait, irq, softIrq, steal, guest, guestnice;
     int cpuid = -1;
