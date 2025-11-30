@@ -8,6 +8,15 @@
 #include "timing.hpp"
 #include "logging.h"
 #include "keybinds.h"
+
+#ifdef __ANDROID__
+template <typename T>
+static bool keys_are_pressed(const T &)
+{
+    return false;
+}
+#endif
+
 #include "fps_metrics.h"
 #include "fps_limiter.h"
 
