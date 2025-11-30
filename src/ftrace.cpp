@@ -15,6 +15,12 @@ namespace FTrace {
 FTrace::FTrace(const overlay_params::ftrace_options& options) {
    assert(options.enabled);
 
+#if defined(__ANDROID__)
+   SPDLOG_INFO("ftrace: disabled on Android (skipping trace_pipe)");
+   trace_pipe_fd = -1;
+   return;
+#endif
+
    trace_pipe_fd = open("/sys/kernel/tracing/trace_pipe", O_RDONLY | O_NONBLOCK);
    if (trace_pipe_fd == -1) {
        SPDLOG_ERROR("could not open ftrace pipe: {}", strerror(errno));
@@ -65,14 +71,23 @@ void FTrace::ftrace_thread()
         size_t size { 0 };
     } buffer;
 
+    if (trace_pipe_fd < 0) {
+        SPDLOG_DEBUG("FTrace thread started without valid trace_pipe_fd, exiting");
+        return;
+    }
+
     while (!stop_thread) {
         struct pollfd fd = {
             .fd = trace_pipe_fd,
             .events = POLLIN,
             .revents = 0,
         };
+
+        // 500ms 타임아웃 유지 (이미 안전 범위)
         int ret = poll(&fd, 1, 500);
         if (ret < 0) {
+            if (errno == EINTR)
+                continue;  // 시그널에 깨진 건 그냥 다시
             SPDLOG_ERROR("FTrace: polling on trace_pipe failed: {}", strerror(errno));
             break;
         }
@@ -80,11 +95,18 @@ void FTrace::ftrace_thread()
         if (!(fd.revents & POLLIN))
             continue;
 
-        ssize_t size_read = read(trace_pipe_fd, &buffer.data[buffer.size], buffer.data.size() - buffer.size);
+        ssize_t size_read = read(trace_pipe_fd,
+                                 &buffer.data[buffer.size],
+                                 buffer.data.size() - buffer.size);
         if (size_read < 0) {
+            if (errno == EINTR)
+                continue;  // 마찬가지로 시그널이면 다시
             SPDLOG_ERROR("FTrace: reading from trace_pipe failed: {}", strerror(errno));
             break;
         }
+        if (size_read == 0)
+            continue; // EOF 혹은 일시적, 버퍼 유지하고 다음 poll
+
         buffer.size += size_t(size_read);
 
         {
@@ -96,7 +118,7 @@ void FTrace::ftrace_thread()
                 if (newline_it == end_it)
                     break;
 
-                handle_ftrace_entry(std::string { it, size_t(std::distance(it, newline_it)) });
+                handle_ftrace_entry(std::string{ it, size_t(std::distance(it, newline_it)) });
                 it = std::next(newline_it, 1);
             }
 
