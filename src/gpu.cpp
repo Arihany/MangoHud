@@ -7,37 +7,66 @@ namespace fs = ghc::filesystem;
 GPUS::GPUS() {
     std::set<std::string> gpu_entries;
 
-#if defined(__ANDROID__)
-    try {
-        fs::path drm_root{"/sys/class/drm"};
 
-        std::error_code ec;
-        if (!fs::exists(drm_root, ec) || ec) {
-            SPDLOG_WARN(
-                "/sys/class/drm not accessible on Android (exists={} ec={})",
-                fs::exists(drm_root) ? "true" : "false",
-                ec ? ec.message() : "none"
+#if defined(__ANDROID__)
+    const fs::path drm_root{"/sys/class/drm"};
+    std::error_code ec;
+
+    const bool exists = fs::exists(drm_root, ec);
+
+    if (!exists || ec) {
+        if (ec == std::errc::permission_denied) {
+            SPDLOG_DEBUG(
+                "Android: skipping {} enumeration (permission denied)",
+                drm_root.string()
             );
-            return;
+        } else if (!exists && !ec) {
+            SPDLOG_DEBUG(
+                "Android: {} does not exist, skipping DRM GPU discovery",
+                drm_root.string()
+            );
+        } else {
+            SPDLOG_WARN(
+                "Android: error probing {}: {}",
+                drm_root.string(),
+                ec ? ec.message() : "no error_code"
+            );
         }
 
-        for (const auto& entry : fs::directory_iterator(drm_root)) {
+    } else {
+        fs::directory_iterator it{drm_root, ec};
+        fs::directory_iterator end{};
+
+        for (; !ec && it != end; it.increment(ec)) {
+            const auto& entry = *it;
             if (!entry.is_directory())
                 continue;
 
-            std::string node_name = entry.path().filename().string();
+            const std::string node_name = entry.path().filename().string();
 
             if (node_name.rfind("renderD", 0) != 0 || node_name.length() <= 7)
                 continue;
 
-            std::string render_number = node_name.substr(7);
+            const std::string render_number = node_name.substr(7);
             if (std::all_of(render_number.begin(), render_number.end(), ::isdigit))
                 gpu_entries.insert(node_name);
         }
-    } catch (const fs::filesystem_error& ex) {
-        SPDLOG_WARN("Android: failed to enumerate /sys/class/drm: {}", ex.what());
-        return;
+
+        if (ec == std::errc::permission_denied) {
+            SPDLOG_DEBUG(
+                "Android: permission denied while iterating {} – treating as no DRM GPUs",
+                drm_root.string()
+            );
+            gpu_entries.clear();
+        } else if (ec) {
+            SPDLOG_WARN(
+                "Android: error while iterating {}: {}",
+                drm_root.string(),
+                ec.message()
+            );
+        }
     }
+
 #else
     for (const auto& entry : fs::directory_iterator("/sys/class/drm")) {
         if (!entry.is_directory())
