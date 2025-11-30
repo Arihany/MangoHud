@@ -74,6 +74,70 @@ static bool read_android_core_ctl_busy(int &busy)
     return false;
 }
 
+static bool read_android_core_ctl_busy_for_cpu(int cpu_id, int &busy, bool &online)
+{
+    std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(cpu_id) + "/core_ctl/global_state";
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        SPDLOG_DEBUG("core_ctl: failed to open {}", path);
+        return false;
+    }
+
+    std::string line;
+    if (!std::getline(file, line)) {
+        SPDLOG_DEBUG("core_ctl: empty {}", path);
+        return false;
+    }
+
+    // 기본값: online = true
+    online = true;
+
+    // Online: N 파싱
+    {
+        auto pos = line.find("Online");
+        if (pos != std::string::npos) {
+            auto colon = line.find(':', pos);
+            if (colon != std::string::npos) {
+                std::string val = line.substr(colon + 1);
+                auto first = val.find_first_not_of(" \t\r\n");
+                auto last  = val.find_last_not_of(" \t\r\n");
+                if (first != std::string::npos && last != std::string::npos) {
+                    val = val.substr(first, last - first + 1);
+                    int online_int = 0;
+                    if (try_stoi(online_int, val))
+                        online = (online_int != 0);
+                }
+            }
+        }
+    }
+
+    // Busy%: N 파싱
+    auto pos = line.find("Busy%");
+    if (pos == std::string::npos) {
+        SPDLOG_DEBUG("core_ctl: Busy% not found in {}", path);
+        return false;
+    }
+
+    auto colon = line.find(':', pos);
+    if (colon == std::string::npos)
+        return false;
+
+    std::string val = line.substr(colon + 1);
+    auto first = val.find_first_not_of(" \t\r\n");
+    auto last  = val.find_last_not_of(" \t\r\n");
+    if (first == std::string::npos || last == std::string::npos)
+        return false;
+    val = val.substr(first, last - first + 1);
+
+    if (!try_stoi(busy, val)) {
+        SPDLOG_DEBUG("core_ctl: failed to parse Busy% from '{}' for {}", val, path);
+        return false;
+    }
+
+    SPDLOG_DEBUG("core_ctl: cpu{} Busy% = {}, online={}", cpu_id, busy, online);
+    return true;
+}
+
 #if defined(__ANDROID__)
 // Android: enumerate cpu cores from /sys/devices/system/cpu (cpu0, cpu1, ...)
 static bool android_enumerate_cpus(std::vector<CPUData>& out, CPUData& total)
@@ -273,32 +337,42 @@ bool CPUStats::UpdateCPUData()
         return false;
 
 #if defined(__ANDROID__)
-    int busy = -1;
-    if (!read_android_core_ctl_busy(busy)) {
-        SPDLOG_DEBUG("Android CPU: core_ctl Busy% not available, zeroing usage");
-        for (auto &cpu : m_cpuData)
-            cpu.percent = 0.0f;
-        m_cpuDataTotal.percent = 0.0f;
-
-        m_cpuPeriod = m_cpuData.empty() ? 0.0 : 1.0;
-        m_updatedCPUs = true;
-        return true;
-    }
-
-    float p = std::clamp(static_cast<float>(busy), 0.0f, 100.0f);
+    // Android / Winlator:
+    // 코어별 core_ctl Busy%로 per-core usage 계산.
+    float total_percent = 0.0f;
+    int counted = 0;
 
     for (auto &cpu : m_cpuData) {
-        cpu.percent = p;
+        int  busy   = 0;
+        bool online = true;
 
-        cpu.totalPeriod = 100;
-        cpu.userPeriod  = static_cast<unsigned long long>(p);
+        if (!read_android_core_ctl_busy_for_cpu(cpu.cpu_id, busy, online)) {
+            // 이 코어는 core_ctl 정보 없음 → 0%로 취급
+            cpu.percent = 0.0f;
+        } else if (!online) {
+            // offline 코어
+            cpu.percent = 0.0f;
+        } else {
+            float p = std::clamp(static_cast<float>(busy), 0.0f, 100.0f);
+            cpu.percent = p;
+            total_percent += p;
+            counted++;
+        }
+
+        // period 쪽은 그냥 형식 맞춰서 채워줌 (실제 그래프에서는 percent만 씀)
+        cpu.totalPeriod   = 100;
+        cpu.userPeriod    = static_cast<unsigned long long>(cpu.percent);
         cpu.idleAllPeriod = 100 - cpu.userPeriod;
     }
 
-    m_cpuDataTotal.percent = p;
+    if (counted > 0)
+        m_cpuDataTotal.percent = total_percent / static_cast<float>(counted);
+    else
+        m_cpuDataTotal.percent = 0.0f;
+
     m_cpuDataTotal.totalPeriod = 100;
 
-    m_cpuPeriod = 1.0;
+    m_cpuPeriod   = 1.0;
     m_updatedCPUs = true;
     return true;
 #else
