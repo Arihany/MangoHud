@@ -7,36 +7,59 @@
 #include "config.h"
 #include "notify.h"
 
-#define EVENT_SIZE  ( sizeof (struct inotify_event) )
-#define EVENT_BUF_LEN     ( 1024 * ( EVENT_SIZE + 16 ) )
+#define EVENT_SIZE   (sizeof(struct inotify_event))
+#define EVENT_BUF_LEN (1024 * (EVENT_SIZE + 16))
 
 static void fileChanged(notify_thread *nt) {
-    int length, i = 0;
     char buffer[EVENT_BUF_LEN];
     overlay_params local_params = *nt->params;
 
     while (!nt->quit) {
-        length = read( nt->fd, buffer, EVENT_BUF_LEN );
+        // 논블로킹 read 결과 체크
+        int length = read(nt->fd, buffer, EVENT_BUF_LEN);
+        if (length <= 0) {
+            // EAGAIN 등: 이벤트 없음 -> 500ms 슬립 후 재시도
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            continue;
+        }
+
+        int i = 0;
         while (i < length) {
-            struct inotify_event *event =
-                (struct inotify_event *) &buffer[i];
+            auto *event = reinterpret_cast<struct inotify_event *>(&buffer[i]);
             i += EVENT_SIZE + event->len;
-            if (event->mask & IN_MODIFY || event->mask & IN_DELETE_SELF) {
-                // In the case of IN_DELETE_SELF, some editors may do a save-to-temp-file/delete-original/move-temp-file
-                // so sleep a little to let file to be replaced
+
+            if (event->mask & (IN_MODIFY | IN_DELETE_SELF)) {
+                // 파일 덮어쓰기 여유 시간
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                parse_overlay_config(&local_params, getenv("MANGOHUD_CONFIG"), false);
-                if ((event->mask & IN_DELETE_SELF) || (nt->params->config_file_path != local_params.config_file_path)) {
-                    SPDLOG_DEBUG("Watching config file: {}", local_params.config_file_path.c_str());
+
+                parse_overlay_config(&local_params,
+                                     getenv("MANGOHUD_CONFIG"),
+                                     false);
+
+                // 파일이 삭제 후 새 파일로 교체되었거나, 경로가 바뀐 경우 watch 교체
+                if ((event->mask & IN_DELETE_SELF) ||
+                    (nt->params->config_file_path != local_params.config_file_path)) {
+
+                    SPDLOG_DEBUG("Watching config file: {}",
+                                 local_params.config_file_path.c_str());
+
                     inotify_rm_watch(nt->fd, nt->wd);
-                    nt->wd = inotify_add_watch(nt->fd, local_params.config_file_path.c_str(), IN_MODIFY | IN_DELETE_SELF);
+                    nt->wd = inotify_add_watch(
+                        nt->fd,
+                        local_params.config_file_path.c_str(),
+                        IN_MODIFY | IN_DELETE_SELF
+                    );
                 }
-                std::lock_guard<std::mutex> lk(nt->mutex);
-                *nt->params = local_params;
+
+                {
+                    std::lock_guard<std::mutex> lk(nt->mutex);
+                    *nt->params = local_params;
+                }
             }
         }
-        i = 0;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        // 이벤트 한 번 털었으면 최소 500ms 쉰다
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 }
 
