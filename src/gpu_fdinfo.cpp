@@ -23,8 +23,6 @@ const std::vector<std::string> kIntelThrottleTemp = {
     "reason_vr_thermalert"
 };
 
-}
-
 int GPU_fdinfo::kgsl_freq_norm_mode = -1;
 
 namespace fs = ghc::filesystem;
