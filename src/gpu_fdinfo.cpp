@@ -167,7 +167,7 @@ void GPU_fdinfo::find_hwmon_sensors()
     std::string hwmon;
 
 #if defined(__ANDROID__)
-    // Adreno(msm_drm) kgsl/thermal
+    // for thermal zone
     if (module == "msm_drm") {
         SPDLOG_DEBUG("hwmon: skipping hwmon scan for msm_drm on Android (using kgsl/thermal)");
         return;
@@ -650,8 +650,8 @@ void GPU_fdinfo::init_kgsl() {
     };
 
     const KgslFile candidates[] = {
-        { "busy",  { "gpubusy", "gpu_busy_percent", "gpu_busy_percentage" } },
-        { "temp",  { "temp", "gpu_temp" } },
+        { "busy",  { "gpu_busy_percentage", "gpu_busy_percent", "gpubusy" } },
+        // no temp
         { "clock", { "clock_mhz", "gpuclk" } },
     };
 
@@ -659,26 +659,27 @@ void GPU_fdinfo::init_kgsl() {
         for (const char* fname : c.names) {
             std::string p = sys_path + "/" + fname;
 
-            if (!fs::exists(p))
+            std::error_code ec;
+            if (!fs::exists(p, ec) || ec) {
+                if (ec == std::errc::permission_denied) {
+                    SPDLOG_DEBUG("kgsl: permission denied for {}", p);
+                }
                 continue;
-
-            if (c.logical == std::string("clock")) {
-                gpu_clock_stream.open(p);
-                if (!gpu_clock_stream.good()) {
-                    SPDLOG_WARN("kgsl: failed to open {} (clock), trying next candidate", p);
-                    continue;
-                }
-            } else {
-                auto& stream = kgsl_streams[c.logical];
-                stream.open(p);
-                if (!stream.good()) {
-                    SPDLOG_WARN("kgsl: failed to open {} ({}), trying next candidate",
-                                p, c.logical);
-                    continue;
-                }
             }
 
             SPDLOG_INFO("kgsl: using {} for {}", p, c.logical);
+
+            if (c.logical == std::string("clock")) {
+                gpu_clock_stream.open(p);
+                if (!gpu_clock_stream.good())
+                    SPDLOG_WARN("kgsl: failed to open {}", p);
+            } else { // "busy"
+                auto& stream = kgsl_streams[c.logical];
+                stream.open(p);
+                if (!stream.good())
+                    SPDLOG_WARN("kgsl: failed to open {}", p);
+            }
+
             break;
         }
     }
@@ -699,25 +700,6 @@ int GPU_fdinfo::get_kgsl_load() {
         return 0;
 
     return std::stoi(usage_str);
-}
-
-int GPU_fdinfo::get_kgsl_temp()
-{
-    auto it = kgsl_streams.find("temp");
-    if (it == kgsl_streams.end() || !it->second.is_open())
-        return 0;
-
-    std::ifstream& s = it->second;
-    std::string temp_str;
-
-    s.seekg(0);
-    std::getline(s, temp_str);
-
-    if (temp_str.empty())
-        return 0;
-
-    // kgsl temp는 보통 milli-degree
-    return std::round(std::stoi(temp_str) / 1'000.f);
 }
 
 void GPU_fdinfo::main_thread()
@@ -755,10 +737,11 @@ void GPU_fdinfo::main_thread()
         metrics.CoreClock = get_gpu_clock();
         metrics.voltage = hwmon_sensors["voltage"].val;
 
-        if (module == "msm_drm")
-            metrics.temp = get_kgsl_temp();
-        else
+        if (module == "msm_drm") {
+            metrics.temp = 0.0f;
+        } else {
             metrics.temp = hwmon_sensors["temp"].val / 1000.f;
+        }
 
         metrics.memory_temp = hwmon_sensors["vram_temp"].val / 1000.f;
 
