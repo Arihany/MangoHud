@@ -571,10 +571,32 @@ bool CPUStats::ReadcpuTempFile(int& temp) {
 }
 
 bool CPUStats::UpdateCpuTemp() {
+#if defined(__ANDROID__)
+    constexpr int ANDROID_CPU_TEMP_MIN_UPDATE_MS = 500;
+
+    static auto  last_ts  = std::chrono::steady_clock::time_point{};
+    static bool  last_ret = false;
+
+    auto now = std::chrono::steady_clock::now();
+
+    if (last_ts.time_since_epoch().count() != 0) {
+        auto delta_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_ts).count();
+
+        if (delta_ms < ANDROID_CPU_TEMP_MIN_UPDATE_MS) {
+            return last_ret;
+        }
+    }
+    last_ts = now;
+#endif
+
     if (gpus) {
         for (auto gpu : gpus->available_gpus) {
             if (gpu->is_apu()) {
                 m_cpuDataTotal.temp = gpu->metrics.apu_cpu_temp;
+#if defined(__ANDROID__)
+                last_ret = true;
+#endif
                 return true;
             }
         }
@@ -583,6 +605,10 @@ bool CPUStats::UpdateCpuTemp() {
     int temp = 0;
     bool ret = ReadcpuTempFile(temp);
     m_cpuDataTotal.temp = temp;
+
+#if defined(__ANDROID__)
+    last_ret = ret;
+#endif
 
     return ret;
 }
@@ -741,6 +767,10 @@ static bool get_cpu_power_xgene(CPUPowerData* cpuPowerData, float& power) {
 }
 
 bool CPUStats::UpdateCpuPower() {
+#if defined(__ANDROID__)
+    m_cpuDataTotal.power = 0.0f;
+    return false;
+#else
     InitCpuPowerData();
 
     if(!m_cpuPowerData)
@@ -774,6 +804,7 @@ bool CPUStats::UpdateCpuPower() {
     m_cpuDataTotal.power = power;
 
     return true;
+#endif
 }
 
 static bool find_input(const std::string& path, const char* input_prefix, std::string& input, const std::string& name)
@@ -842,9 +873,20 @@ bool CPUStats::UpdateCPUData()
         return false;
 
 #if defined(__ANDROID__)
-    // ANDROID:
-    // 1) core_ctl Busy%로 per-core & total 구현 (중국 빌드 모방)
-    // 2) core_ctl 실패 시 per-core는 죽이고, total만 /proc/self/stat로 근사
+    constexpr int ANDROID_CPU_MIN_UPDATE_MS = 500;
+
+    static auto last_ts = std::chrono::steady_clock::time_point{};
+    auto now = std::chrono::steady_clock::now();
+
+    if (last_ts.time_since_epoch().count() != 0) {
+        auto delta_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_ts).count();
+
+        if (delta_ms < ANDROID_CPU_MIN_UPDATE_MS) {
+            return m_updatedCPUs;
+        }
+    }
+    last_ts = now;
 
     std::unordered_map<int, CoreCtlEntry> corectl;
     bool have_corectl = read_core_ctl_global_state(corectl);
