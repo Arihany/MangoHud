@@ -690,16 +690,57 @@ int GPU_fdinfo::get_kgsl_load() {
     if (it == kgsl_streams.end() || !it->second.is_open())
         return 0;
 
-    std::ifstream& s = it->second;
+    std::ifstream &s = it->second;
     std::string usage_str;
 
+    s.clear();
     s.seekg(0);
     std::getline(s, usage_str);
 
     if (usage_str.empty())
         return 0;
 
-    return std::stoi(usage_str);
+    auto trim = [](std::string &str) {
+        auto not_space = [](int ch) { return !std::isspace(ch); };
+        str.erase(str.begin(),
+                  std::find_if(str.begin(), str.end(), not_space));
+        str.erase(std::find_if(str.rbegin(), str.rend(), not_space).base(),
+                  str.end());
+    };
+    trim(usage_str);
+
+    if (usage_str.find(' ') != std::string::npos) {
+        std::istringstream iss(usage_str);
+        unsigned long long busy = 0, total = 0;
+
+        if (!(iss >> busy >> total) || total == 0)
+            return 0;
+
+        double percent = static_cast<double>(busy) * 100.0 /
+                         static_cast<double>(total);
+
+        if (percent < 0.0)
+            percent = 0.0;
+        if (percent > 100.0)
+            percent = 100.0;
+
+        return static_cast<int>(std::round(percent));
+    }
+
+    // clamp for norm
+    int val = 0;
+    try {
+        val = std::stoi(usage_str);
+    } catch (...) {
+        return 0;
+    }
+
+    if (val < 0)
+        val = 0;
+    if (val > 100)
+        val = 100;
+
+    return val;
 }
 
 void GPU_fdinfo::main_thread()
