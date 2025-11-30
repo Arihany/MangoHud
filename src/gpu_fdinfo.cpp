@@ -370,8 +370,6 @@ int GPU_fdinfo::get_gpu_load()
 {
     if (module == "xe")
         return get_xe_load();
-    else if (module == "msm_drm")
-        return get_kgsl_load();
 
     uint64_t now = os_time_get_nano();
     uint64_t gpu_time_now = get_gpu_time();
@@ -379,17 +377,29 @@ int GPU_fdinfo::get_gpu_load()
     if (previous_time == 0) {
         previous_gpu_time = gpu_time_now;
         previous_time = now;
-
         return 0;
     }
 
-    float delta_time = now - previous_time;
-    float delta_gpu_time = gpu_time_now - previous_gpu_time;
+    float delta_time = static_cast<float>(now - previous_time);
+    float delta_gpu_time = static_cast<float>(gpu_time_now - previous_gpu_time);
 
-    int result = delta_gpu_time / delta_time * 100;
+    float result = 0.0f;
 
-    if (result > 100)
-        result = 100;
+    if (delta_time > 0.0f)
+        result = (delta_gpu_time / delta_time) * 100.0f;  // drm-engine-*
+
+#if defined(__ANDROID__)
+    if (module == "msm_drm" && result <= 0.0f) {
+        int kgsl = get_kgsl_load();
+        if (kgsl > 0)
+            result = static_cast<float>(kgsl);
+    }
+#endif
+
+    if (result > 100.0f)
+        result = 100.0f;
+    if (result < 0.0f)
+        result = 0.0f;
 
     previous_gpu_time = gpu_time_now;
     previous_time = now;
@@ -690,57 +700,52 @@ int GPU_fdinfo::get_kgsl_load() {
     if (it == kgsl_streams.end() || !it->second.is_open())
         return 0;
 
-    std::ifstream &s = it->second;
-    std::string usage_str;
+    std::ifstream& s = it->second;
+    std::string line;
 
-    s.clear();
     s.seekg(0);
-    std::getline(s, usage_str);
-
-    if (usage_str.empty())
+    std::getline(s, line);
+    if (line.empty())
         return 0;
 
-    auto trim = [](std::string &str) {
-        auto not_space = [](int ch) { return !std::isspace(ch); };
-        str.erase(str.begin(),
-                  std::find_if(str.begin(), str.end(), not_space));
-        str.erase(std::find_if(str.rbegin(), str.rend(), not_space).base(),
-                  str.end());
-    };
-    trim(usage_str);
+    unsigned long long a = 0, b = 0;
+    std::stringstream ss(line);
 
-    if (usage_str.find(' ') != std::string::npos) {
-        std::istringstream iss(usage_str);
-        unsigned long long busy = 0, total = 0;
-
-        if (!(iss >> busy >> total) || total == 0)
+    if ((ss >> a) && (ss >> b)) {
+        // gpubusy: "busy total"
+        if (b == 0)
             return 0;
 
-        double percent = static_cast<double>(busy) * 100.0 /
-                         static_cast<double>(total);
+        if (kgsl_total_prev == 0) {
+            kgsl_busy_prev  = a;
+            kgsl_total_prev = b;
+            return 0;
+        }
 
-        if (percent < 0.0)
-            percent = 0.0;
-        if (percent > 100.0)
-            percent = 100.0;
+        uint64_t delta_busy  = a - kgsl_busy_prev;
+        uint64_t delta_total = b - kgsl_total_prev;
 
-        return static_cast<int>(std::round(percent));
+        kgsl_busy_prev  = a;
+        kgsl_total_prev = b;
+
+        if (delta_total == 0 || delta_busy <= 0)
+            return 0;
+
+        double load = (double)delta_busy * 100.0 / (double)delta_total;
+        if (load < 0.0)   load = 0.0;
+        if (load > 100.0) load = 100.0;
+        return (int)std::round(load);
+    } else {
+        // gpu_busy_percentage / gpu_busy_percent: %
+        try {
+            int v = std::stoi(line);
+            if (v < 0)   v = 0;
+            if (v > 100) v = 100;
+            return v;
+        } catch (...) {
+            return 0;
+        }
     }
-
-    // clamp for norm
-    int val = 0;
-    try {
-        val = std::stoi(usage_str);
-    } catch (...) {
-        return 0;
-    }
-
-    if (val < 0)
-        val = 0;
-    if (val > 100)
-        val = 100;
-
-    return val;
 }
 
 void GPU_fdinfo::main_thread()
