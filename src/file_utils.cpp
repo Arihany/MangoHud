@@ -8,6 +8,10 @@
 #include <fstream>
 #include <cstring>
 #include <string>
+#include <algorithm>
+#include <regex>
+#include <cctype>
+#include <cerrno>
 #include <spdlog/spdlog.h>
 
 #ifndef PROCDIR
@@ -37,6 +41,7 @@ std::string get_basename(const std::string&& path)
 }
 
 #ifdef __linux__
+
 std::vector<std::string> ls(const char* root, const char* prefix, LS_FLAGS flags)
 {
     std::vector<std::string> list;
@@ -98,7 +103,6 @@ std::vector<std::string> ls(const char* root, const char* prefix, LS_FLAGS flags
     closedir(dirp);
     return list;
 }
-#endif // __linux__
 
 bool file_exists(const std::string& path)
 {
@@ -199,8 +203,8 @@ std::string get_config_dir()
     return path;
 }
 
-bool lib_loaded(const std::string& lib, pid_t pid) {
-
+bool lib_loaded(const std::string& lib, pid_t pid)
+{
     std::string who = pid != -1 ? std::to_string(pid) : "self";
     auto paths = { fs::path("/proc") / who / "map_files",
                    fs::path("/proc") / who / "fd" };
