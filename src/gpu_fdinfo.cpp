@@ -650,7 +650,7 @@ void GPU_fdinfo::init_kgsl() {
     };
 
     const KgslFile candidates[] = {
-        { "busy",  { "gpu_busy_percentage", "gpu_busy_percent", "gpubusy" } },
+        { "busy",  { "gpubusy", "gpu_busy_percent", "gpu_busy_percentage" } },
         { "temp",  { "temp", "gpu_temp" } },
         { "clock", { "clock_mhz", "gpuclk" } },
     };
@@ -662,19 +662,23 @@ void GPU_fdinfo::init_kgsl() {
             if (!fs::exists(p))
                 continue;
 
-            SPDLOG_INFO("kgsl: using {} for {}", p, c.logical);
-
             if (c.logical == std::string("clock")) {
                 gpu_clock_stream.open(p);
-                if (!gpu_clock_stream.good())
-                    SPDLOG_WARN("kgsl: failed to open {}", p);
+                if (!gpu_clock_stream.good()) {
+                    SPDLOG_WARN("kgsl: failed to open {} (clock), trying next candidate", p);
+                    continue;
+                }
             } else {
                 auto& stream = kgsl_streams[c.logical];
                 stream.open(p);
-                if (!stream.good())
-                    SPDLOG_WARN("kgsl: failed to open {}", p);
+                if (!stream.good()) {
+                    SPDLOG_WARN("kgsl: failed to open {} ({}), trying next candidate",
+                                p, c.logical);
+                    continue;
+                }
             }
 
+            SPDLOG_INFO("kgsl: using {} for {}", p, c.logical);
             break;
         }
     }
