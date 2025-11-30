@@ -398,7 +398,7 @@ int GPU_fdinfo::get_gpu_load()
 
     if (module == "msm_drm" && result <= 0.0f) {
         int kgsl = get_kgsl_load();
-        SPDLOG_INFO("gpu_load: msm_drm fallback to kgsl load={}", kgsl);
+        SPDLOG_DEBUG("gpu_load: msm_drm fallback to kgsl load={}", kgsl);
         if (kgsl > 0)
             result = static_cast<float>(kgsl);
     }
