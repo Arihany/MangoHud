@@ -50,15 +50,13 @@ class GPU {
         }
 
         gpu_metrics get_metrics() {
-            if (nvidia)
-                this->metrics = nvidia->copy_metrics();
-
-            if (amdgpu)
-                this->metrics = amdgpu->copy_metrics();
-
-            if (fdinfo)
-                this->metrics = fdinfo->copy_metrics();
-
+            if (nvidia) {
+                metrics = nvidia->copy_metrics();
+            } else if (amdgpu) {
+                metrics = amdgpu->copy_metrics();
+            } else if (fdinfo) {
+                metrics = fdinfo->copy_metrics();
+            }
             return metrics;
         };
 
