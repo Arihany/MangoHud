@@ -24,7 +24,7 @@ pre_args = [
   '-D__STDC_FORMAT_MACROS',
   '-D__STDC_LIMIT_MACROS',
   '-DPACKAGE_VERSION="@0@"'.format(meson.project_version()),
-  '-DSPDLOG_COMPILED_LIB'
+  '-DSPDLOG_HEADER_ONLY'
 ]
 
 # Always set max spdlog level, handle this using MANGOHUD_LOG_LEVEL instead.
@@ -244,7 +244,11 @@ spdlog_options = [
   'std_format=disabled'
 ]
 
-spdlog_dep = dependency('spdlog', required: false)
+spdlog_dep = dependency('spdlog',
+  method : 'cmake',
+  fallback : ['spdlog', 'spdlog_dep'],
+  default_options : ['compile_library=false'],
+)
 
 if get_option('use_system_spdlog').disabled() or not spdlog_dep.found()
     if get_option('use_system_spdlog').enabled()
