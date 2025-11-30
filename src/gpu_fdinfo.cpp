@@ -332,6 +332,12 @@ void GPU_fdinfo::get_current_hwmon_readings()
 
 float GPU_fdinfo::get_power_usage()
 {
+#if defined(__ANDROID__)
+    // Android/Winlator: hwmon 기반 GPU power는 대부분 무의미 + 권한 이슈
+    // 그냥 0으로 고정해서 sysfs 접근 자체를 막는다.
+    return 0.0f;
+#endif
+
     if (!hwmon_sensors["power"].filename.empty())
         return static_cast<float>(hwmon_sensors["power"].val) / 1'000'000;
 
@@ -874,19 +880,27 @@ double GPU_fdinfo::get_kgsl_freq_ratio() {
 
 void GPU_fdinfo::main_thread()
 {
+    // 최소 500ms 이상으로 강제
+    constexpr int MIN_INTERVAL_MS = 500;
+    const int interval_ms = std::max(METRICS_UPDATE_PERIOD_MS, MIN_INTERVAL_MS);
+
     while (!stop_thread) {
-        std::unique_lock<std::mutex> lock(metrics_mutex);
-        cond_var.wait(lock, [this]() { return !paused || stop_thread; });
+        {
+            // 일단 pause / resume 동기화
+            std::unique_lock<std::mutex> lock(metrics_mutex);
+            cond_var.wait(lock, [this]() { return !paused || stop_thread; });
+            if (stop_thread)
+                break;
+        }
 
 #ifndef TEST_ONLY
-        if (HUDElements.g_gamescopePid > 0 && HUDElements.g_gamescopePid != pid)
-        {
+        if (HUDElements.g_gamescopePid > 0 && HUDElements.g_gamescopePid != pid) {
             pid = HUDElements.g_gamescopePid;
             find_fd();
         }
 #endif
 
-        // Recheck fds every 10secs, fixes Mass Effect 1, maybe some others too
+        // 10초마다 fdinfo 리스캔
         {
             auto t = os_time_get_nano() / 1'000'000;
             if (t - fdinfo_last_update_ms >= 10'000) {
@@ -895,17 +909,43 @@ void GPU_fdinfo::main_thread()
             }
         }
 
+        // 공통: fdinfo 파싱은 한 번
         gather_fdinfo_data();
+
+#if defined(__ANDROID__)
+        // - fdinfo 기반 load / vram / clock만 유지
+        // - hwmon / power / fan / throttle 전부 차단
+        metrics.load           = get_gpu_load();
+        metrics.proc_vram_used = get_memory_used();
+        metrics.CoreClock      = get_gpu_clock();  // kgsl clock 있으면 이쪽에서 사용
+
+        // hwmon / powercap 계열은 전부 끔
+        metrics.powerUsage  = 0.0f;
+        metrics.powerLimit  = 0.0f;
+        metrics.voltage     = 0;
+        metrics.temp        = 0.0f;   // 온도는 Android 전용 백엔드에서 따로 채우는 쪽으로
+        metrics.memory_temp = 0.0f;
+        metrics.fan_speed   = 0;
+        metrics.fan_rpm     = false;
+
+        metrics.is_power_throttled   = false;
+        metrics.is_current_throttled = false;
+        metrics.is_temp_throttled    = false;
+        metrics.is_other_throttled   = false;
+
+#else
+
         get_current_hwmon_readings();
 
-        metrics.load = get_gpu_load();
+        metrics.load           = get_gpu_load();
         metrics.proc_vram_used = get_memory_used();
 
         metrics.powerUsage = get_power_usage();
-        metrics.powerLimit = static_cast<float>(hwmon_sensors["power_limit"].val) / 1'000'000;
+        metrics.powerLimit =
+            static_cast<float>(hwmon_sensors["power_limit"].val) / 1'000'000;
 
         metrics.CoreClock = get_gpu_clock();
-        metrics.voltage = hwmon_sensors["voltage"].val;
+        metrics.voltage   = hwmon_sensors["voltage"].val;
 
         if (module == "msm_drm") {
             metrics.temp = 0.0f;
@@ -916,13 +956,14 @@ void GPU_fdinfo::main_thread()
         metrics.memory_temp = hwmon_sensors["vram_temp"].val / 1000.f;
 
         metrics.fan_speed = hwmon_sensors["fan_speed"].val;
-        metrics.fan_rpm = true; // Fan data is pulled from hwmon
+        metrics.fan_rpm   = true; // Fan data is pulled from hwmon
 
         int throttling = get_throttling_status();
-        metrics.is_power_throttled = throttling & GPU_throttle_status::POWER;
+        metrics.is_power_throttled   = throttling & GPU_throttle_status::POWER;
         metrics.is_current_throttled = throttling & GPU_throttle_status::CURRENT;
-        metrics.is_temp_throttled = throttling & GPU_throttle_status::TEMP;
-        metrics.is_other_throttled = throttling & GPU_throttle_status::OTHER;
+        metrics.is_temp_throttled    = throttling & GPU_throttle_status::TEMP;
+        metrics.is_other_throttled   = throttling & GPU_throttle_status::OTHER;
+#endif
 
         SPDLOG_DEBUG(
             "pci_dev = {}, pid = {}, module = {}, "
@@ -935,8 +976,6 @@ void GPU_fdinfo::main_thread()
             metrics.voltage
         );
 
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(METRICS_UPDATE_PERIOD_MS)
-        );
+        std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
     }
 }
