@@ -697,15 +697,22 @@ int GPU_fdinfo::get_kgsl_load() {
     return std::stoi(usage_str);
 }
 
+int GPU_fdinfo::get_kgsl_temp()
+{
+    auto it = kgsl_streams.find("temp");
+    if (it == kgsl_streams.end() || !it->second.is_open())
+        return 0;
+
+    std::ifstream& s = it->second;
     std::string temp_str;
 
-    s->seekg(0);
-
-    std::getline(*s, temp_str);
+    s.seekg(0);
+    std::getline(s, temp_str);
 
     if (temp_str.empty())
         return 0;
 
+    // kgsl temp는 보통 milli-degree
     return std::round(std::stoi(temp_str) / 1'000.f);
 }
 
