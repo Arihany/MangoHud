@@ -554,7 +554,7 @@ void GPU_fdinfo::find_xe_gt_dir()
        SPDLOG_WARN("Intel xe gt dir: failed to open {}", throttle_status_path);
     } else {
         load_xe_i915_throttle_reasons(throttle_folder,
-                                      intel_throttle_power,
+                                      kIntelThrottlePower,
                                       throttle_power_streams);
 
         load_xe_i915_throttle_reasons(throttle_folder,
@@ -568,8 +568,8 @@ void GPU_fdinfo::find_xe_gt_dir()
 }
 
 void GPU_fdinfo::load_xe_i915_throttle_reasons(
-    const std::string& throttle_folder,
-    const std::vector<std::string>& throttle_reasons,
+    std::string throttle_folder,
+    std::vector<std::string> throttle_reasons,
     std::vector<std::ifstream>& throttle_reason_streams
 ) {
     for (const auto& throttle_reason : throttle_reasons) {
