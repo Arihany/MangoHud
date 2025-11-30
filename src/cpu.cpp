@@ -174,7 +174,6 @@ static bool probe_core_ctl_sources()
     return true;
 }
 
-// 2) Busy% / Online 파싱 (여러 global_state를 전부 합쳐서 out에 넣는다)
 static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& out)
 {
     if (!probe_core_ctl_sources())
@@ -193,6 +192,9 @@ static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& ou
     };
 
     for (auto& src : g_corectl_sources) {
+        // 어떤 파일을 읽는지 로그
+        SPDLOG_DEBUG("core_ctl: reading global_state {}", src.path);
+
         if (!src.stream || !src.stream->is_open()) {
             src.stream = std::make_unique<std::ifstream>(src.path);
             if (!src.stream->is_open()) {
@@ -214,13 +216,19 @@ static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& ou
             if (line.empty())
                 continue;
 
-            // "CPU0" / "CPU1" / "CPU 0" 등 허용
-            if (starts_with(line, "CPU")) {
+            // 일부 기기에서 "cpu0" (소문자)일 가능성도 있어서 대소문자 모두 허용
+            bool is_cpu_header = false;
+            if (line.size() >= 3) {
+                if (line.rfind("CPU", 0) == 0 || line.rfind("cpu", 0) == 0)
+                    is_cpu_header = true;
+            }
+
+            if (is_cpu_header) {
                 std::string rest = line.substr(3);
                 trim(rest);
                 int id = -1;
                 if (!try_stoi(id, rest)) {
-                    SPDLOG_DEBUG("core_ctl: failed to parse CPU header '{}'", line);
+                    SPDLOG_DEBUG("core_ctl: failed to parse CPU header '{}' in {}", line, src.path);
                     current_cpu = -1;
                     continue;
                 }
@@ -228,6 +236,7 @@ static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& ou
                 current_cpu = id;
                 auto& e = out[id];
                 e.cpu_id = id;
+                SPDLOG_DEBUG("core_ctl: [{}] new CPU entry: cpu{}", src.path, id);
                 continue;
             }
 
@@ -249,16 +258,29 @@ static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& ou
             auto& e = it->second;
 
             int v = 0;
-            if (key == "Online") {
+
+            // key를 소문자로 내려서 다양한 변형 허용 (online / Online / busy% / Busy% 등)
+            std::string key_lower = key;
+            std::transform(key_lower.begin(), key_lower.end(), key_lower.begin(), ::tolower);
+
+            if (key_lower == "online") {
                 if (try_stoi(v, val)) {
                     e.online     = v;
                     e.has_online = true;
+                    SPDLOG_DEBUG("core_ctl: [{}] cpu{} Online = {} (raw='{}')",
+                                 src.path, current_cpu, v, val);
                 }
-            } else if (key == "Busy%") {
+            } else if (key_lower == "busy%") {
                 if (try_stoi(v, val)) {
                     e.busy     = v;
                     e.has_busy = true;
+                    SPDLOG_DEBUG("core_ctl: [{}] cpu{} Busy%% = {} (raw='{}')",
+                                 src.path, current_cpu, v, val);
                 }
+            } else {
+                // 나중에 패턴 분석용
+                SPDLOG_TRACE("core_ctl: [{}] cpu{} unknown key '{}' val '{}'",
+                             src.path, current_cpu, key, val);
             }
         }
     }
@@ -268,7 +290,14 @@ static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& ou
         return false;
     }
 
-    SPDLOG_DEBUG("core_ctl: parsed {} CPU entries", out.size());
+    // 최종적으로 어떤 엔트리들이 있는지 한 번 정리해서 보여줌
+    for (const auto& kv : out) {
+        const auto& e = kv.second;
+        SPDLOG_DEBUG("core_ctl: entry cpu{} busy={} online={} has_busy={} has_online={}",
+                     e.cpu_id, e.busy, e.online, e.has_busy, e.has_online);
+    }
+
+    SPDLOG_DEBUG("core_ctl: parsed {} CPU entries total", out.size());
     return true;
 }
 
@@ -953,6 +982,9 @@ bool CPUStats::UpdateCPUData()
     std::unordered_map<int, CoreCtlEntry> corectl;
     bool have_corectl = read_core_ctl_global_state(corectl);
 
+    SPDLOG_DEBUG("Android CPU: read_core_ctl_global_state -> have_corectl={} entries={}",
+                 have_corectl, corectl.size());
+
     float total_percent = 0.0f;
     int   count_online  = 0;
 
@@ -961,6 +993,7 @@ bool CPUStats::UpdateCPUData()
         for (auto &cpu : m_cpuData) {
             auto it = corectl.find(cpu.cpu_id);
             if (it == corectl.end()) {
+                SPDLOG_DEBUG("Android CPU: no core_ctl entry for cpu{}", cpu.cpu_id);
                 cpu.percent       = 0.0f;
                 cpu.totalPeriod   = 0;
                 cpu.userPeriod    = 0;
@@ -971,7 +1004,18 @@ bool CPUStats::UpdateCPUData()
             const auto &e = it->second;
             bool online = !e.has_online || e.online != 0;
 
-            if (!online || !e.has_busy) {
+            if (!online) {
+                SPDLOG_DEBUG("Android CPU: cpu{} marked offline in core_ctl (online={}, has_online={})",
+                             cpu.cpu_id, e.online, e.has_online);
+                cpu.percent       = 0.0f;
+                cpu.totalPeriod   = 0;
+                cpu.userPeriod    = 0;
+                cpu.idleAllPeriod = 0;
+                continue;
+            }
+
+            if (!e.has_busy) {
+                SPDLOG_DEBUG("Android CPU: cpu{} has no Busy%% field in core_ctl", cpu.cpu_id);
                 cpu.percent       = 0.0f;
                 cpu.totalPeriod   = 0;
                 cpu.userPeriod    = 0;
