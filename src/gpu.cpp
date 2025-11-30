@@ -7,8 +7,8 @@ namespace fs = ghc::filesystem;
 GPUS::GPUS() {
     std::set<std::string> gpu_entries;
 
-
 #if defined(__ANDROID__)
+    // ANDROID: /sys/class/drm 존재/권한 확인 후 renderD* 나열
     const fs::path drm_root{"/sys/class/drm"};
     std::error_code ec;
 
@@ -32,7 +32,6 @@ GPUS::GPUS() {
                 ec ? ec.message() : "no error_code"
             );
         }
-
     } else {
         fs::directory_iterator it{drm_root, ec};
         fs::directory_iterator end{};
@@ -68,25 +67,27 @@ GPUS::GPUS() {
     }
 
 #else
+    // 일반 리눅스: /sys/class/drm에서 renderD* 나열
     for (const auto& entry : fs::directory_iterator("/sys/class/drm")) {
         if (!entry.is_directory())
             continue;
 
-        std::string node_name = entry.path().filename().string();
+        const std::string node_name = entry.path().filename().string();
 
         if (node_name.rfind("renderD", 0) != 0 || node_name.length() <= 7)
             continue;
 
-        std::string render_number = node_name.substr(7);
+        const std::string render_number = node_name.substr(7);
         if (std::all_of(render_number.begin(), render_number.end(), ::isdigit))
             gpu_entries.insert(node_name);
     }
 #endif
 
-    // Now process the sorted GPU entries
-    uint8_t idx = 0, total_active = 0;
+    uint8_t idx = 0;
+    uint8_t total_active = 0;
 
 #if defined(__ANDROID__)
+    // DRM renderD*가 하나도 안 보일 때: KGSL fallback
     if (gpu_entries.empty()) {
         const fs::path kgsl_root{"/sys/class/kgsl/kgsl-3d0"};
         std::error_code kgsl_ec;
@@ -105,15 +106,16 @@ GPUS::GPUS() {
             uint32_t vendor_id = 0;
             uint32_t device_id = 0;
 
-            std::shared_ptr<GPU> ptr =
-                std::make_shared<GPU>(node_name, vendor_id, device_id, pci_dev, driver);
+            auto ptr = std::make_shared<GPU>(
+                node_name, vendor_id, device_id, pci_dev, driver
+            );
 
-            // KGSL fallback
             ptr->is_active = true;
             available_gpus.emplace_back(ptr);
 
             SPDLOG_DEBUG(
-                "GPU Found (KGSL fallback): node_name: {}, driver: {}, vendor_id: {:x} device_id: {:x} pci_dev: {}",
+                "GPU Found (KGSL fallback): node_name: {}, driver: {}, "
+                "vendor_id: {:x} device_id: {:x} pci_dev: {}",
                 node_name, driver, vendor_id, device_id, pci_dev
             );
 
@@ -140,6 +142,7 @@ GPUS::GPUS() {
     }
 #endif
 
+    // DRM 기반 GPU들 처리
     for (const auto& node_name : gpu_entries) {
         const std::string driver = get_driver(node_name);
 
@@ -150,7 +153,9 @@ GPUS::GPUS() {
 
         {
             const std::string* d =
-                std::find(std::begin(supported_drivers), std::end(supported_drivers), driver);
+                std::find(std::begin(supported_drivers),
+                          std::end(supported_drivers),
+                          driver);
 
             if (d == std::end(supported_drivers)) {
                 SPDLOG_WARN(
@@ -161,30 +166,42 @@ GPUS::GPUS() {
             }
         }
 
-        std::string path = "/sys/class/drm/" + node_name;
-        std::string device_address = get_pci_device_address(path);  // Store the result
-        const char* pci_dev = device_address.c_str();
-
         uint32_t vendor_id = 0;
         uint32_t device_id = 0;
+        const char* pci_dev = "";
 
-        if (!device_address.empty())
-        {
+#if !defined(__ANDROID__)
+        // 데스크탑/일반 리눅스: PCI 경로에서 vendor/device 조회
+        const std::string path = "/sys/class/drm/" + node_name;
+        const std::string device_address = get_pci_device_address(path);
+
+        if (!device_address.empty()) {
+            pci_dev = device_address.c_str();
+
+            const std::string vendor_path =
+                "/sys/bus/pci/devices/" + device_address + "/vendor";
+            const std::string device_path =
+                "/sys/bus/pci/devices/" + device_address + "/device";
+
             try {
-                vendor_id = std::stoul(read_line("/sys/bus/pci/devices/" + device_address + "/vendor"), nullptr, 16);
-            } catch(...) {
-                SPDLOG_ERROR("stoul failed on: {}", "/sys/bus/pci/devices/" + device_address + "/vendor");
+                vendor_id = std::stoul(read_line(vendor_path), nullptr, 16);
+            } catch (...) {
+                SPDLOG_DEBUG("stoul failed on vendor path: {}", vendor_path);
             }
 
             try {
-                device_id = std::stoul(read_line("/sys/bus/pci/devices/" + device_address + "/device"), nullptr, 16);
+                device_id = std::stoul(read_line(device_path), nullptr, 16);
             } catch (...) {
-                SPDLOG_ERROR("stoul failed on: {}", "/sys/bus/pci/devices/" + device_address + "/device");
+                SPDLOG_DEBUG("stoul failed on device path: {}", device_path);
             }
         }
+#else
+        // ANDROID:
+        // - 모바일 SoC는 일반적으로 PCI 버스를 안 쓰므로 vendor/device는 0으로 둔다.
+        (void)node_name;
+#endif
 
-        std::shared_ptr<GPU> ptr =
-            std::make_shared<GPU>(node_name, vendor_id, device_id, pci_dev, driver);
+        auto ptr = std::make_shared<GPU>(node_name, vendor_id, device_id, pci_dev, driver);
 
         if (params()->gpu_list.size() == 1 && params()->gpu_list[0] == idx++)
             ptr->is_active = true;
@@ -221,10 +238,8 @@ GPUS::GPUS() {
             "this GPU: name = {}, driver = {}, vendor = {:x}, pci_dev = {}",
             gpu->drm_node, gpu->driver, gpu->vendor_id, gpu->pci_dev
         );
-
         break;
     }
-
 }
 
 std::string GPUS::get_driver(const std::string& node) {
@@ -247,21 +262,50 @@ std::string GPUS::get_driver(const std::string& node) {
 }
 
 std::string GPUS::get_pci_device_address(const std::string& drm_card_path) {
-    // /sys/class/drm/renderD128/device/subsystem -> /sys/bus/pci
-    auto subsystem = fs::canonical(drm_card_path + "/device/subsystem").string();
-    auto idx = subsystem.rfind("/") + 1; // /sys/bus/pci
-                                         //         ^
-                                         //         |- find this guy
-    if (subsystem.substr(idx) != "pci")
-        return "";
+#if defined(__ANDROID__)
+    // ANDROID:
+    // - 모바일 SoC는 일반적으로 PCI 버스로 GPU를 보지 않는다.
+    // - 여기서 canonical/read_symlink를 돌려봤자 의미 없고, I/O + 예외 오버헤드만 생긴다.
+    return {};
+#else
+    std::error_code ec;
 
-    // /sys/class/drm/renderD128/device -> /sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0/0000:02:01.0/0000:03:00.0
-    auto pci_addr = fs::read_symlink(drm_card_path + "/device").string();
-    idx = pci_addr.rfind("/") + 1; // /sys/.../0000:03:00.0
-                                   //         ^
-                                   //         |- find this guy
+    const auto subsystem_path = drm_card_path + "/device/subsystem";
+    auto subsystem = fs::canonical(subsystem_path, ec);
+    if (ec) {
+        SPDLOG_DEBUG(
+            "get_pci_device_address: canonical({}) failed: {}",
+            subsystem_path, ec.message()
+        );
+        return {};
+    }
 
-    return pci_addr.substr(idx); // 0000:03:00.0
+    const auto subsystem_str = subsystem.string();
+    auto idx = subsystem_str.rfind('/');
+    if (idx == std::string::npos)
+        return {};
+
+    const auto bus_name = subsystem_str.substr(idx + 1);
+    if (bus_name != "pci")
+        return {};
+
+    const auto device_symlink_path = drm_card_path + "/device";
+    auto pci_symlink = fs::read_symlink(device_symlink_path, ec);
+    if (ec) {
+        SPDLOG_DEBUG(
+            "get_pci_device_address: read_symlink({}) failed: {}",
+            device_symlink_path, ec.message()
+        );
+        return {};
+    }
+
+    const auto pci_str = pci_symlink.string();
+    idx = pci_str.rfind('/');
+    if (idx == std::string::npos)
+        return {};
+
+    return pci_str.substr(idx + 1);
+#endif
 }
 
 int GPU::index_in_selected_gpus() {
