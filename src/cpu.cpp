@@ -12,6 +12,13 @@
 #include <spdlog/spdlog.h>
 #include "string_utils.h"
 #include "gpu.h"
+#include "file_utils.h"
+
+#if defined(__ANDROID__)
+#include <chrono>
+#include <unistd.h>
+#include <unordered_map>
+#endif
 
 #ifndef TEST_ONLY
 #include "hud_elements.h"
@@ -33,61 +40,49 @@
 #define PROCCPUINFOFILE PROCDIR "/cpuinfo"
 #endif
 
-#include "file_utils.h"
+#ifdef __ANDROID__
 
-static bool read_android_core_ctl_busy(int &busy)
-{
-    const char *path = "/sys/devices/system/cpu/cpu0/core_ctl/global_state";
-    std::ifstream file(path);
-    if (!file.is_open()) {
-        SPDLOG_DEBUG("core_ctl: failed to open {}", path);
-        return false;
-    }
-
-    std::string line;
-    while (std::getline(file, line)) {
-        auto pos = line.find("Busy%");
-        if (pos == std::string::npos)
-            continue;
-
-        auto colon = line.find(':', pos);
-        if (colon == std::string::npos)
-            continue;
-
-        std::string val = line.substr(colon + 1);
-        auto first = val.find_first_not_of(" \t\r\n");
-        auto last  = val.find_last_not_of(" \t\r\n");
-        if (first == std::string::npos || last == std::string::npos)
-            return false;
-        val = val.substr(first, last - first + 1);
-
-        if (!try_stoi(busy, val)) {
-            SPDLOG_DEBUG("core_ctl: failed to parse Busy% from '{}'", val);
-            return false;
-        }
-
-        SPDLOG_DEBUG("core_ctl: Busy% = {}", busy);
-        return true;
-    }
-
-    SPDLOG_DEBUG("core_ctl: Busy% line not found");
-    return false;
-}
+#include <chrono>
+#include <dirent.h>
+#include <unistd.h>
 
 #if defined(__ANDROID__)
-// Android: enumerate cpu cores from /sys/devices/system/cpu (cpu0, cpu1, ...)
-static bool android_enumerate_cpus(std::vector<CPUData>& out, CPUData& total)
+namespace {
+
+struct CoreCtlEntry {
+    int  cpu_id     = -1;
+    int  busy       = 0;
+    int  online     = 1;
+    bool has_busy   = false;
+    bool has_online = false;
+};
+
+struct CoreCtlSource {
+    std::string path;
+    std::unique_ptr<std::ifstream> stream;
+};
+
+static std::vector<CoreCtlSource> g_corectl_sources;
+static bool g_corectl_probed = false;
+
+// 1) 한 번만 전체 /sys/devices/system/cpu를 스캔해서
+//    cpuN/core_ctl/global_state 들을 캐싱
+static bool probe_core_ctl_sources()
 {
+    if (g_corectl_probed)
+        return !g_corectl_sources.empty();
+
+    g_corectl_probed = true;
+    g_corectl_sources.clear();
+
     const char* base = "/sys/devices/system/cpu";
     DIR* dir = opendir(base);
     if (!dir) {
-        SPDLOG_ERROR("Android CPU: failed to open {}", base);
+        SPDLOG_DEBUG("core_ctl: failed to open {}", base);
         return false;
     }
 
-    out.clear();
     struct dirent* ent = nullptr;
-
     while ((ent = readdir(dir)) != nullptr) {
         const char* name = ent->d_name;
         if (strncmp(name, "cpu", 3) != 0)
@@ -97,29 +92,236 @@ static bool android_enumerate_cpus(std::vector<CPUData>& out, CPUData& total)
         long id = strtol(name + 3, &end, 10);
         if (!end || *end != '\0')
             continue;
-        if (id < 0 || id > 1024) // sane bound
+        if (id < 0 || id > 1024)
             continue;
 
-        CPUData cpu{};
-        cpu.cpu_id     = static_cast<int>(id);
-        cpu.totalTime  = 1;
-        cpu.totalPeriod = 1;
-        out.push_back(cpu);
-    }
+        std::string path =
+            std::string(base) + "/" + name + "/core_ctl/global_state";
 
+        if (access(path.c_str(), R_OK) == 0) {
+            CoreCtlSource src;
+            src.path = std::move(path);
+            g_corectl_sources.push_back(std::move(src));
+        }
+    }
     closedir(dir);
 
-    std::sort(out.begin(), out.end(),
-              [](const CPUData& a, const CPUData& b){ return a.cpu_id < b.cpu_id; });
+    if (g_corectl_sources.empty()) {
+        SPDLOG_INFO("core_ctl: no global_state found under {}", base);
+        return false;
+    }
 
-    total = {};
-    total.totalTime  = 1;
-    total.totalPeriod = 1;
-
-    SPDLOG_INFO("Android CPU: detected {} cores from sysfs", out.size());
-    return !out.empty();
+    SPDLOG_INFO("core_ctl: found {} global_state file(s)", g_corectl_sources.size());
+    return true;
 }
-#endif
+
+// 2) Busy% / Online 파싱 (여러 global_state를 전부 합쳐서 out에 넣는다)
+static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& out)
+{
+    if (!probe_core_ctl_sources())
+        return false;
+
+    out.clear();
+
+    auto trim = [](std::string& s) {
+        auto first = s.find_first_not_of(" \t\r\n");
+        auto last  = s.find_last_not_of(" \t\r\n");
+        if (first == std::string::npos || last == std::string::npos) {
+            s.clear();
+            return;
+        }
+        s = s.substr(first, last - first + 1);
+    };
+
+    for (auto& src : g_corectl_sources) {
+        if (!src.stream || !src.stream->is_open()) {
+            src.stream = std::make_unique<std::ifstream>(src.path);
+            if (!src.stream->is_open()) {
+                SPDLOG_DEBUG("core_ctl: cannot open {}", src.path);
+                src.stream.reset();
+                continue;
+            }
+        }
+
+        std::ifstream& file = *src.stream;
+        file.clear();
+        file.seekg(0, std::ios::beg);
+
+        std::string line;
+        int current_cpu = -1;
+
+        while (std::getline(file, line)) {
+            trim(line);
+            if (line.empty())
+                continue;
+
+            // "CPU0" / "CPU1" / "CPU 0" 등 허용
+            if (starts_with(line, "CPU")) {
+                std::string rest = line.substr(3);
+                trim(rest);
+                int id = -1;
+                if (!try_stoi(id, rest)) {
+                    SPDLOG_DEBUG("core_ctl: failed to parse CPU header '{}'", line);
+                    current_cpu = -1;
+                    continue;
+                }
+
+                current_cpu = id;
+                auto& e = out[id];
+                e.cpu_id = id;
+                continue;
+            }
+
+            if (current_cpu < 0)
+                continue;
+
+            auto colon = line.find(':');
+            if (colon == std::string::npos)
+                continue;
+
+            std::string key = line.substr(0, colon);
+            std::string val = line.substr(colon + 1);
+            trim(key);
+            trim(val);
+
+            auto it = out.find(current_cpu);
+            if (it == out.end())
+                continue;
+            auto& e = it->second;
+
+            int v = 0;
+            if (key == "Online") {
+                if (try_stoi(v, val)) {
+                    e.online     = v;
+                    e.has_online = true;
+                }
+            } else if (key == "Busy%") {
+                if (try_stoi(v, val)) {
+                    e.busy     = v;
+                    e.has_busy = true;
+                }
+            }
+        }
+    }
+
+    if (out.empty()) {
+        SPDLOG_INFO("core_ctl: parsed no CPU entries from global_state");
+        return false;
+    }
+
+    SPDLOG_DEBUG("core_ctl: parsed {} CPU entries", out.size());
+    return true;
+}
+
+// ===== /proc/self/stat 기반 total CPU fallback =====
+
+static long g_clk_tck = 0;
+static bool g_proc_cpu_inited = false;
+static double g_last_proc_cpu = 0.0;
+static std::chrono::steady_clock::time_point g_last_proc_ts;
+
+// /proc/self/stat에서 utime+stime을 초 단위로 읽어오기
+static bool android_read_self_cpu_time(double &out_sec)
+{
+    std::ifstream file("/proc/self/stat");
+    if (!file.is_open())
+        return false;
+
+    std::string line;
+    if (!std::getline(file, line))
+        return false;
+
+    auto rparen = line.rfind(')');
+    if (rparen == std::string::npos)
+        return false;
+
+    if (rparen + 2 >= line.size())
+        return false;
+
+    std::string rest = line.substr(rparen + 2);
+    std::istringstream iss(rest);
+    std::string token;
+    int idx = 0;
+    unsigned long long utime = 0;
+    unsigned long long stime = 0;
+
+    // state(0) ~ ... ~ utime(11) ~ stime(12)
+    while (iss >> token) {
+        if (idx == 11) {
+            utime = std::strtoull(token.c_str(), nullptr, 10);
+        } else if (idx == 12) {
+            stime = std::strtoull(token.c_str(), nullptr, 10);
+            break;
+        }
+        ++idx;
+    }
+
+    if (utime == 0 && stime == 0)
+        return false;
+
+    if (g_clk_tck <= 0) {
+        g_clk_tck = sysconf(_SC_CLK_TCK);
+        if (g_clk_tck <= 0)
+            g_clk_tck = 100;
+    }
+
+    out_sec = static_cast<double>(utime + stime) / static_cast<double>(g_clk_tck);
+    return true;
+}
+
+// core_ctl이 없을 때: 프로세스 CPU 사용률을 "전체 CPU %" 근사치로 계산
+static bool android_update_total_cpu_fallback(CPUData &total,
+                                              const std::vector<CPUData> &cpus)
+{
+    double now_cpu = 0.0;
+    if (!android_read_self_cpu_time(now_cpu))
+        return false;
+
+    auto now_ts = std::chrono::steady_clock::now();
+
+    if (!g_proc_cpu_inited) {
+        g_proc_cpu_inited = true;
+        g_last_proc_cpu   = now_cpu;
+        g_last_proc_ts    = now_ts;
+        total.percent     = 0.0f;
+        total.totalPeriod = 0;
+        SPDLOG_INFO("Android CPU: init /proc/self/stat fallback");
+        return true;
+    }
+
+    double dt   = std::chrono::duration_cast<std::chrono::duration<double>>(now_ts - g_last_proc_ts).count();
+    double dcpu = now_cpu - g_last_proc_cpu;
+
+    g_last_proc_cpu = now_cpu;
+    g_last_proc_ts  = now_ts;
+
+    if (dt <= 0.0 || dcpu < 0.0)
+        return false;
+
+    int ncores = static_cast<int>(cpus.size());
+    if (ncores <= 0)
+        ncores = 1;
+
+    double capacity = dt * static_cast<double>(ncores);
+    if (capacity <= 0.0)
+        return false;
+
+    double frac = dcpu / capacity;
+    double pct  = frac * 100.0;
+    if (pct < 0.0) pct = 0.0;
+    if (pct > 100.0) pct = 100.0;
+
+    total.percent     = static_cast<float>(pct);
+    total.totalPeriod = 100;
+
+    SPDLOG_DEBUG("Android CPU fallback: dcpu={}s dt={}s cores={} => {}%",
+                 dcpu, dt, ncores, total.percent);
+
+    return true;
+}
+
+} // namespace
+#endif // __ANDROID__
 
 static void calculateCPUData(CPUData& cpuData,
     unsigned long long int usertime,
@@ -203,176 +405,19 @@ bool CPUStats::Init()
         return true;
 
 #if defined(__ANDROID__)
-    // Android / Winlator: do NOT use /proc/stat (permission denied),
-    // enumerate cores from /sys/devices/system/cpu instead.
-    if (android_enumerate_cpus(m_cpuData, m_cpuDataTotal)) {
-
-#ifndef TEST_ONLY
-        if (get_params()->enabled[OVERLAY_PARAM_ENABLED_core_type])
-            get_cpu_cores_types();
-#endif
-
-        m_inited = true;
-        return UpdateCPUData();
-    }
-
-    SPDLOG_WARN("Android CPU: sysfs enumeration failed, falling back to /proc/stat");
-#endif
-
-    std::string line;
-    std::ifstream file (PROCSTATFILE);
-    bool first = true;
-    m_cpuData.clear();
-
-    if (!file.is_open()) {
-        SPDLOG_ERROR("Failed to opening " PROCSTATFILE);
+    // ANDROID: /proc/stat 안 쓴다. sysfs로 코어 enum.
+    if (!android_enumerate_cpus(m_cpuData, m_cpuDataTotal)) {
+        SPDLOG_ERROR("Android CPU: sysfs enumeration failed, disabling CPU stats");
         return false;
     }
-
-    do {
-        if (!std::getline(file, line)) {
-            SPDLOG_DEBUG("Failed to read all of " PROCSTATFILE);
-            return false;
-        } else if (starts_with(line, "cpu")) {
-            if (first) {
-                first = false;
-                continue;
-            }
-
-            CPUData cpu = {};
-            cpu.totalTime = 1;
-            cpu.totalPeriod = 1;
-            sscanf(line.c_str(), "cpu%4d ", &cpu.cpu_id);
-            m_cpuData.push_back(cpu);
-
-        } else if (starts_with(line, "btime ")) {
-            sscanf(line.c_str(), "btime %lld\n", &m_boottime);
-            break;
-        }
-    } while (true);
 
 #ifndef TEST_ONLY
     if (get_params()->enabled[OVERLAY_PARAM_ENABLED_core_type])
         get_cpu_cores_types();
 #endif
 
-    m_inited = true;
-    return UpdateCPUData();
-}
-
-bool CPUStats::Reinit()
-{
-    m_inited = false;
-    return Init();
-}
-
-bool CPUStats::UpdateCPUData()
-{
-    if (!m_inited)
-        return false;
-
-#if defined(__ANDROID__)
-
-    if (m_cpuData.empty())
-        return false;
-
-    // 1) cpufreq 기반 per-core pseudo usage
-    auto read_long = [](const std::string &path, long &val) -> bool {
-        std::ifstream f(path);
-        if (!f.is_open())
-            return false;
-
-        long tmp = 0;
-        if (!(f >> tmp))
-            return false;
-
-        val = tmp;
-        return true;
-    };
-
-    std::vector<long> cur_freqs(m_cpuData.size(), 0);
-    long max_freq = 0;
-
-    // 1차 패스: 각 코어 scaling_cur_freq 읽고 전체 최대값 찾기
-    for (size_t i = 0; i < m_cpuData.size(); ++i) {
-        auto &cpu = m_cpuData[i];
-
-        // 중국 빌드가 쓰는 패턴과 최대한 비슷하게: cpuX + "/cpufreq/scaling_cur_freq"
-        std::string path = "/sys/devices/system/cpu/cpu" +
-                           std::to_string(cpu.cpu_id) +
-                           "/cpufreq/scaling_cur_freq";
-
-        long freq = 0;
-        if (read_long(path, freq) && freq > 0) {
-            cur_freqs[i] = freq;
-            if (freq > max_freq)
-                max_freq = freq;
-        } else {
-            cur_freqs[i] = 0;
-        }
-    }
-
-    float total_percent = 0.0f;
-    int   active_cores  = 0;
-
-    // 2차 패스: per-core % 계산 (현재 freq / 샘플 내 최대 freq)
-    if (max_freq > 0) {
-        for (size_t i = 0; i < m_cpuData.size(); ++i) {
-            auto &cpu = m_cpuData[i];
-            long freq = cur_freqs[i];
-
-            float p = 0.0f;
-            if (freq > 0) {
-                p = (static_cast<float>(freq) * 100.0f) /
-                    static_cast<float>(max_freq);
-
-                if (p < 0.0f)   p = 0.0f;
-                if (p > 100.0f) p = 100.0f;
-
-                total_percent += p;
-                active_cores++;
-            }
-
-            cpu.percent = p;
-
-            // /proc/stat이 없으니 period 계열은 그냥 "가짜 0~100 스케일"로 맞춘다
-            unsigned long long up = static_cast<unsigned long long>(p + 0.5f);
-            if (up > 100ULL) up = 100ULL;
-
-            cpu.totalPeriod   = 100;
-            cpu.userPeriod    = up;
-            cpu.idleAllPeriod = 100 - up;
-        }
-    } else {
-        // cpufreq 자체를 못 읽으면 전부 0%
-        for (auto &cpu : m_cpuData) {
-            cpu.percent       = 0.0f;
-            cpu.totalPeriod   = 0;
-            cpu.userPeriod    = 0;
-            cpu.idleAllPeriod = 0;
-        }
-        active_cores  = 0;
-        total_percent = 0.0f;
-    }
-
-    // 3) 전체 CPU %: core_ctl Busy%가 있으면 그걸 믿고, 없으면 per-core 평균
-    int busy = 0;
-    if (read_android_core_ctl_busy(busy)) {
-        float p = static_cast<float>(busy);
-        if (p < 0.0f)   p = 0.0f;
-        if (p > 100.0f) p = 100.0f;
-
-        m_cpuDataTotal.percent = p;
-    } else if (active_cores > 0) {
-        m_cpuDataTotal.percent = total_percent / static_cast<float>(active_cores);
-    } else {
-        m_cpuDataTotal.percent = 0.0f;
-    }
-
-    m_cpuDataTotal.totalPeriod = 100;
-    m_cpuPeriod   = 1.0;
-    m_updatedCPUs = true;
-    return true;
+        m_inited = true;
+        return UpdateCPUData();
 
 #else
 
@@ -789,6 +834,148 @@ static void check_thermal_zones(std::string& path, std::string& input) {
 
         return;
     }
+}
+
+bool CPUStats::UpdateCPUData()
+{
+    if (!m_inited)
+        return false;
+
+#if defined(__ANDROID__)
+    // ANDROID:
+    // 1) core_ctl Busy%로 per-core & total 구현 (중국 빌드 모방)
+    // 2) core_ctl 실패 시 per-core는 죽이고, total만 /proc/self/stat로 근사
+
+    std::unordered_map<int, CoreCtlEntry> corectl;
+    bool have_corectl = read_core_ctl_global_state(corectl);
+
+    float total_percent = 0.0f;
+    int   count_online  = 0;
+
+    if (have_corectl) {
+        for (auto &cpu : m_cpuData) {
+            auto it = corectl.find(cpu.cpu_id);
+            if (it == corectl.end()) {
+                cpu.percent       = 0.0f;
+                cpu.totalPeriod   = 0;
+                cpu.userPeriod    = 0;
+                cpu.idleAllPeriod = 0;
+                continue;
+            }
+
+            const auto &e = it->second;
+            bool online = !e.has_online || e.online != 0;
+
+            if (!online || !e.has_busy) {
+                cpu.percent       = 0.0f;
+                cpu.totalPeriod   = 0;
+                cpu.userPeriod    = 0;
+                cpu.idleAllPeriod = 0;
+                continue;
+            }
+
+            float p = std::clamp(static_cast<float>(e.busy), 0.0f, 100.0f);
+
+            cpu.percent       = p;
+            cpu.totalPeriod   = 100;
+            cpu.userPeriod    = static_cast<unsigned long long>(p);
+            cpu.idleAllPeriod = 100 - cpu.userPeriod;
+
+            total_percent += p;
+            count_online++;
+        }
+    }
+
+    if (have_corectl && count_online > 0) {
+        m_cpuDataTotal.percent     = total_percent / static_cast<float>(count_online);
+        m_cpuDataTotal.totalPeriod = 100;
+        m_cpuPeriod   = 1.0;
+        m_updatedCPUs = true;
+        return true;
+    }
+
+    // 여기서부터는 hack fallback:
+    // per-core hack(core_ctl)이 터졌으므로 코어별 %는 전부 죽이고,
+    // total CPU만 /proc/self/stat 기반으로 대충 근사한다.
+    for (auto &cpu : m_cpuData) {
+        cpu.percent       = 0.0f;
+        cpu.totalPeriod   = 0;
+        cpu.userPeriod    = 0;
+        cpu.idleAllPeriod = 0;
+    }
+
+    if (android_update_total_cpu_fallback(m_cpuDataTotal, m_cpuData)) {
+        m_cpuPeriod   = 1.0;
+        m_updatedCPUs = true;
+        SPDLOG_INFO("Android CPU: using /proc/self/stat fallback for total CPU only");
+        return true;
+    }
+
+    SPDLOG_WARN("Android CPU: no core_ctl and fallback failed, CPU stats disabled");
+    m_cpuDataTotal.percent     = 0.0f;
+    m_cpuDataTotal.totalPeriod = 0;
+    m_cpuPeriod   = 0.0;
+    m_updatedCPUs = false;
+    return false;
+
+#else
+    // ===== 이하 기존 리눅스 /proc/stat 코드 =====
+    unsigned long long int usertime, nicetime, systemtime, idletime;
+    unsigned long long int ioWait, irq, softIrq, steal, guest, guestnice;
+    int cpuid = -1;
+    size_t cpu_count = 0;
+
+    std::string line;
+    std::ifstream file (PROCSTATFILE);
+    bool ret = false;
+
+    if (!file.is_open()) {
+        SPDLOG_ERROR("Failed to opening " PROCSTATFILE);
+        return false;
+    }
+
+    do {
+        if (!std::getline(file, line)) {
+            break;
+        } else if (!ret && sscanf(line.c_str(), "cpu  %16llu %16llu %16llu %16llu %16llu %16llu %16llu %16llu %16llu %16llu",
+            &usertime, &nicetime, &systemtime, &idletime, &ioWait, &irq, &softIrq, &steal, &guest, &guestnice) == 10) {
+            ret = true;
+            calculateCPUData(m_cpuDataTotal, usertime, nicetime, systemtime, idletime, ioWait, irq, softIrq, steal, guest, guestnice);
+        } else if (sscanf(line.c_str(), "cpu%4d %16llu %16llu %16llu %16llu %16llu %16llu %16llu %16llu %16llu %16llu",
+            &cpuid, &usertime, &nicetime, &systemtime, &idletime, &ioWait, &irq, &softIrq, &steal, &guest, &guestnice) == 11) {
+
+            if (!ret) {
+                SPDLOG_DEBUG("Failed to parse 'cpu' line:{}", line);
+                return false;
+            }
+
+            if (cpuid < 0) {
+                SPDLOG_DEBUG("Cpu id '{}' is out of bounds", cpuid);
+                return false;
+            }
+
+            if (cpu_count + 1 > m_cpuData.size() || m_cpuData[cpu_count].cpu_id != cpuid) {
+                SPDLOG_DEBUG("Cpu id '{}' is out of bounds or wrong index, reiniting", cpuid);
+                return Reinit();
+            }
+
+            CPUData& cpuData = m_cpuData[cpu_count];
+            calculateCPUData(cpuData, usertime, nicetime, systemtime, idletime, ioWait, irq, softIrq, steal, guest, guestnice);
+            cpuid = -1;
+            cpu_count++;
+
+        } else {
+            break;
+        }
+    } while(true);
+
+    if (cpu_count < m_cpuData.size())
+        m_cpuData.resize(cpu_count);
+
+    m_cpuPeriod   = static_cast<double>(m_cpuData[0].totalPeriod) / m_cpuData.size();
+    m_updatedCPUs = true;
+    return ret;
+#endif
 }
 
 bool CPUStats::GetCpuFile() {
