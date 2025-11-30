@@ -558,11 +558,11 @@ void GPU_fdinfo::find_xe_gt_dir()
                                       throttle_power_streams);
 
         load_xe_i915_throttle_reasons(throttle_folder,
-                                      intel_throttle_current,
+                                      kIntelThrottleCurrent,
                                       throttle_current_streams);
 
         load_xe_i915_throttle_reasons(throttle_folder,
-                                      intel_throttle_temp,
+                                      kIntelThrottleTemp,
                                       throttle_temp_streams);
     }
 }
