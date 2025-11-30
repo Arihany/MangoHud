@@ -7,7 +7,9 @@
 #include <stdlib.h>
 #include <errno.h>
 #ifdef __linux__
+#  if !defined(__ANDROID__)
 #include <wordexp.h>
+#  endif
 #include <unistd.h>
 #endif
 #include "imgui.h"
@@ -338,7 +340,7 @@ parse_str(const char *str)
 static std::string
 parse_path(const char *str)
 {
-#ifdef _XOPEN_SOURCE
+#if defined(_XOPEN_SOURCE) && !defined(__ANDROID__)
    // Expand ~/ to home dir
    if (str[0] == '~') {
       std::stringstream s;
