@@ -725,12 +725,12 @@ int GPU_fdinfo::get_kgsl_load() {
     unsigned long long a = 0, b = 0;
     std::stringstream ss(line);
 
+    // 1) gpubusy: "busy total"
     if ((ss >> a) && (ss >> b)) {
-        // gpubusy: "busy total"
         if (b == 0)
             return 0;
 
-        if (kgsl_total_prev == 0) {
+        if (kgsl_total_prev == 0 || a < kgsl_busy_prev || b < kgsl_total_prev) {
             kgsl_busy_prev  = a;
             kgsl_total_prev = b;
             return 0;
@@ -749,16 +749,15 @@ int GPU_fdinfo::get_kgsl_load() {
         if (load < 0.0)   load = 0.0;
         if (load > 100.0) load = 100.0;
         return (int)std::round(load);
-    } else {
-        // gpu_busy_percentage / gpu_busy_percent: %
-        try {
-            int v = std::stoi(line);
-            if (v < 0)   v = 0;
-            if (v > 100) v = 100;
-            return v;
-        } catch (...) {
-            return 0;
-        }
+    }
+
+    try {
+        int v = std::stoi(line);
+        if (v < 0)   v = 0;
+        if (v > 100) v = 100;
+        return v;
+    } catch (...) {
+        return 0;
     }
 }
 
