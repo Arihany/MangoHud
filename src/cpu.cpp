@@ -36,6 +36,52 @@
 
 #include "file_utils.h"
 
+#include "file_utils.h"
+
+#if defined(__ANDROID__)
+static bool g_android_core_ctl_backend = false;
+
+static bool read_android_core_ctl_busy(int &busy)
+{
+    const char *path = "/sys/devices/system/cpu/cpu0/core_ctl/global_state";
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        SPDLOG_DEBUG("core_ctl: failed to open {}", path);
+        return false;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        auto pos = line.find("Busy%");
+        if (pos == std::string::npos)
+            continue;
+
+        auto colon = line.find(':', pos);
+        if (colon == std::string::npos)
+            continue;
+
+        std::string val = line.substr(colon + 1);
+        // trim
+        auto first = val.find_first_not_of(" \t\r\n");
+        auto last  = val.find_last_not_of(" \t\r\n");
+        if (first == std::string::npos || last == std::string::npos)
+            return false;
+        val = val.substr(first, last - first + 1);
+
+        if (!try_stoi(busy, val)) {
+            SPDLOG_DEBUG("core_ctl: failed to parse Busy% from '{}'", val);
+            return false;
+        }
+
+        SPDLOG_DEBUG("core_ctl: Busy% = {}", busy);
+        return true;
+    }
+
+    SPDLOG_DEBUG("core_ctl: Busy% line not found");
+    return false;
+}
+#endif
+
 static void calculateCPUData(CPUData& cpuData,
     unsigned long long int usertime,
     unsigned long long int nicetime,
@@ -117,6 +163,41 @@ bool CPUStats::Init()
     if (m_inited)
         return true;
 
+#if defined(__ANDROID__)
+    {
+        std::string cpu_root = "/sys/devices/system/cpu/";
+        auto entries = ls(cpu_root.c_str());
+        m_cpuData.clear();
+
+        for (auto &name : entries) {
+            if (!starts_with(name, "cpu"))
+                continue;
+
+            const char *p = name.c_str() + 3;
+            char *endp = nullptr;
+            long id = strtol(p, &endp, 10);
+            if (p == endp || *endp != '\0' || id < 0)
+                continue;
+
+            CPUData cpu = {};
+            cpu.cpu_id = static_cast<int>(id);
+            cpu.totalTime = 1;
+            cpu.totalPeriod = 1;
+            m_cpuData.push_back(cpu);
+        }
+
+        if (!m_cpuData.empty()) {
+            SPDLOG_INFO("CPUStats: using Android core_ctl backend with {} CPUs", m_cpuData.size());
+            g_android_core_ctl_backend = true;
+            m_inited = true;
+            UpdateCPUData();
+            return true;
+        } else {
+            SPDLOG_WARN("CPUStats: Android core_ctl backend failed to find any CPUs, falling back to /proc/stat");
+        }
+    }
+#endif
+
     std::string line;
     std::ifstream file (PROCSTATFILE);
     bool first = true;
@@ -175,6 +256,26 @@ bool CPUStats::Reinit()
 //TODO take sampling interval into account?
 bool CPUStats::UpdateCPUData()
 {
+#if defined(__ANDROID__)
+    if (g_android_core_ctl_backend) {
+        int busy = 0;
+        if (!read_android_core_ctl_busy(busy)) {
+            SPDLOG_DEBUG("CPUStats: core_ctl backend update failed");
+            return false;
+        }
+
+        float percent = std::min(std::max(static_cast<float>(busy), 0.0f), 100.0f);
+        m_cpuDataTotal.percent = percent;
+
+        for (auto &cpu : m_cpuData) {
+            cpu.percent = percent;
+        }
+
+        m_cpuPeriod = 0.0;
+        m_updatedCPUs = true;
+        return true;
+    }
+    
     unsigned long long int usertime, nicetime, systemtime, idletime;
     unsigned long long int ioWait, irq, softIrq, steal, guest, guestnice;
     int cpuid = -1;
