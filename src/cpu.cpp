@@ -46,7 +46,6 @@
 #include <dirent.h>
 #include <unistd.h>
 
-#if defined(__ANDROID__)
 namespace {
 
 struct CoreCtlEntry {
@@ -212,6 +211,53 @@ static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& ou
     SPDLOG_DEBUG("core_ctl: parsed {} CPU entries", out.size());
     return true;
 }
+
+// Android: enumerate cpu cores from /sys/devices/system/cpu (cpu0, cpu1, ...)
+// (누락되었던 함수 복구)
+static bool android_enumerate_cpus(std::vector<CPUData>& out, CPUData& total)
+{
+    const char* base = "/sys/devices/system/cpu";
+    DIR* dir = opendir(base);
+    if (!dir) {
+        SPDLOG_ERROR("Android CPU: failed to open {}", base);
+        return false;
+    }
+
+    out.clear();
+    struct dirent* ent = nullptr;
+
+    while ((ent = readdir(dir)) != nullptr) {
+        const char* name = ent->d_name;
+        if (strncmp(name, "cpu", 3) != 0)
+            continue;
+
+        char* end = nullptr;
+        long id = strtol(name + 3, &end, 10);
+        if (!end || *end != '\0')
+            continue;
+        if (id < 0 || id > 1024) // sane bound
+            continue;
+
+        CPUData cpu{};
+        cpu.cpu_id     = static_cast<int>(id);
+        cpu.totalTime  = 1;
+        cpu.totalPeriod = 1;
+        out.push_back(cpu);
+    }
+
+    closedir(dir);
+
+    std::sort(out.begin(), out.end(),
+              [](const CPUData& a, const CPUData& b){ return a.cpu_id < b.cpu_id; });
+
+    total = {};
+    total.totalTime  = 1;
+    total.totalPeriod = 1;
+
+    SPDLOG_INFO("Android CPU: detected {} cores from sysfs", out.size());
+    return !out.empty();
+}
+
 
 // ===== /proc/self/stat 기반 total CPU fallback =====
 
