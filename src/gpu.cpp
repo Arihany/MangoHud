@@ -86,6 +86,60 @@ GPUS::GPUS() {
     // Now process the sorted GPU entries
     uint8_t idx = 0, total_active = 0;
 
+#if defined(__ANDROID__)
+    if (gpu_entries.empty()) {
+        const fs::path kgsl_root{"/sys/class/kgsl/kgsl-3d0"};
+        std::error_code kgsl_ec;
+        const bool kgsl_exists = fs::exists(kgsl_root, kgsl_ec);
+
+        if (kgsl_exists && !kgsl_ec) {
+            SPDLOG_INFO(
+                "Android: no DRM render nodes visible, using KGSL fallback at {}",
+                kgsl_root.string()
+            );
+
+            const std::string node_name = "kgsl-3d0";
+            const std::string driver    = "msm_drm";
+            const char* pci_dev         = "";
+
+            uint32_t vendor_id = 0;
+            uint32_t device_id = 0;
+
+            std::shared_ptr<GPU> ptr =
+                std::make_shared<GPU>(node_name, vendor_id, device_id, pci_dev, driver);
+
+            // KGSL fallback
+            ptr->is_active = true;
+            available_gpus.emplace_back(ptr);
+
+            SPDLOG_DEBUG(
+                "GPU Found (KGSL fallback): node_name: {}, driver: {}, vendor_id: {:x} device_id: {:x} pci_dev: {}",
+                node_name, driver, vendor_id, device_id, pci_dev
+            );
+
+            total_active = 1;
+        } else {
+            if (kgsl_ec == std::errc::permission_denied) {
+                SPDLOG_DEBUG(
+                    "Android: KGSL node {} present but permission denied; skipping GPU discovery",
+                    kgsl_root.string()
+                );
+            } else if (kgsl_ec) {
+                SPDLOG_DEBUG(
+                    "Android: error probing KGSL node {}: {}",
+                    kgsl_root.string(),
+                    kgsl_ec.message()
+                );
+            } else {
+                SPDLOG_DEBUG(
+                    "Android: KGSL node {} not present; no Android GPUs discovered",
+                    kgsl_root.string()
+                );
+            }
+        }
+    }
+#endif
+
     for (const auto& node_name : gpu_entries) {
         const std::string driver = get_driver(node_name);
 
