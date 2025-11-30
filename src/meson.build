@@ -104,6 +104,8 @@ if is_unixy or host_machine.system() == 'android'
     )
   endif
 
+
+
   opengl_files = files(
     'gl/glad.c',
     'gl/gl_renderer.cpp',
@@ -175,6 +177,12 @@ if is_unixy or host_machine.system() == 'android'
     )
   endif
 endif
+
+# disable gl_hud, inject_egl
+if host_machine.system() == 'android'
+  opengl_files = []
+endif
+
 
 link_args = cc.get_supported_link_arguments(['-Wl,-Bsymbolic-functions', '-Wl,-z,relro', '-Wl,--exclude-libs,ALL', '-lGL', '-static-libstdc++'])
 # meson fails to check version-script so just force add
