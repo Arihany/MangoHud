@@ -368,6 +368,20 @@ int GPU_fdinfo::get_xe_load()
 
 int GPU_fdinfo::get_gpu_load()
 {
+    static bool logged_once = false;
+    if (!logged_once) {
+        const char* backend =
+            (module == "xe")      ? "xe fdinfo cycles" :
+            (module == "msm_drm") ? "kgsl busy%" :
+                                     "drm fdinfo time";
+
+        SPDLOG_INFO(
+            "GPU_fdinfo load path: module=\"{}\", backend={}",
+            module, backend
+        );
+        logged_once = true;
+    }
+    
     if (module == "xe")
         return get_xe_load();
 
