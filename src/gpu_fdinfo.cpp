@@ -168,12 +168,6 @@ void GPU_fdinfo::find_hwmon_sensors()
 {
     std::string hwmon;
 
-    if (module == "msm_drm" && result <= 0.0f) {
-        int kgsl = get_kgsl_load();
-        if (kgsl > 0)
-            result = static_cast<float>(kgsl);
-    }
-
     if (module == "msm")
         hwmon = find_hwmon_sensor_dir("gpu");
     else if (module == "panfrost")
@@ -402,13 +396,11 @@ int GPU_fdinfo::get_gpu_load()
     if (delta_time > 0.0f)
         result = (delta_gpu_time / delta_time) * 100.0f;  // drm-engine-*
 
-#if defined(__ANDROID__)
     if (module == "msm_drm" && result <= 0.0f) {
         int kgsl = get_kgsl_load();
         if (kgsl > 0)
             result = static_cast<float>(kgsl);
     }
-#endif
 
     if (result > 100.0f)
         result = 100.0f;
