@@ -166,6 +166,20 @@ float GPU_fdinfo::get_memory_used()
 
 void GPU_fdinfo::find_hwmon_sensors()
 {
+#if defined(__ANDROID__)
+    // Android msm_drm/msm_dpu:
+    // - Winlator/컨테이너 환경에서 /sys/class/drm/.../hwmon은 거의 접근 불가거나 없음
+    // - GPU 온도/파워는 KGSL 또는 상위 레벨에서 따로 처리할 것이므로 여기서는 스킵
+    if (module == "msm_drm" || module == "msm_dpu") {
+        SPDLOG_DEBUG(
+            "hwmon: skipping hwmon scan for module=\"{}\" on Android "
+            "(KGSL backend / container usually has no hwmon access)",
+            module
+        );
+        return;
+    }
+#endif
+
     std::string hwmon;
 
     if (module == "msm")
@@ -190,10 +204,8 @@ void GPU_fdinfo::find_hwmon_sensors()
             auto sensor = &hs.second;
             std::smatch matches;
 
-            if (
-                !std::regex_match(filename, matches, sensor->rx) ||
-                matches.size() != 2
-            )
+            if (!std::regex_match(filename, matches, sensor->rx) ||
+                matches.size() != 2)
                 continue;
 
             auto cur_id = std::stoull(matches[1].str());
@@ -278,21 +290,22 @@ std::string GPU_fdinfo::find_hwmon_sensor_dir(std::string name) {
 void GPU_fdinfo::get_current_hwmon_readings()
 {
     for (auto& hs : hwmon_sensors) {
-        auto key = hs.first;
-        auto sensor = &hs.second;
+        auto& sensor = hs.second;
 
-        if (!sensor->stream.is_open())
+        if (!sensor.stream.is_open())
             continue;
 
-        sensor->stream.seekg(0);
+        sensor.stream.seekg(0);
 
-        std::stringstream ss;
-        ss << sensor->stream.rdbuf();
-
-        if (ss.str().empty())
+        std::string buf;
+        if (!std::getline(sensor.stream, buf) || buf.empty())
             continue;
 
-        sensor->val = std::stoull(ss.str());
+        try {
+            sensor.val = std::stoull(buf);
+        } catch (...) {
+            // 잘못된 값이면 그냥 이전 값 유지
+        }
     }
 }
 
