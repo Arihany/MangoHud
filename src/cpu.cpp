@@ -52,6 +52,10 @@ struct CoreCtlEntry {
     bool has_online = false;
 };
 
+static bool g_backend_logged_corectl   = false;
+static bool g_backend_logged_fallback  = false;
+static bool g_backend_logged_disabled  = false;
+
 // ANDROID: sysfs 기반 CPU 코어 enum
 static bool android_enumerate_cpus(std::vector<CPUData>& out, CPUData& total)
 {
@@ -934,11 +938,13 @@ bool CPUStats::UpdateCPUData()
     static auto last_ts = std::chrono::steady_clock::time_point{};
     auto now = std::chrono::steady_clock::now();
 
+    // 너무 자주 돌지 않게 최소 주기 제한
     if (last_ts.time_since_epoch().count() != 0) {
         auto delta_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(now - last_ts).count();
 
         if (delta_ms < ANDROID_CPU_MIN_UPDATE_MS) {
+            // 이전 값 그대로 재사용
             return m_updatedCPUs;
         }
     }
@@ -950,6 +956,7 @@ bool CPUStats::UpdateCPUData()
     float total_percent = 0.0f;
     int   count_online  = 0;
 
+    // ===== 1) core_ctl Busy% 백엔드 시도 =====
     if (have_corectl) {
         for (auto &cpu : m_cpuData) {
             auto it = corectl.find(cpu.cpu_id);
@@ -985,6 +992,19 @@ bool CPUStats::UpdateCPUData()
     }
 
     if (have_corectl && count_online > 0) {
+        // ★ hacky core_ctl Busy% 경로 사용 로그 (한 번만)
+        if (!g_backend_logged_corectl) {
+            g_backend_logged_corectl = true;
+            SPDLOG_INFO(
+                "Android CPU: using core_ctl Busy%% backend (online_cpus={}, sources={})",
+                count_online,
+                static_cast<int>(g_corectl_sources.size())
+            );
+            for (const auto& src : g_corectl_sources) {
+                SPDLOG_INFO("Android CPU: core_ctl source: {}", src.path);
+            }
+        }
+
         m_cpuDataTotal.percent     = total_percent / static_cast<float>(count_online);
         m_cpuDataTotal.totalPeriod = 100;
         m_cpuPeriod   = 1.0;
@@ -992,9 +1012,7 @@ bool CPUStats::UpdateCPUData()
         return true;
     }
 
-    // 여기서부터는 hack fallback:
-    // per-core hack(core_ctl)이 터졌으므로 코어별 %는 전부 죽이고,
-    // total CPU만 /proc/self/stat 기반으로 대충 근사한다.
+    // ===== 2) core_ctl 실패: per-core는 죽이고 total만 fallback =====
     for (auto &cpu : m_cpuData) {
         cpu.percent       = 0.0f;
         cpu.totalPeriod   = 0;
@@ -1005,11 +1023,23 @@ bool CPUStats::UpdateCPUData()
     if (android_update_total_cpu_fallback(m_cpuDataTotal, m_cpuData)) {
         m_cpuPeriod   = 1.0;
         m_updatedCPUs = true;
-        SPDLOG_INFO("Android CPU: using /proc/self/stat fallback for total CPU only");
+
+        // ★ /proc/self/stat fallback 백엔드 사용 로그 (한 번만, INFO)
+        if (!g_backend_logged_fallback) {
+            g_backend_logged_fallback = true;
+            SPDLOG_INFO("Android CPU: using /proc/self/stat fallback backend (total only)");
+        }
         return true;
     }
 
-    SPDLOG_WARN("Android CPU: no core_ctl and fallback failed, CPU stats disabled");
+    // ===== 3) fallback도 실패: 경고 도배 대신 DEBUG 한 번만 =====
+    if (!g_backend_logged_disabled) {
+        g_backend_logged_disabled = true;
+        SPDLOG_DEBUG(
+            "Android CPU: no core_ctl and /proc/self/stat fallback failed, CPU stats disabled"
+        );
+    }
+
     m_cpuDataTotal.percent     = 0.0f;
     m_cpuDataTotal.totalPeriod = 0;
     m_cpuPeriod   = 0.0;
@@ -1017,7 +1047,7 @@ bool CPUStats::UpdateCPUData()
     return false;
 
 #else
-    // ===== 이하 기존 리눅스 /proc/stat 코드 =====
+    // ===== 이하 기존 리눅스 /proc/stat 코드 그대로 =====
     unsigned long long int usertime, nicetime, systemtime, idletime;
     unsigned long long int ioWait, irq, softIrq, steal, guest, guestnice;
     int cpuid = -1;
