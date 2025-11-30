@@ -275,7 +275,8 @@ bool CPUStats::UpdateCPUData()
         m_updatedCPUs = true;
         return true;
     }
-    
+#endif
+
     unsigned long long int usertime, nicetime, systemtime, idletime;
     unsigned long long int ioWait, irq, softIrq, steal, guest, guestnice;
     int cpuid = -1;
