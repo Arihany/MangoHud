@@ -4,6 +4,8 @@
 #include "hud_elements.h"
 #endif
 
+int GPU_fdinfo::kgsl_freq_norm_mode = -1;
+
 namespace fs = ghc::filesystem;
 
 void GPU_fdinfo::find_fd()
@@ -166,13 +168,11 @@ void GPU_fdinfo::find_hwmon_sensors()
 {
     std::string hwmon;
 
-#if defined(__ANDROID__)
-    // for thermal zone
-    if (module == "msm_drm") {
-        SPDLOG_DEBUG("hwmon: skipping hwmon scan for msm_drm on Android (using kgsl/thermal)");
-        return;
+    if (module == "msm_drm" && result <= 0.0f) {
+        int kgsl = get_kgsl_load();
+        if (kgsl > 0)
+            result = static_cast<float>(kgsl);
     }
-#endif
 
     if (module == "msm")
         hwmon = find_hwmon_sensor_dir("gpu");
@@ -710,6 +710,46 @@ void GPU_fdinfo::init_kgsl() {
 }
 
 int GPU_fdinfo::get_kgsl_load() {
+    return get_kgsl_load_effective();
+}
+
+int GPU_fdinfo::get_kgsl_load_effective() {
+    if (kgsl_freq_norm_mode == -1) {
+        const char* env = std::getenv("MANGOHUD_KGSL_FREQ_NORM");
+        if (!env || *env == '\0' || *env == '0')
+            kgsl_freq_norm_mode = 0;
+        else
+            kgsl_freq_norm_mode = 1;
+
+        SPDLOG_INFO(
+            "kgsl: freq normalization {} (MANGOHUD_KGSL_FREQ_NORM={})",
+            kgsl_freq_norm_mode ? "ENABLED" : "DISABLED",
+            env ? env : "null"
+        );
+    }
+
+    int raw = get_kgsl_load_raw();
+    if (raw <= 0)
+        return raw;
+
+    if (kgsl_freq_norm_mode == 0)
+        return raw;
+
+    double ratio = get_kgsl_freq_ratio();
+    if (ratio <= 0.0)
+        return raw;
+
+    double norm = static_cast<double>(raw) * ratio;
+
+    if (norm < 0.0)
+        norm = 0.0;
+    if (norm > 100.0)
+        norm = 100.0;
+
+    return static_cast<int>(std::lround(norm));
+}
+
+int GPU_fdinfo::get_kgsl_load_raw() {
     auto it = kgsl_streams.find("busy");
     if (it == kgsl_streams.end() || !it->second.is_open())
         return 0;
@@ -745,6 +785,51 @@ int GPU_fdinfo::get_kgsl_load() {
     } catch (...) {
         return 0;
     }
+}
+
+static bool read_kgsl_u64(const std::string& path, uint64_t& out) {
+    std::ifstream f(path);
+    if (!f.is_open())
+        return false;
+
+    std::string s;
+    std::getline(f, s);
+    if (s.empty())
+        return false;
+
+    try {
+        out = static_cast<uint64_t>(std::stoull(s));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+double GPU_fdinfo::get_kgsl_freq_ratio() {
+    const std::string base = "/sys/class/kgsl/kgsl-3d0";
+
+    uint64_t cur = 0;
+    uint64_t max = 0;
+
+    if (!read_kgsl_u64(base + "/devfreq/cur_freq", cur)) {
+        read_kgsl_u64(base + "/gpuclk", cur);
+    }
+
+    if (!read_kgsl_u64(base + "/devfreq/max_freq", max)) {
+        read_kgsl_u64(base + "/max_gpuclk", max);
+    }
+
+    if (cur == 0 || max == 0)
+        return 0.0;
+
+    double ratio = static_cast<double>(cur) / static_cast<double>(max);
+
+    if (ratio < 0.0)
+        ratio = 0.0;
+    if (ratio > 1.0)
+        ratio = 1.0;
+
+    return ratio;
 }
 
 void GPU_fdinfo::main_thread()
