@@ -206,6 +206,19 @@ std::string get_config_dir()
 bool lib_loaded(const std::string& lib, pid_t pid)
 {
     std::string who = pid != -1 ? std::to_string(pid) : "self";
+
+#if defined(__ANDROID__)
+    if (pid != -1 && pid != getpid()) {
+        SPDLOG_DEBUG("lib_loaded: skipping scan for pid={} on Android (self only)", who);
+        return false;
+    }
+    if (pid == -1) {
+        who = "self";
+    } else {
+        who = std::to_string(getpid());
+    }
+#endif
+
     auto paths = { fs::path("/proc") / who / "map_files",
                    fs::path("/proc") / who / "fd" };
 
