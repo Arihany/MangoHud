@@ -1,4 +1,6 @@
 #pragma once
+#ifndef MANGOHUD_GPU_FDINFO_H
+#define MANGOHUD_GPU_FDINFO_H
 
 #include <inttypes.h>
 #include <sys/stat.h>
@@ -11,6 +13,11 @@
 #include <map>
 #include <set>
 #include <regex>
+#include <string>
+#include <vector>
+#include <mutex>
+#include <condition_variable>
+#include <fstream>
 
 #ifdef TEST_ONLY
 #include <../src/mesa/util/os_time.h>
@@ -32,10 +39,10 @@ struct hwmon_sensor {
 };
 
 enum GPU_throttle_status : int {
-    POWER = 0b0001,
+    POWER   = 0b0001,
     CURRENT = 0b0010,
-    TEMP = 0b0100,
-    OTHER = 0b1000,
+    TEMP    = 0b0100,
+    OTHER   = 0b1000,
 };
 
 class GPU_fdinfo {
@@ -105,23 +112,20 @@ private:
     bool check_throttle_reasons(std::vector<std::ifstream> &throttle_reason_streams);
     int get_throttling_status();
 
-    const std::vector<std::string> intel_throttle_power = {"reason_pl1", "reason_pl2"};
-    const std::vector<std::string> intel_throttle_current = {"reason_pl4", "reason_vr_tdc"};
-    const std::vector<std::string> intel_throttle_temp = {
-        "reason_prochot", "reason_ratl", "reason_thermal", "reason_vr_thermalert"};
     void load_xe_i915_throttle_reasons(
         std::string throttle_folder,
         std::vector<std::string> throttle_reasons,
         std::vector<std::ifstream> &throttle_reason_streams);
 
+    // Android / KGSL backend
     std::map<std::string, std::ifstream> kgsl_streams;
-    void init_kgsl();
-    int get_kgsl_load();
-    int get_kgsl_temp();
-    int     get_kgsl_load_raw();
-    double  get_kgsl_freq_ratio();    // cur_freq / max_freq (0.0 ~ 1.0, fail: 0)
-    int     get_kgsl_load_effective(); // env
-    static  int kgsl_freq_norm_mode;   // 0 = off, 1 = on
+    void   init_kgsl();
+    int    get_kgsl_load();
+    int    get_kgsl_temp();
+    int    get_kgsl_load_raw();
+    double get_kgsl_freq_ratio();      // cur_freq / max_freq (0.0 ~ 1.0, fail: 0)
+    int    get_kgsl_load_effective();  // env
+    static int kgsl_freq_norm_mode;    // 0 = off, 1 = on
 
 public:
     GPU_fdinfo(
@@ -233,14 +237,16 @@ public:
 
     ~GPU_fdinfo() {
         stop_thread = true;
+        cond_var.notify_all();
         if (thread.joinable())
             thread.join();
     }
 
     gpu_metrics copy_metrics() const
     {
+        std::lock_guard<std::mutex> lock(metrics_mutex);
         return metrics;
-    };
+    }
 
     void pause()
     {
@@ -256,3 +262,5 @@ public:
 
     float amdgpu_helper_get_proc_vram();
 };
+
+#endif // MANGOHUD_GPU_FDINFO_H
