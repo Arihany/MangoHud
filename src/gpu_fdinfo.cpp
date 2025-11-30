@@ -726,15 +726,17 @@ int GPU_fdinfo::get_kgsl_load_effective() {
     if (raw <= 0)
         return raw;
 
-    if (kgsl_freq_norm_mode == 0)
+    if (kgsl_freq_norm_mode == 0) {
         SPDLOG_DEBUG("kgsl: freq normalization disabled, returning raw={}", raw);
         return raw;
+    }
 
     double ratio = get_kgsl_freq_ratio();
     SPDLOG_DEBUG("kgsl: freq ratio = {}", ratio);
-    if (ratio <= 0.0)
-        SPDLOG_DEBUG("kgsl: freq normalization disabled, returning raw={}", raw);
+    if (ratio <= 0.0) {
+        SPDLOG_DEBUG("kgsl: freq ratio invalid (<=0), returning raw={}", raw);
         return raw;
+    }
 
     double norm = static_cast<double>(raw) * ratio;
     SPDLOG_DEBUG("kgsl: normalized load = raw={} * ratio={} => {}", raw, ratio, norm);
@@ -744,7 +746,7 @@ int GPU_fdinfo::get_kgsl_load_effective() {
     if (norm > 100.0)
         norm = 100.0;
 
-    return static_cast<int>(std::lround(norm));
+    int result = static_cast<int>(std::lround(norm));
     SPDLOG_DEBUG("kgsl: normalized load (clamped) = {}", result);
     return result;
 }
