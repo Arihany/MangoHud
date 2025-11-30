@@ -44,7 +44,18 @@ std::vector<std::string> ls(const char* root, const char* prefix, LS_FLAGS flags
 
     DIR* dirp = opendir(root);
     if (!dirp) {
-        SPDLOG_ERROR("Error opening directory '{}': {}", root, strerror(errno));
+        int err = errno;
+
+        if (err == EACCES || err == EPERM) {
+            SPDLOG_DEBUG("Skipping directory '{}' due to permissions: {}", root, strerror(err));
+            return list;
+        }
+        if (err == ENOENT || err == ENOTDIR) {
+            SPDLOG_DEBUG("Directory '{}' not present: {}", root, strerror(err));
+            return list;
+        }
+
+        SPDLOG_ERROR("Error opening directory '{}': {}", root, strerror(err));
         return list;
     }
 
@@ -79,12 +90,15 @@ std::vector<std::string> ls(const char* root, const char* prefix, LS_FLAGS flags
             if (flags & LS_FILES)
                 list.push_back(dp->d_name);
             break;
+        default:
+            break;
         }
     }
 
     closedir(dirp);
     return list;
 }
+#endif // __linux__
 
 bool file_exists(const std::string& path)
 {
@@ -187,20 +201,29 @@ std::string get_config_dir()
 
 bool lib_loaded(const std::string& lib, pid_t pid) {
 
-   std::string who = pid != -1 ? std::to_string(pid) : "self";
-   auto paths = { fs::path("/proc") / who / "map_files",
-            fs::path("/proc") / who / "fd" };
+    std::string who = pid != -1 ? std::to_string(pid) : "self";
+    auto paths = { fs::path("/proc") / who / "map_files",
+                   fs::path("/proc") / who / "fd" };
+
     for (auto& path : paths) {
-        if (dir_exists(path.string())) {
-            for (auto& p : fs::directory_iterator(path)) {
-                auto file = p.path().string();
-                auto sym = read_symlink(file.c_str());
-                if (to_lower(sym).find(lib) != std::string::npos) {
-                    return true;
+        const auto path_str = path.string();
+
+        if (dir_exists(path_str)) {
+            try {
+                for (auto& p : fs::directory_iterator(path)) {
+                    auto file = p.path().string();
+                    auto sym = read_symlink(file.c_str());
+                    if (to_lower(sym).find(lib) != std::string::npos) {
+                        return true;
+                    }
                 }
             }
+            catch (const fs::filesystem_error& e) {
+                SPDLOG_DEBUG("lib_loaded: cannot scan '{}': {}", path_str, e.what());
+                continue;
+            }
         } else {
-            SPDLOG_DEBUG("tried to access path that doesn't exist {}", path.string());
+            SPDLOG_DEBUG("tried to access path that doesn't exist {}", path_str);
         }
     }
     return false;
