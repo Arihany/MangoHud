@@ -4,8 +4,6 @@
 #include "hud_elements.h"
 #endif
 
-namespace {
-
 const std::vector<std::string> kIntelThrottlePower = {
     "reason_pl1",
     "reason_pl2"
