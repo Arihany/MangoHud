@@ -118,6 +118,8 @@ private:
     void init_kgsl();
     int get_kgsl_load();
     int get_kgsl_temp();
+    uint64_t kgsl_busy_prev  = 0;
+    uint64_t kgsl_total_prev = 0;
 
 public:
     GPU_fdinfo(
