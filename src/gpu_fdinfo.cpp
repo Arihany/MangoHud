@@ -166,6 +166,14 @@ void GPU_fdinfo::find_hwmon_sensors()
 {
     std::string hwmon;
 
+#if defined(__ANDROID__)
+    // Adreno(msm_drm) kgsl/thermal
+    if (module == "msm_drm") {
+        SPDLOG_DEBUG("hwmon: skipping hwmon scan for msm_drm on Android (using kgsl/thermal)");
+        return;
+    }
+#endif
+
     if (module == "msm")
         hwmon = find_hwmon_sensor_dir("gpu");
     else if (module == "panfrost")
@@ -636,46 +644,58 @@ void GPU_fdinfo::init_kgsl() {
         return;
     }
 
-    for (std::string metric : {"gpu_busy_percentage", "temp", "clock_mhz" }) {
-        std::string p = sys_path + "/" + metric;
+    struct KgslFile {
+        const char* logical;
+        std::initializer_list<const char*> names;
+    };
 
-        if (!fs::exists(p)) {
-            SPDLOG_WARN("kgsl: {} is not found", p);
-            continue;
+    const KgslFile candidates[] = {
+        { "busy",  { "gpu_busy_percentage", "gpu_busy_percent", "gpubusy" } },
+        { "temp",  { "temp", "gpu_temp" } },
+        { "clock", { "clock_mhz", "gpuclk" } },
+    };
+
+    for (const auto& c : candidates) {
+        for (const char* fname : c.names) {
+            std::string p = sys_path + "/" + fname;
+
+            if (!fs::exists(p))
+                continue;
+
+            SPDLOG_INFO("kgsl: using {} for {}", p, c.logical);
+
+            if (c.logical == std::string("clock")) {
+                gpu_clock_stream.open(p);
+                if (!gpu_clock_stream.good())
+                    SPDLOG_WARN("kgsl: failed to open {}", p);
+            } else {
+                auto& stream = kgsl_streams[c.logical];
+                stream.open(p);
+                if (!stream.good())
+                    SPDLOG_WARN("kgsl: failed to open {}", p);
+            }
+
+            break;
         }
-
-        SPDLOG_INFO("kgsl: opening {}", p);
-
-        if (metric == "clock_mhz")
-            gpu_clock_stream.open(p);
-        else
-            kgsl_streams[metric].open(p);
     }
 }
 
 int GPU_fdinfo::get_kgsl_load() {
-    std::ifstream* s = &kgsl_streams["gpu_busy_percentage"];
-
-    if (!s->is_open())
+    auto it = kgsl_streams.find("busy");
+    if (it == kgsl_streams.end() || !it->second.is_open())
         return 0;
 
+    std::ifstream& s = it->second;
     std::string usage_str;
 
-    s->seekg(0);
-
-    std::getline(*s, usage_str);
+    s.seekg(0);
+    std::getline(s, usage_str);
 
     if (usage_str.empty())
         return 0;
 
     return std::stoi(usage_str);
 }
-
-int GPU_fdinfo::get_kgsl_temp() {
-    std::ifstream* s = &kgsl_streams["temp"];
-
-    if (!s->is_open())
-        return 0;
 
     std::string temp_str;
 
