@@ -35,6 +35,45 @@
 
 #include "file_utils.h"
 
+static bool read_android_core_ctl_busy(int &busy)
+{
+    const char *path = "/sys/devices/system/cpu/cpu0/core_ctl/global_state";
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        SPDLOG_DEBUG("core_ctl: failed to open {}", path);
+        return false;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        auto pos = line.find("Busy%");
+        if (pos == std::string::npos)
+            continue;
+
+        auto colon = line.find(':', pos);
+        if (colon == std::string::npos)
+            continue;
+
+        std::string val = line.substr(colon + 1);
+        auto first = val.find_first_not_of(" \t\r\n");
+        auto last  = val.find_last_not_of(" \t\r\n");
+        if (first == std::string::npos || last == std::string::npos)
+            return false;
+        val = val.substr(first, last - first + 1);
+
+        if (!try_stoi(busy, val)) {
+            SPDLOG_DEBUG("core_ctl: failed to parse Busy% from '{}'", val);
+            return false;
+        }
+
+        SPDLOG_DEBUG("core_ctl: Busy% = {}", busy);
+        return true;
+    }
+
+    SPDLOG_DEBUG("core_ctl: Busy% line not found");
+    return false;
+}
+
 #if defined(__ANDROID__)
 // Android: enumerate cpu cores from /sys/devices/system/cpu (cpu0, cpu1, ...)
 static bool android_enumerate_cpus(std::vector<CPUData>& out, CPUData& total)
@@ -234,65 +273,34 @@ bool CPUStats::UpdateCPUData()
         return false;
 
 #if defined(__ANDROID__)
-    // -------- Android / core_ctl backend --------
-    bool any_busy = false;
-    float total_percent = 0.0f;
-    int   online_cores = 0;
-
-    for (auto& cpu : m_cpuData) {
-        std::string path = "/sys/devices/system/cpu/cpu" +
-                           std::to_string(cpu.cpu_id) +
-                           "/core_ctl/global_state";
-
-        std::ifstream f(path);
-        if (!f.is_open()) {
-            SPDLOG_DEBUG("Android CPU: no core_ctl for cpu{}", cpu.cpu_id);
+    int busy = -1;
+    if (!read_android_core_ctl_busy(busy)) {
+        SPDLOG_DEBUG("Android CPU: core_ctl Busy% not available, zeroing usage");
+        for (auto &cpu : m_cpuData)
             cpu.percent = 0.0f;
-            continue;
-        }
-
-        std::string line;
-        int busy = -1;
-        int online = 1;
-
-        while (std::getline(f, line)) {
-            if (line.find("Online:") == 0) {
-                int tmp = 1;
-                if (sscanf(line.c_str(), "Online: %d", &tmp) == 1)
-                    online = tmp;
-            } else if (line.find("Busy%") != std::string::npos) {
-                int tmp = -1;
-                if (sscanf(line.c_str(), "%*[^0-9]%d", &tmp) == 1)
-                    busy = tmp;
-            }
-        }
-
-        if (online == 0 || busy < 0) {
-            cpu.percent = 0.0f;
-            continue;
-        }
-
-        cpu.percent = static_cast<float>(busy);
-        any_busy = true;
-        total_percent += cpu.percent;
-        online_cores++;
-    }
-
-    if (!any_busy || online_cores == 0) {
         m_cpuDataTotal.percent = 0.0f;
-    } else {
-        m_cpuDataTotal.percent = total_percent / static_cast<float>(online_cores);
+
+        m_cpuPeriod = m_cpuData.empty() ? 0.0 : 1.0;
+        m_updatedCPUs = true;
+        return true;
     }
 
-    if (m_cpuData.empty()) {
-        m_cpuPeriod = 0.0;
-    } else {
-        m_cpuPeriod = 1.0;
+    float p = std::clamp(static_cast<float>(busy), 0.0f, 100.0f);
+
+    for (auto &cpu : m_cpuData) {
+        cpu.percent = p;
+
+        cpu.totalPeriod = 100;
+        cpu.userPeriod  = static_cast<unsigned long long>(p);
+        cpu.idleAllPeriod = 100 - cpu.userPeriod;
     }
 
+    m_cpuDataTotal.percent = p;
+    m_cpuDataTotal.totalPeriod = 100;
+
+    m_cpuPeriod = 1.0;
     m_updatedCPUs = true;
     return true;
-
 #else
 
     unsigned long long int usertime, nicetime, systemtime, idletime;
@@ -365,50 +373,67 @@ bool CPUStats::UpdateCoreMhz() {
         std::string path = "/sys/devices/system/cpu/cpu" +
                            std::to_string(cpu.cpu_id) +
                            "/cpufreq/scaling_cur_freq";
+
+        int mhz = 0;
         if ((fp = fopen(path.c_str(), "r"))) {
-            int64_t temp;
+            int64_t temp = 0;
             if (fscanf(fp, "%" PRId64, &temp) != 1)
                 temp = 0;
-            cpu.mhz = temp / 1000;
             fclose(fp);
-        } else {
-            cpu.mhz = 0;
+            mhz = static_cast<int>(temp / 1000);
         }
+
+        cpu.mhz = mhz;
+        m_coreMhz.push_back(mhz);
     }
+
 #else
     static bool scaling_freq = true;
-    if (scaling_freq){
-        for (auto& cpu : m_cpuData){
-            std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(cpu.cpu_id) + "/cpufreq/scaling_cur_freq";
-            if ((fp = fopen(path.c_str(), "r"))){
-                int64_t temp;
+
+    if (scaling_freq) {
+        for (auto& cpu : m_cpuData) {
+            std::string path = "/sys/devices/system/cpu/cpu" +
+                               std::to_string(cpu.cpu_id) +
+                               "/cpufreq/scaling_cur_freq";
+
+            int mhz = 0;
+            if ((fp = fopen(path.c_str(), "r"))) {
+                int64_t temp = 0;
                 if (fscanf(fp, "%" PRId64, &temp) != 1)
                     temp = 0;
-                cpu.mhz = temp / 1000;
                 fclose(fp);
-                scaling_freq = true;
+                mhz = static_cast<int>(temp / 1000);
             } else {
                 scaling_freq = false;
                 break;
             }
+
+            cpu.mhz = mhz;
+            m_coreMhz.push_back(mhz);
         }
-    } else {
-        static std::ifstream cpuInfo(PROCCPUINFOFILE);
-        static std::string row;
+    }
+
+    if (!scaling_freq) {
+        std::ifstream cpuInfo(PROCCPUINFOFILE);
+        std::string row;
         size_t i = 0;
+
         while (std::getline(cpuInfo, row) && i < m_cpuData.size()) {
-            if (row.find("MHz") != std::string::npos){
-                row = std::regex_replace(row, std::regex(R"([^0-9.])"), "");
-                if (!try_stoi(m_cpuData[i].mhz, row))
-                    m_cpuData[i].mhz = 0;
-                i++;
-            }
+            if (row.find("MHz") == std::string::npos)
+                continue;
+
+            row = std::regex_replace(row, std::regex(R"([^0-9.])"), "");
+            if (!try_stoi(m_cpuData[i].mhz, row))
+                m_cpuData[i].mhz = 0;
+
+            m_coreMhz.push_back(m_cpuData[i].mhz);
+            i++;
         }
     }
 #endif
 
     m_cpuDataTotal.cpu_mhz = 0;
-    for (auto data : m_cpuData)
+    for (const auto& data : m_cpuData)
         if (data.mhz > m_cpuDataTotal.cpu_mhz)
             m_cpuDataTotal.cpu_mhz = data.mhz;
 
