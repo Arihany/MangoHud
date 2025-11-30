@@ -52,6 +52,66 @@ struct CoreCtlEntry {
     bool has_online = false;
 };
 
+// ANDROID: sysfs 기반 CPU 코어 enum
+static bool android_enumerate_cpus(std::vector<CPUData>& out, CPUData& total)
+{
+    const char* base = "/sys/devices/system/cpu";
+    DIR* dir = opendir(base);
+    if (!dir) {
+        SPDLOG_ERROR("Android CPU: failed to open {}", base);
+        return false;
+    }
+
+    std::vector<int> ids;
+    struct dirent* ent = nullptr;
+
+    while ((ent = readdir(dir)) != nullptr) {
+        const char* name = ent->d_name;
+
+        // "cpu0", "cpu1" 형태만
+        if (strncmp(name, "cpu", 3) != 0)
+            continue;
+
+        char* end = nullptr;
+        long id = strtol(name + 3, &end, 10);
+        if (!end || *end != '\0')
+            continue;
+        if (id < 0 || id > 1024)
+            continue;
+
+        ids.push_back(static_cast<int>(id));
+    }
+
+    closedir(dir);
+
+    if (ids.empty()) {
+        SPDLOG_ERROR("Android CPU: no cpuN entries under {}", base);
+        return false;
+    }
+
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+
+    out.clear();
+    out.reserve(ids.size());
+
+    for (int id : ids) {
+        CPUData cpu{};          // zero-init
+        cpu.cpu_id     = id;
+        cpu.percent    = 0.0f;
+        cpu.totalPeriod = 0;
+        out.push_back(cpu);
+    }
+
+    // total 초기화
+    total = CPUData{};
+    total.cpu_id = -1;
+
+    SPDLOG_INFO("Android CPU: enumerated {} cores from sysfs", out.size());
+    return true;
+}
+
+
 struct CoreCtlSource {
     std::string path;
     std::unique_ptr<std::ifstream> stream;
