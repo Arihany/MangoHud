@@ -128,7 +128,8 @@ public:
         , pci_dev(pci_dev)
         , drm_node(drm_node)
     {
-        SPDLOG_DEBUG("GPU driver is \"{}\"", module);
+        SPDLOG_INFO("GPU_fdinfo: module=\"{}\" pci_dev=\"{}\" drm_node=\"{}\"",
+            module, pci_dev, drm_node);
 
         find_fd();
         gather_fdinfo_data();
