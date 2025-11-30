@@ -74,9 +74,13 @@ static bool read_android_core_ctl_busy(int &busy)
     return false;
 }
 
+#if defined(__ANDROID__)
 static bool read_android_core_ctl_busy_for_cpu(int cpu_id, int &busy, bool &online)
 {
-    std::string path = "/sys/devices/system/cpu/cpu" + std::to_string(cpu_id) + "/core_ctl/global_state";
+    std::string path = "/sys/devices/system/cpu/cpu" +
+                       std::to_string(cpu_id) +
+                       "/core_ctl/global_state";
+
     std::ifstream file(path);
     if (!file.is_open()) {
         SPDLOG_DEBUG("core_ctl: failed to open {}", path);
@@ -84,59 +88,66 @@ static bool read_android_core_ctl_busy_for_cpu(int cpu_id, int &busy, bool &onli
     }
 
     std::string line;
-    if (!std::getline(file, line)) {
-        SPDLOG_DEBUG("core_ctl: empty {}", path);
-        return false;
-    }
+    bool busy_found   = false;
+    bool online_found = false;
 
     // 기본값: online = true
     online = true;
+    busy   = 0;
 
-    // Online: N 파싱
-    {
-        auto pos = line.find("Online");
-        if (pos != std::string::npos) {
-            auto colon = line.find(':', pos);
+    while (std::getline(file, line)) {
+        // Online: N
+        auto pos_online = line.find("Online");
+        if (pos_online != std::string::npos) {
+            auto colon = line.find(':', pos_online);
             if (colon != std::string::npos) {
                 std::string val = line.substr(colon + 1);
                 auto first = val.find_first_not_of(" \t\r\n");
                 auto last  = val.find_last_not_of(" \t\r\n");
                 if (first != std::string::npos && last != std::string::npos) {
                     val = val.substr(first, last - first + 1);
-                    int online_int = 0;
-                    if (try_stoi(online_int, val))
+                    int online_int = 1;
+                    if (try_stoi(online_int, val)) {
                         online = (online_int != 0);
+                        online_found = true;
+                    }
                 }
             }
         }
+
+        // Busy%: N
+        auto pos_busy = line.find("Busy%");
+        if (pos_busy != std::string::npos) {
+            auto colon = line.find(':', pos_busy);
+            if (colon == std::string::npos)
+                continue;
+
+            std::string val = line.substr(colon + 1);
+            auto first = val.find_first_not_of(" \t\r\n");
+            auto last  = val.find_last_not_of(" \t\r\n");
+            if (first == std::string::npos || last == std::string::npos)
+                return false;
+
+            val = val.substr(first, last - first + 1);
+
+            if (!try_stoi(busy, val)) {
+                SPDLOG_DEBUG("core_ctl: failed to parse Busy% from '{}' in {}", val, path);
+                return false;
+            }
+
+            busy_found = true;
+        }
     }
 
-    // Busy%: N 파싱
-    auto pos = line.find("Busy%");
-    if (pos == std::string::npos) {
-        SPDLOG_DEBUG("core_ctl: Busy% not found in {}", path);
+    if (!busy_found) {
+        SPDLOG_DEBUG("core_ctl: Busy% line not found in {}", path);
         return false;
     }
 
-    auto colon = line.find(':', pos);
-    if (colon == std::string::npos)
-        return false;
-
-    std::string val = line.substr(colon + 1);
-    auto first = val.find_first_not_of(" \t\r\n");
-    auto last  = val.find_last_not_of(" \t\r\n");
-    if (first == std::string::npos || last == std::string::npos)
-        return false;
-    val = val.substr(first, last - first + 1);
-
-    if (!try_stoi(busy, val)) {
-        SPDLOG_DEBUG("core_ctl: failed to parse Busy% from '{}' for {}", val, path);
-        return false;
-    }
-
-    SPDLOG_DEBUG("core_ctl: cpu{} Busy% = {}, online={}", cpu_id, busy, online);
+    SPDLOG_DEBUG("core_ctl: cpu{} Busy% = {}, online = {}", cpu_id, busy, online);
     return true;
 }
+#endif
 
 #if defined(__ANDROID__)
 // Android: enumerate cpu cores from /sys/devices/system/cpu (cpu0, cpu1, ...)
@@ -330,48 +341,103 @@ bool CPUStats::Reinit()
     return Init();
 }
 
-//TODO take sampling interval into account?
 bool CPUStats::UpdateCPUData()
 {
     if (!m_inited)
         return false;
 
 #if defined(__ANDROID__)
-    // Android / Winlator:
-    // 코어별 core_ctl Busy%로 per-core usage 계산.
+    // ===== 1차 시도: core_ctl Busy% per-core =====
+    bool  have_core_ctl = false;
     float total_percent = 0.0f;
-    int counted = 0;
+    int   online_cores  = 0;
 
     for (auto &cpu : m_cpuData) {
         int  busy   = 0;
         bool online = true;
 
-        if (!read_android_core_ctl_busy_for_cpu(cpu.cpu_id, busy, online)) {
-            // 이 코어는 core_ctl 정보 없음 → 0%로 취급
-            cpu.percent = 0.0f;
-        } else if (!online) {
-            // offline 코어
-            cpu.percent = 0.0f;
-        } else {
+        if (read_android_core_ctl_busy_for_cpu(cpu.cpu_id, busy, online) && online) {
             float p = std::clamp(static_cast<float>(busy), 0.0f, 100.0f);
-            cpu.percent = p;
-            total_percent += p;
-            counted++;
-        }
 
-        // period 쪽은 그냥 형식 맞춰서 채워줌 (실제 그래프에서는 percent만 씀)
-        cpu.totalPeriod   = 100;
-        cpu.userPeriod    = static_cast<unsigned long long>(cpu.percent);
-        cpu.idleAllPeriod = 100 - cpu.userPeriod;
+            cpu.percent      = p;
+            cpu.totalPeriod  = 100;
+            cpu.userPeriod   = static_cast<unsigned long long>(p);
+            cpu.idleAllPeriod = 100 - cpu.userPeriod;
+
+            total_percent += p;
+            online_cores++;
+            have_core_ctl = true;
+        } else {
+            // 데이터 없음 → 일단 0으로 초기화, 필요하면 fallback에서 다시 채움
+            cpu.percent       = 0.0f;
+            cpu.totalPeriod   = 0;
+            cpu.userPeriod    = 0;
+            cpu.idleAllPeriod = 0;
+        }
     }
 
-    if (counted > 0)
-        m_cpuDataTotal.percent = total_percent / static_cast<float>(counted);
+    // ===== 2차 시도: core_ctl이 전혀 안 먹히면 cpufreq 기반 pseudo-usage =====
+    if (!have_core_ctl) {
+        SPDLOG_DEBUG("Android CPU: core_ctl not available, falling back to cpufreq-based usage");
+
+        total_percent = 0.0f;
+        online_cores  = 0;
+
+        for (auto &cpu : m_cpuData) {
+            std::string base = "/sys/devices/system/cpu/cpu" +
+                               std::to_string(cpu.cpu_id) + "/cpufreq/";
+
+            auto read_long = [](const std::string &path, long &val) -> bool {
+                std::ifstream f(path);
+                if (!f.is_open())
+                    return false;
+                long tmp = 0;
+                if (!(f >> tmp))
+                    return false;
+                val = tmp;
+                return true;
+            };
+
+            long cur = 0;
+            long minf = 0;
+            long maxf = 0;
+
+            if (!read_long(base + "scaling_cur_freq", cur)) {
+                cpu.percent = 0.0f;
+                continue;
+            }
+
+            // cpuinfo_min/max가 있으면 우선 사용, 없으면 scaling_min/max
+            if (!read_long(base + "cpuinfo_min_freq", minf))
+                read_long(base + "scaling_min_freq", minf);
+            if (!read_long(base + "cpuinfo_max_freq", maxf))
+                read_long(base + "scaling_max_freq", maxf);
+
+            if (maxf <= 0 || maxf <= minf) {
+                cpu.percent = 0.0f;
+                continue;
+            }
+
+            float frac = (static_cast<float>(cur) - static_cast<float>(minf)) /
+                         static_cast<float>(maxf - minf);
+            float p = std::clamp(frac, 0.0f, 1.0f) * 100.0f;
+
+            cpu.percent      = p;
+            cpu.totalPeriod  = 100;
+            cpu.userPeriod   = static_cast<unsigned long long>(p);
+            cpu.idleAllPeriod = 100 - cpu.userPeriod;
+
+            total_percent += p;
+            online_cores++;
+        }
+    }
+
+    if (online_cores > 0)
+        m_cpuDataTotal.percent = total_percent / static_cast<float>(online_cores);
     else
         m_cpuDataTotal.percent = 0.0f;
 
     m_cpuDataTotal.totalPeriod = 100;
-
     m_cpuPeriod   = 1.0;
     m_updatedCPUs = true;
     return true;
