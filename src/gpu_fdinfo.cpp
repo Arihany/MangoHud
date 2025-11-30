@@ -730,27 +730,13 @@ int GPU_fdinfo::get_kgsl_load() {
         if (b == 0)
             return 0;
 
-        if (kgsl_total_prev == 0 || a < kgsl_busy_prev || b < kgsl_total_prev) {
-            kgsl_busy_prev  = a;
-            kgsl_total_prev = b;
-            return 0;
-        }
-
-        uint64_t delta_busy  = a - kgsl_busy_prev;
-        uint64_t delta_total = b - kgsl_total_prev;
-
-        kgsl_busy_prev  = a;
-        kgsl_total_prev = b;
-
-        if (delta_total == 0 || delta_busy <= 0)
-            return 0;
-
-        double load = (double)delta_busy * 100.0 / (double)delta_total;
+        double load = static_cast<double>(a) * 100.0 / static_cast<double>(b);
         if (load < 0.0)   load = 0.0;
         if (load > 100.0) load = 100.0;
-        return (int)std::round(load);
+        return static_cast<int>(std::round(load));
     }
 
+    // 2) gpu_busy_percentage / gpu_busy_percent: "NN"
     try {
         int v = std::stoi(line);
         if (v < 0)   v = 0;
