@@ -8,9 +8,6 @@
 #include "hud_elements.h"
 #endif
 
-// iostats.h에 정의되어 있지 않을 경우를 대비한 안전장치
-using Clock = std::chrono::steady_clock;
-
 struct iostats g_io_stats;
 
 void getIoStats(iostats& io)
