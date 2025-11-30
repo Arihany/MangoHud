@@ -4,6 +4,27 @@
 #include "hud_elements.h"
 #endif
 
+namespace {
+
+const std::vector<std::string> kIntelThrottlePower = {
+    "reason_pl1",
+    "reason_pl2"
+};
+
+const std::vector<std::string> kIntelThrottleCurrent = {
+    "reason_pl4",
+    "reason_vr_tdc"
+};
+
+const std::vector<std::string> kIntelThrottleTemp = {
+    "reason_prochot",
+    "reason_ratl",
+    "reason_thermal",
+    "reason_vr_thermalert"
+};
+
+}
+
 int GPU_fdinfo::kgsl_freq_norm_mode = -1;
 
 namespace fs = ghc::filesystem;
@@ -457,15 +478,15 @@ void GPU_fdinfo::find_i915_gt_dir()
        SPDLOG_WARN("Intel i915 gt dir: failed to open {}", throttle_status_path);
     } else {
         load_xe_i915_throttle_reasons(throttle_folder,
-                                      intel_throttle_power,
+                                      kIntelThrottlePower,
                                       throttle_power_streams);
 
         load_xe_i915_throttle_reasons(throttle_folder,
-                                      intel_throttle_current,
+                                      kIntelThrottleCurrent,
                                       throttle_current_streams);
 
         load_xe_i915_throttle_reasons(throttle_folder,
-                                      intel_throttle_temp,
+                                      kIntelThrottleTemp,
                                       throttle_temp_streams);
     }
 }
@@ -541,8 +562,8 @@ void GPU_fdinfo::find_xe_gt_dir()
 }
 
 void GPU_fdinfo::load_xe_i915_throttle_reasons(
-    std::string throttle_folder,
-    std::vector<std::string> throttle_reasons,
+    const std::string& throttle_folder,
+    const std::vector<std::string>& throttle_reasons,
     std::vector<std::ifstream>& throttle_reason_streams
 ) {
     for (const auto& throttle_reason : throttle_reasons) {
