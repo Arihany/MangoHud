@@ -1,5 +1,4 @@
 #include "cpu.h"
-#include <ctype.h>
 #include <memory>
 #include <string>
 #include <iostream>
@@ -13,7 +12,6 @@
 #include <spdlog/spdlog.h>
 #include "string_utils.h"
 #include "gpu.h"
-#include "hud_elements.h"
 
 #ifndef TEST_ONLY
 #include "hud_elements.h"
@@ -37,49 +35,50 @@
 
 #include "file_utils.h"
 
-#include "file_utils.h"
-
 #if defined(__ANDROID__)
-static bool g_android_core_ctl_backend = false;
-
-static bool read_android_core_ctl_busy(int &busy)
+// Android: enumerate cpu cores from /sys/devices/system/cpu (cpu0, cpu1, ...)
+static bool android_enumerate_cpus(std::vector<CPUData>& out, CPUData& total)
 {
-    const char *path = "/sys/devices/system/cpu/cpu0/core_ctl/global_state";
-    std::ifstream file(path);
-    if (!file.is_open()) {
-        SPDLOG_DEBUG("core_ctl: failed to open {}", path);
+    const char* base = "/sys/devices/system/cpu";
+    DIR* dir = opendir(base);
+    if (!dir) {
+        SPDLOG_ERROR("Android CPU: failed to open {}", base);
         return false;
     }
 
-    std::string line;
-    while (std::getline(file, line)) {
-        auto pos = line.find("Busy%");
-        if (pos == std::string::npos)
+    out.clear();
+    struct dirent* ent = nullptr;
+
+    while ((ent = readdir(dir)) != nullptr) {
+        const char* name = ent->d_name;
+        if (strncmp(name, "cpu", 3) != 0)
             continue;
 
-        auto colon = line.find(':', pos);
-        if (colon == std::string::npos)
+        char* end = nullptr;
+        long id = strtol(name + 3, &end, 10);
+        if (!end || *end != '\0')
+            continue;
+        if (id < 0 || id > 1024) // sane bound
             continue;
 
-        std::string val = line.substr(colon + 1);
-        // trim
-        auto first = val.find_first_not_of(" \t\r\n");
-        auto last  = val.find_last_not_of(" \t\r\n");
-        if (first == std::string::npos || last == std::string::npos)
-            return false;
-        val = val.substr(first, last - first + 1);
-
-        if (!try_stoi(busy, val)) {
-            SPDLOG_DEBUG("core_ctl: failed to parse Busy% from '{}'", val);
-            return false;
-        }
-
-        SPDLOG_DEBUG("core_ctl: Busy% = {}", busy);
-        return true;
+        CPUData cpu{};
+        cpu.cpu_id     = static_cast<int>(id);
+        cpu.totalTime  = 1;
+        cpu.totalPeriod = 1;
+        out.push_back(cpu);
     }
 
-    SPDLOG_DEBUG("core_ctl: Busy% line not found");
-    return false;
+    closedir(dir);
+
+    std::sort(out.begin(), out.end(),
+              [](const CPUData& a, const CPUData& b){ return a.cpu_id < b.cpu_id; });
+
+    total = {};
+    total.totalTime  = 1;
+    total.totalPeriod = 1;
+
+    SPDLOG_INFO("Android CPU: detected {} cores from sysfs", out.size());
+    return !out.empty();
 }
 #endif
 
@@ -165,48 +164,22 @@ bool CPUStats::Init()
         return true;
 
 #if defined(__ANDROID__)
-    m_cpuData.clear();
-
-    DIR* dir = opendir("/sys/devices/system/cpu");
-    if (!dir) {
-        SPDLOG_ERROR("Failed to open /sys/devices/system/cpu");
-        return false;
-    }
-
-    struct dirent* de;
-    while ((de = readdir(dir))) {
-        if (strncmp(de->d_name, "cpu", 3) != 0)
-            continue;
-        unsigned char c = (unsigned char)de->d_name[3];
-        if (!isdigit(c))
-            continue;
-
-        int id = atoi(de->d_name + 3);
-        if (id < 0)
-            continue;
-
-        CPUData cpu = {};
-        cpu.cpu_id     = id;
-        cpu.totalTime  = 1;
-        cpu.totalPeriod = 1;
-        m_cpuData.push_back(cpu);
-    }
-    closedir(dir);
-
-    std::sort(m_cpuData.begin(), m_cpuData.end(),
-              [](const CPUData& a, const CPUData& b) {
-                  return a.cpu_id < b.cpu_id;
-              });
+    // Android / Winlator: do NOT use /proc/stat (permission denied),
+    // enumerate cores from /sys/devices/system/cpu instead.
+    if (android_enumerate_cpus(m_cpuData, m_cpuDataTotal)) {
 
 #ifndef TEST_ONLY
-    if (get_params()->enabled[OVERLAY_PARAM_ENABLED_core_type])
-        get_cpu_cores_types();
+        if (get_params()->enabled[OVERLAY_PARAM_ENABLED_core_type])
+            get_cpu_cores_types();
 #endif
 
-    m_inited = true;
-    return UpdateCPUData();
+        m_inited = true;
+        return UpdateCPUData();
+    }
 
-#else
+    SPDLOG_WARN("Android CPU: sysfs enumeration failed, falling back to /proc/stat");
+#endif
+
     std::string line;
     std::ifstream file (PROCSTATFILE);
     bool first = true;
@@ -246,7 +219,6 @@ bool CPUStats::Init()
 
     m_inited = true;
     return UpdateCPUData();
-#endif
 }
 
 bool CPUStats::Reinit()
@@ -262,82 +234,62 @@ bool CPUStats::UpdateCPUData()
         return false;
 
 #if defined(__ANDROID__)
-    const char* path = "/sys/devices/system/cpu/cpu0/core_ctl/global_state";
-    FILE* fp = fopen(path, "r");
-    if (!fp) {
-        SPDLOG_ERROR("Failed to open {}", path);
-        return false;
-    }
+    // -------- Android / core_ctl backend --------
+    bool any_busy = false;
+    float total_percent = 0.0f;
+    int   online_cores = 0;
 
-    std::vector<float> busy;
-    int current_cpu = -1;
-    char buf[256];
+    for (auto& cpu : m_cpuData) {
+        std::string path = "/sys/devices/system/cpu/cpu" +
+                           std::to_string(cpu.cpu_id) +
+                           "/core_ctl/global_state";
 
-    while (fgets(buf, sizeof(buf), fp)) {
-        int id = -1;
-
-        if (sscanf(buf, "CPU: %d", &id) == 1) {
-            current_cpu = id;
+        std::ifstream f(path);
+        if (!f.is_open()) {
+            SPDLOG_DEBUG("Android CPU: no core_ctl for cpu{}", cpu.cpu_id);
+            cpu.percent = 0.0f;
             continue;
         }
 
-        if (sscanf(buf, "CPU%d", &id) == 1) {
-            current_cpu = id;
+        std::string line;
+        int busy = -1;
+        int online = 1;
+
+        while (std::getline(f, line)) {
+            if (line.find("Online:") == 0) {
+                int tmp = 1;
+                if (sscanf(line.c_str(), "Online: %d", &tmp) == 1)
+                    online = tmp;
+            } else if (line.find("Busy%") != std::string::npos) {
+                int tmp = -1;
+                if (sscanf(line.c_str(), "%*[^0-9]%d", &tmp) == 1)
+                    busy = tmp;
+            }
+        }
+
+        if (online == 0 || busy < 0) {
+            cpu.percent = 0.0f;
             continue;
         }
 
-        int b = -1;
-        if (sscanf(buf, "Busy%%: %d", &b) == 1) {
-            if (current_cpu < 0)
-                continue;
-
-            if ((size_t)(current_cpu + 1) > busy.size())
-                busy.resize(current_cpu + 1, 0.0f);
-
-            busy[current_cpu] = (float)b;
-        }
-    }
-    fclose(fp);
-
-    if (busy.empty()) {
-        SPDLOG_ERROR("core_ctl global_state contained no Busy%% lines");
-        return false;
+        cpu.percent = static_cast<float>(busy);
+        any_busy = true;
+        total_percent += cpu.percent;
+        online_cores++;
     }
 
-    float total = 0.0f;
-    size_t count = 0;
-
-    for (size_t i = 0; i < m_cpuData.size(); ++i) {
-        CPUData& cpu = m_cpuData[i];
-        float p = 0.0f;
-
-        if (cpu.cpu_id >= 0 && (size_t)cpu.cpu_id < busy.size())
-            p = busy[cpu.cpu_id];
-
-        if (p < 0.0f)   p = 0.0f;
-        if (p > 100.0f) p = 100.0f;
-
-        cpu.percent = p;
-        total += p;
-        ++count;
-
-        cpu.totalPeriod = 1;
-        cpu.totalTime  += 1;
-    }
-
-    if (count > 0) {
-        float avg = total / (float)count;
-        if (avg < 0.0f)   avg = 0.0f;
-        if (avg > 100.0f) avg = 100.0f;
-        m_cpuDataTotal.percent = avg;
-    } else {
+    if (!any_busy || online_cores == 0) {
         m_cpuDataTotal.percent = 0.0f;
+    } else {
+        m_cpuDataTotal.percent = total_percent / static_cast<float>(online_cores);
     }
 
-    m_cpuDataTotal.totalPeriod = 1;
-    m_cpuDataTotal.totalTime  += 1;
+    if (m_cpuData.empty()) {
+        m_cpuPeriod = 0.0;
+    } else {
+        m_cpuPeriod = 1.0;
+    }
 
-    m_cpuPeriod   = 1.0;
     m_updatedCPUs = true;
     return true;
 
@@ -406,6 +358,24 @@ bool CPUStats::UpdateCPUData()
 bool CPUStats::UpdateCoreMhz() {
     m_coreMhz.clear();
     FILE *fp;
+
+#if defined(__ANDROID__)
+    // Android: best-effort cpufreq only, no /proc/cpuinfo fallback
+    for (auto& cpu : m_cpuData) {
+        std::string path = "/sys/devices/system/cpu/cpu" +
+                           std::to_string(cpu.cpu_id) +
+                           "/cpufreq/scaling_cur_freq";
+        if ((fp = fopen(path.c_str(), "r"))) {
+            int64_t temp;
+            if (fscanf(fp, "%" PRId64, &temp) != 1)
+                temp = 0;
+            cpu.mhz = temp / 1000;
+            fclose(fp);
+        } else {
+            cpu.mhz = 0;
+        }
+    }
+#else
     static bool scaling_freq = true;
     if (scaling_freq){
         for (auto& cpu : m_cpuData){
@@ -435,6 +405,7 @@ bool CPUStats::UpdateCoreMhz() {
             }
         }
     }
+#endif
 
     m_cpuDataTotal.cpu_mhz = 0;
     for (auto data : m_cpuData)
