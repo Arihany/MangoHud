@@ -176,6 +176,16 @@ public:
             drm_engine_type, drm_memory_type
         );
 
+        SPDLOG_INFO(
+            "GPU_fdinfo backend: module=\"{}\", drm_engine_type=\"{}\", drm_memory_type=\"{}\", "
+            "has_fdinfo={} has_kgsl_streams={}",
+            module,
+            drm_engine_type,
+            drm_memory_type,
+            !fdinfo_data.empty(),
+            !kgsl_streams.empty()
+        );
+
         if (called_from_amdgpu_cpp)
             return;
 
