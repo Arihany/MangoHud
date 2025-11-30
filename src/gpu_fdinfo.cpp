@@ -398,7 +398,7 @@ int GPU_fdinfo::get_gpu_load()
 
     if (module == "msm_drm" && result <= 0.0f) {
         int kgsl = get_kgsl_load();
-        SPDLOG_DEBUG("gpu_load: msm_drm fallback to kgsl load={}", kgsl);
+        SPDLOG_INFO("gpu_load: msm_drm fallback to kgsl load={}", kgsl);
         if (kgsl > 0)
             result = static_cast<float>(kgsl);
     }
@@ -722,24 +722,24 @@ int GPU_fdinfo::get_kgsl_load_effective() {
     }
 
     int raw = get_kgsl_load_raw();
-    SPDLOG_DEBUG("kgsl: raw load = {}", raw);
+    SPDLOG_INFO("kgsl: raw load = {}", raw);
     if (raw <= 0)
         return raw;
 
     if (kgsl_freq_norm_mode == 0) {
-        SPDLOG_DEBUG("kgsl: freq normalization disabled, returning raw={}", raw);
+        SPDLOG_INFO("kgsl: freq normalization disabled, returning raw={}", raw);
         return raw;
     }
 
     double ratio = get_kgsl_freq_ratio();
-    SPDLOG_DEBUG("kgsl: freq ratio = {}", ratio);
+    SPDLOG_INFO("kgsl: freq ratio = {}", ratio);
     if (ratio <= 0.0) {
-        SPDLOG_DEBUG("kgsl: freq ratio invalid (<=0), returning raw={}", raw);
+        SPDLOG_INFO("kgsl: freq ratio invalid (<=0), returning raw={}", raw);
         return raw;
     }
 
     double norm = static_cast<double>(raw) * ratio;
-    SPDLOG_DEBUG("kgsl: normalized load = raw={} * ratio={} => {}", raw, ratio, norm);
+    SPDLOG_INFO("kgsl: normalized load = raw={} * ratio={} => {}", raw, ratio, norm);
 
     if (norm < 0.0)
         norm = 0.0;
@@ -747,7 +747,7 @@ int GPU_fdinfo::get_kgsl_load_effective() {
         norm = 100.0;
 
     int result = static_cast<int>(std::lround(norm));
-    SPDLOG_DEBUG("kgsl: normalized load (clamped) = {}", result);
+    SPDLOG_INFO("kgsl: normalized load (clamped) = {}", result);
     return result;
 }
 
@@ -819,7 +819,7 @@ double GPU_fdinfo::get_kgsl_freq_ratio() {
                || read_kgsl_u64(base + "/max_gpuclk", max);
 
     if (!cur_ok || !max_ok || cur == 0 || max == 0) {
-        SPDLOG_DEBUG(
+        SPDLOG_INFO(
             "kgsl: freq ratio unavailable (cur_ok={}, max_ok={}, cur={}, max={})",
             cur_ok, max_ok, cur, max
         );
@@ -827,14 +827,14 @@ double GPU_fdinfo::get_kgsl_freq_ratio() {
     }
 
     double ratio = static_cast<double>(cur) / static_cast<double>(max);
-    SPDLOG_DEBUG("kgsl: freq raw ratio cur={} max={} -> {}", cur, max, ratio);
+    SPDLOG_INFO("kgsl: freq raw ratio cur={} max={} -> {}", cur, max, ratio);
 
     if (ratio < 0.0)
         ratio = 0.0;
     if (ratio > 1.0)
         ratio = 1.0;
 
-    SPDLOG_DEBUG("kgsl: freq ratio (clamped 0..1) = {}", ratio);
+    SPDLOG_INFO("kgsl: freq ratio (clamped 0..1) = {}", ratio);
     return ratio;
 }
 
