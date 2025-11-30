@@ -147,6 +147,8 @@ public:
             // msm driver does not report vram usage
             drm_engine_type = "drm-engine-gpu";
         } else if (module == "msm_drm") {
+            // Adreno / KGSL + drm
+            drm_engine_type = "drm-engine-gpu";
             init_kgsl();
         } else if (module == "panfrost") {
             drm_engine_type = "drm-engine-fragment";
