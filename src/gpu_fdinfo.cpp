@@ -623,6 +623,9 @@ float GPU_fdinfo::amdgpu_helper_get_proc_vram() {
 void GPU_fdinfo::init_kgsl() {
     const std::string sys_path = "/sys/class/kgsl/kgsl-3d0";
 
+    SPDLOG_INFO("kgsl: init_kgsl() called for module=\"{}\", probing {}",
+                module, sys_path);
+
     try {
         if (!fs::exists(sys_path)) {
             SPDLOG_WARN("kgsl: {} is not found. kgsl stats will not work!", sys_path);
@@ -641,7 +644,7 @@ void GPU_fdinfo::init_kgsl() {
             continue;
         }
 
-        SPDLOG_DEBUG("kgsl: {} found", p);
+        SPDLOG_INFO("kgsl: opening {}", p);
 
         if (metric == "clock_mhz")
             gpu_clock_stream.open(p);
