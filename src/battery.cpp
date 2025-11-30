@@ -6,20 +6,33 @@ namespace fs = ghc::filesystem;
 using namespace std;
 
 void BatteryStats::numBattery() {
-    int batteryCount = 0;
-    if (!fs::exists("/sys/class/power_supply/")) {
-         batteryCount = 0;
-    }
-    fs::path path("/sys/class/power_supply/");
-    for (auto& p : fs::directory_iterator(path)) {
-        string fileName = p.path().filename();
-        if (fileName.find("BAT") != std::string::npos) {
-            battPath[batteryCount] = p.path();
-            batteryCount += 1;
-        }
-    }
-    batt_count = batteryCount;
+    batt_count = 0;
     batt_check = true;
+
+    const fs::path path("/sys/class/power_supply/");
+
+    try {
+        if (!fs::exists(path)) {
+            SPDLOG_DEBUG("Battery: {} not present", path.string());
+            return;
+        }
+
+        int batteryCount = 0;
+
+        for (auto& p : fs::directory_iterator(path)) {
+            std::string fileName = p.path().filename().string();
+            if (fileName.find("BAT") != std::string::npos) {
+                battPath[batteryCount] = p.path();
+                batteryCount += 1;
+            }
+        }
+
+        batt_count = batteryCount;
+    }
+    catch (const fs::filesystem_error& e) {
+        SPDLOG_DEBUG("Battery: failed to scan {}: {}", path.string(), e.what());
+        batt_count = 0;
+    }
 }
 
 void BatteryStats::update() {
