@@ -441,34 +441,29 @@ void android_gpu_usage_on_present(
     // 이 프레임까지 새로 완료된 submit들의 GPU 시간 합산
     float gpu_ms_this_frame = android_gpu_usage_collect_gpu_ms_locked(ctx);
 
-    // EMA로 부드럽게
-    const float alpha = 0.2f;
-
+    float gpu_ms = 0.0f;
     if (gpu_ms_this_frame > 0.0f && std::isfinite(gpu_ms_this_frame)) {
-        if (ctx->last_gpu_ms <= 0.0f)
-            ctx->last_gpu_ms = gpu_ms_this_frame;
-        else
-            ctx->last_gpu_ms = (1.0f - alpha) * ctx->last_gpu_ms + alpha * gpu_ms_this_frame;
+        gpu_ms = gpu_ms_this_frame;
     } else {
-        // 새 데이터 없으면 살짝씩 감쇠
-        ctx->last_gpu_ms *= 0.98f;
+        // 새 데이터 없으면 그냥 0으로 떨어뜨림 (sample & hold 싫으면 여기서 ctx->last_gpu_ms 유지도 가능)
+        gpu_ms = 0.0f;
     }
 
-    float raw_usage = 0.0f;
-    if (frame_cpu_ms > 0.5f && ctx->last_gpu_ms > 0.0f) {
-        raw_usage = (ctx->last_gpu_ms / frame_cpu_ms) * 100.0f;
+    ctx->last_gpu_ms = gpu_ms;
+
+    float usage = 0.0f;
+    if (frame_cpu_ms > 0.5f && gpu_ms > 0.0f) {
+        usage = (gpu_ms / frame_cpu_ms) * 100.0f;
     }
 
-    if (!std::isfinite(raw_usage))
-        raw_usage = 0.0f;
+    if (!std::isfinite(usage))
+        usage = 0.0f;
 
-    if (ctx->last_usage <= 0.0f)
-        ctx->last_usage = raw_usage;
-    else
-        ctx->last_usage = (1.0f - alpha) * ctx->last_usage + alpha * raw_usage;
+    if (usage < 0.0f)   usage = 0.0f;
+    if (usage > 150.0f) usage = 150.0f;
 
-    if (ctx->last_usage < 0.0f)   ctx->last_usage = 0.0f;
-    if (ctx->last_usage > 150.0f) ctx->last_usage = 150.0f;
+    ctx->last_usage = usage;
+
 }
 
 bool android_gpu_usage_get_metrics(
