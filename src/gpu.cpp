@@ -9,12 +9,16 @@ GPUS::GPUS() {
 #if defined(__ANDROID__)
 
     // ANDROID:
-    // - drm/kgsl/sysfs 전부 무시
-    // - Vulkan timestamp backend에서 넘겨주는 gpu_usage%를 위한
-    //   "논리 GPU 슬롯" 하나만 등록한다.
+    // - /sys/class/drm, KGSL, hwmon 전부 무시.
+    // - Vulkan timestamp 백엔드에서 계산한 gpu_usage% / gpu_time_ms를
+    //   HUD에 뿌려주기 위한 "논리 GPU" 슬롯 1개만 등록한다.
     //
-    //   실제 % 값은 vulkan.cpp 쪽 snapshot_swapchain_frame에서
-    //   sw_stats.gpu_load / gpu_time_ms로 덮어쓴다.
+    //   실제 값 주입 경로:
+    //     vulkan.cpp::snapshot_swapchain_frame(...)
+    //       → android_gpu_usage_get_metrics(...)
+    //       → selected_gpus()[0]->metrics.load / gpu_time_ms 갱신.
+    //
+    //   여기서는 오직 "이름표"와 "슬롯"만 만든다.
 
     const std::string node_name = "android-vulkan";
     const std::string driver    = "vulkan_timestamp";
