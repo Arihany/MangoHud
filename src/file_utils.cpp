@@ -29,7 +29,7 @@ std::string read_line(const std::string& filename)
     return line;
 }
 
-std::string get_basename(const std::string&& path)
+std::string get_basename(const std::string& path)
 {
     auto npos = path.find_last_of("/\\");
     if (npos == std::string::npos)
@@ -123,7 +123,16 @@ std::string read_symlink(const char * link)
     return std::string(result, (count > 0) ? count : 0);
 }
 
-std::string read_symlink(const std::string&& link)
+std::string read_symlink(const char* link)
+{
+    char result[PATH_MAX] {};
+    ssize_t count = readlink(link, result, PATH_MAX);
+    if (count <= 0)
+        return {};
+    return std::string(result, static_cast<size_t>(count));
+}
+
+std::string read_symlink(const std::string& link)
 {
     return read_symlink(link.c_str());
 }
@@ -205,44 +214,61 @@ std::string get_config_dir()
 
 bool lib_loaded(const std::string& lib, pid_t pid)
 {
-    std::string who = pid != -1 ? std::to_string(pid) : "self";
+    // 검색할 패턴은 미리 lowercase
+    const std::string needle = to_lower(lib);
+    std::string who;
 
 #if defined(__ANDROID__)
-    if (pid != -1 && pid != getpid()) {
-        SPDLOG_DEBUG("lib_loaded: skipping scan for pid={} on Android (self only)", who);
+    // Android: "self"만 허용, 나머지는 바로 포기
+    pid_t self = getpid();
+    if (pid != -1 && pid != self) {
+        SPDLOG_DEBUG("lib_loaded: skipping scan for pid={} on Android (self only)", pid);
         return false;
     }
-    if (pid == -1) {
-        who = "self";
-    } else {
-        who = std::to_string(getpid());
-    }
-#endif
 
-    auto paths = { fs::path("/proc") / who / "map_files",
-                   fs::path("/proc") / who / "fd" };
+    who = std::to_string(self);
+    fs::path base = fs::path("/proc") / who;
+
+    // Android: /proc/<pid>/fd 만 체크 (map_files는 대개 권한/의미 둘 다 애매)
+    auto paths = { base / "fd" };
+
+#else
+    // 일반 리눅스: 요청 pid 또는 self 사용
+    if (pid == -1)
+        who = "self";
+    else
+        who = std::to_string(pid);
+
+    fs::path base = fs::path("/proc") / who;
+    auto paths = { base / "map_files", base / "fd" };
+#endif
 
     for (auto& path : paths) {
         const auto path_str = path.string();
 
-        if (dir_exists(path_str)) {
-            try {
-                for (auto& p : fs::directory_iterator(path)) {
-                    auto file = p.path().string();
-                    auto sym = read_symlink(file.c_str());
-                    if (to_lower(sym).find(lib) != std::string::npos) {
-                        return true;
-                    }
+        if (!dir_exists(path_str)) {
+            SPDLOG_DEBUG("lib_loaded: tried to access path that doesn't exist {}", path_str);
+            continue;
+        }
+
+        try {
+            for (auto& p : fs::directory_iterator(path)) {
+                const auto file = p.path().string();
+                const auto sym  = read_symlink(file.c_str());
+                if (sym.empty())
+                    continue;
+
+                if (to_lower(sym).find(needle) != std::string::npos) {
+                    return true;
                 }
             }
-            catch (const fs::filesystem_error& e) {
-                SPDLOG_DEBUG("lib_loaded: cannot scan '{}': {}", path_str, e.what());
-                continue;
-            }
-        } else {
-            SPDLOG_DEBUG("tried to access path that doesn't exist {}", path_str);
+        }
+        catch (const fs::filesystem_error& e) {
+            SPDLOG_DEBUG("lib_loaded: cannot scan '{}': {}", path_str, e.what());
+            continue;
         }
     }
+
     return false;
 }
 
