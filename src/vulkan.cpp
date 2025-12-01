@@ -1826,7 +1826,13 @@ static VkResult overlay_QueueSubmit(
    struct device_data *device_data = queue_data->device;
 
 #if defined(__ANDROID__)
-   if (device_data->android_gpu_ctx) {
+   // 안드로이드 GPU 계측:
+   //  - 컨텍스트가 있고
+   //  - 실제 커맨드가 존재하며
+   //  - 그래픽 큐인 경우에만 래핑
+   if (device_data->android_gpu_ctx &&
+       submitCount > 0 &&
+       (queue_data->flags & VK_QUEUE_GRAPHICS_BIT)) {
       return android_gpu_usage_queue_submit(
           device_data->android_gpu_ctx,
           queue,
@@ -1839,7 +1845,6 @@ static VkResult overlay_QueueSubmit(
 
    return device_data->vtable.QueueSubmit(queue, submitCount, pSubmits, fence);
 }
-
 
 static VkResult overlay_CreateDevice(
     VkPhysicalDevice                            physicalDevice,
@@ -1930,27 +1935,45 @@ static VkResult overlay_CreateDevice(
     uint32_t qf_count = 0;
     instance_data->vtable.GetPhysicalDeviceQueueFamilyProperties(
         device_data->physical_device, &qf_count, nullptr);
-    std::vector<VkQueueFamilyProperties> qf(qf_count);
-    instance_data->vtable.GetPhysicalDeviceQueueFamilyProperties(
-        device_data->physical_device, &qf_count, qf.data());
 
-    // 대충 첫 graphics 큐에서 timestampValidBits 가져오기
-    for (uint32_t i = 0; i < qf_count; ++i) {
-        if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-            ts_valid_bits = qf[i].timestampValidBits;
-            if (ts_valid_bits)
-                break;
+    if (qf_count > 0) {
+        std::vector<VkQueueFamilyProperties> qf(qf_count);
+        instance_data->vtable.GetPhysicalDeviceQueueFamilyProperties(
+            device_data->physical_device, &qf_count, qf.data());
+
+        // 1차: graphics 큐에서 timestampValidBits 탐색
+        for (uint32_t i = 0; i < qf_count; ++i) {
+            if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+                ts_valid_bits = qf[i].timestampValidBits;
+                if (ts_valid_bits)
+                    break;
+            }
+        }
+
+        // 2차: 그래픽 큐가 0인 경우, 아무 큐나 validBits > 0인 것 하나 더 탐색
+        if (!ts_valid_bits) {
+            for (uint32_t i = 0; i < qf_count; ++i) {
+                if (qf[i].timestampValidBits) {
+                    ts_valid_bits = qf[i].timestampValidBits;
+                    break;
+                }
+            }
         }
     }
-    if (!ts_valid_bits && qf_count > 0)
-        ts_valid_bits = qf[0].timestampValidBits ? qf[0].timestampValidBits : 64;
 
-    device_data->android_gpu_ctx =
-        android_gpu_usage_create(device_data->physical_device,
-                                 device_data->device,
-                                 ts_ns,
-                                 ts_valid_bits,
-                                 disp);
+    if (ts_ns <= 0.0f || !ts_valid_bits) {
+        SPDLOG_WARN(
+            "Android GPU usage: disabling Vulkan timestamp backend "
+            "(timestampPeriod={}, validBits={})",
+            ts_ns, ts_valid_bits);
+    } else {
+        device_data->android_gpu_ctx =
+            android_gpu_usage_create(device_data->physical_device,
+                                     device_data->device,
+                                     ts_ns,
+                                     ts_valid_bits,
+                                     disp);
+    }
 }
 #endif
 
