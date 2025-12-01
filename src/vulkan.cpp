@@ -62,7 +62,8 @@
 #include "fps_limiter.h"
 
 #if defined(__ANDROID__)
-#include "android_gpu_vk_usage.h" 
+#include "android_gpu_vk_usage.h"
+#include "gpu.h" 
 #endif
 
 using namespace std;
@@ -477,14 +478,27 @@ static void snapshot_swapchain_frame(struct swapchain_data *data)
    check_keybinds(instance_data->params);
 
 #if defined(__ANDROID__)
-   if (device_data->android_gpu_ctx) {
-      float gpu_ms = 0.f, gpu_usage = 0.f;
-      if (android_gpu_usage_get_metrics(device_data->android_gpu_ctx, &gpu_ms, &gpu_usage)) {
-         data->sw_stats.gpu_time_ms = gpu_ms;
-         data->sw_stats.gpu_load    = gpu_usage;
+   if (device_data->android_gpu_ctx && gpus) {
+      float gpu_ms = 0.f;
+      float gpu_usage = 0.f;
+
+      if (android_gpu_usage_get_metrics(device_data->android_gpu_ctx,
+                                        &gpu_ms, &gpu_usage)) {
+         // 일단 첫 번째 선택 GPU에만 꽂는다.
+         auto selected = gpus->selected_gpus();
+         if (!selected.empty()) {
+            auto& gpu = selected[0];
+
+            int load = static_cast<int>(gpu_usage + 0.5f);
+            if (load < 0)   load = 0;
+            if (load > 100) load = 100;
+
+            gpu->metrics.load = load;
+            // gpu_ms는 지금은 HUD에 안 쓰고, 내부 계산용으로만 유지
+         }
       }
    }
-#endif   
+#endif
    
 #ifdef __linux__
    if (instance_data->params.control >= 0) {
