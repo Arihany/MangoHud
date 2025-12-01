@@ -1902,11 +1902,26 @@ static VkResult overlay_CreateDevice(
 
 #if defined(__ANDROID__)
 {
-    const float ts_period_ns = device_data->properties.limits.timestampPeriod;
+    AndroidVkGpuDispatch disp {};
+    disp.QueueSubmit          = device_data->vtable.QueueSubmit;
+    disp.CreateQueryPool      = device_data->vtable.CreateQueryPool;
+    disp.DestroyQueryPool     = device_data->vtable.DestroyQueryPool;
+    disp.GetQueryPoolResults  = device_data->vtable.GetQueryPoolResults;
+    disp.CreateCommandPool    = device_data->vtable.CreateCommandPool;
+    disp.DestroyCommandPool   = device_data->vtable.DestroyCommandPool;
+    disp.AllocateCommandBuffers = device_data->vtable.AllocateCommandBuffers;
+    disp.FreeCommandBuffers   = device_data->vtable.FreeCommandBuffers;
+    disp.ResetCommandBuffer   = device_data->vtable.ResetCommandBuffer;
+    disp.BeginCommandBuffer   = device_data->vtable.BeginCommandBuffer;
+    disp.EndCommandBuffer     = device_data->vtable.EndCommandBuffer;
+    disp.CmdWriteTimestamp    = device_data->vtable.CmdWriteTimestamp;
+
+    float ts_ns = device_data->properties.limits.timestampPeriod;
     device_data->android_gpu_ctx =
         android_gpu_usage_create(device_data->physical_device,
                                  device_data->device,
-                                 ts_period_ns);
+                                 ts_ns,
+                                 disp);
 }
 #endif
 
