@@ -4,22 +4,25 @@
 
 // Vulkan 디스패치 테이블 모음
 struct AndroidVkGpuDispatch {
+    // 큐/쿼리 관련
     PFN_vkQueueSubmit             QueueSubmit;
     PFN_vkCreateQueryPool         CreateQueryPool;
     PFN_vkDestroyQueryPool        DestroyQueryPool;
     PFN_vkGetQueryPoolResults     GetQueryPoolResults;
 
+    // 커맨드 풀 / 버퍼
     PFN_vkCreateCommandPool       CreateCommandPool;
     PFN_vkDestroyCommandPool      DestroyCommandPool;
+    PFN_vkResetCommandPool        ResetCommandPool;
     PFN_vkAllocateCommandBuffers  AllocateCommandBuffers;
     PFN_vkFreeCommandBuffers      FreeCommandBuffers;
-    PFN_vkResetCommandBuffer      ResetCommandBuffer;
     PFN_vkBeginCommandBuffer      BeginCommandBuffer;
     PFN_vkEndCommandBuffer        EndCommandBuffer;
 
+    // 타임스탬프 / 쿼리 / 배리어
     PFN_vkCmdWriteTimestamp       CmdWriteTimestamp;
-    PFN_vkCmdResetQueryPool       CmdResetQueryPool;    // 새로 추가
-    PFN_vkCmdPipelineBarrier      CmdPipelineBarrier;   // 배리어 넣을 거면
+    PFN_vkCmdResetQueryPool       CmdResetQueryPool;
+    PFN_vkCmdPipelineBarrier      CmdPipelineBarrier;
 };
 
 struct AndroidVkGpuContext;
@@ -29,6 +32,7 @@ AndroidVkGpuContext* android_gpu_usage_create(
     VkPhysicalDevice              phys_dev,
     VkDevice                      device,
     float                         timestamp_period_ns,
+    uint32_t                      timestamp_valid_bits,
     const AndroidVkGpuDispatch&   disp);
 
 void android_gpu_usage_destroy(AndroidVkGpuContext* ctx);
