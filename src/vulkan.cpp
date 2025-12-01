@@ -1907,13 +1907,14 @@ static VkResult overlay_CreateDevice(
 
 #if defined(__ANDROID__)
 {
-    AndroidVkGpuDispatch disp {};
+    AndroidVkGpuDispatch disp{};
     disp.QueueSubmit            = device_data->vtable.QueueSubmit;
     disp.CreateQueryPool        = device_data->vtable.CreateQueryPool;
     disp.DestroyQueryPool       = device_data->vtable.DestroyQueryPool;
     disp.GetQueryPoolResults    = device_data->vtable.GetQueryPoolResults;
     disp.CreateCommandPool      = device_data->vtable.CreateCommandPool;
     disp.DestroyCommandPool     = device_data->vtable.DestroyCommandPool;
+    disp.ResetCommandPool       = device_data->vtable.ResetCommandPool;
     disp.AllocateCommandBuffers = device_data->vtable.AllocateCommandBuffers;
     disp.FreeCommandBuffers     = device_data->vtable.FreeCommandBuffers;
     disp.ResetCommandBuffer     = device_data->vtable.ResetCommandBuffer;
@@ -1921,12 +1922,34 @@ static VkResult overlay_CreateDevice(
     disp.EndCommandBuffer       = device_data->vtable.EndCommandBuffer;
     disp.CmdWriteTimestamp      = device_data->vtable.CmdWriteTimestamp;
     disp.CmdResetQueryPool      = device_data->vtable.CmdResetQueryPool;
+    disp.CmdPipelineBarrier     = device_data->vtable.CmdPipelineBarrier;
 
     float ts_ns = device_data->properties.limits.timestampPeriod;
+
+    uint32_t ts_valid_bits = 0;
+    uint32_t qf_count = 0;
+    instance_data->vtable.GetPhysicalDeviceQueueFamilyProperties(
+        device_data->physical_device, &qf_count, nullptr);
+    std::vector<VkQueueFamilyProperties> qf(qf_count);
+    instance_data->vtable.GetPhysicalDeviceQueueFamilyProperties(
+        device_data->physical_device, &qf_count, qf.data());
+
+    // 대충 첫 graphics 큐에서 timestampValidBits 가져오기
+    for (uint32_t i = 0; i < qf_count; ++i) {
+        if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+            ts_valid_bits = qf[i].timestampValidBits;
+            if (ts_valid_bits)
+                break;
+        }
+    }
+    if (!ts_valid_bits && qf_count > 0)
+        ts_valid_bits = qf[0].timestampValidBits ? qf[0].timestampValidBits : 64;
+
     device_data->android_gpu_ctx =
         android_gpu_usage_create(device_data->physical_device,
                                  device_data->device,
                                  ts_ns,
+                                 ts_valid_bits,
                                  disp);
 }
 #endif
