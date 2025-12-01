@@ -71,7 +71,6 @@ using namespace std;
 float offset_x, offset_y, hudSpacing;
 int hudFirstRow, hudSecondRow;
 VkPhysicalDeviceDriverProperties driverProps = {};
-std::string gpu;
 
 #if !defined(_WIN32)
 namespace MangoHud { namespace GL {
