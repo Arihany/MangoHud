@@ -18,7 +18,8 @@ struct AndroidVkGpuDispatch {
     PFN_vkEndCommandBuffer        EndCommandBuffer;
 
     PFN_vkCmdWriteTimestamp       CmdWriteTimestamp;
-    PFN_vkCmdResetQueryPool       CmdResetQueryPool;   // ★ 새로 추가
+    PFN_vkCmdResetQueryPool       CmdResetQueryPool;    // 새로 추가
+    PFN_vkCmdPipelineBarrier      CmdPipelineBarrier;   // 배리어 넣을 거면
 };
 
 struct AndroidVkGpuContext;
