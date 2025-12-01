@@ -5,7 +5,6 @@
 namespace fs = ghc::filesystem;
 
 GPUS::GPUS() {
-    std::set<std::string> gpu_entries;
 
 #if defined(__ANDROID__)
 
