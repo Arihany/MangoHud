@@ -1,3 +1,5 @@
+#include <atomic>
+#include <array>
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
@@ -48,7 +50,8 @@ overlay_params *_params {};
 double min_frametime, max_frametime;
 bool gpu_metrics_exists = false;
 bool steam_focused = false;
-vector<float> frametime_data(200,0.f);
+static size_t frametime_pos   = 0;
+static size_t frametime_count = 0;
 int fan_speed;
 fcatoverlay fcatstatus;
 std::string drm_dev;
@@ -59,44 +62,48 @@ void init_spdlog()
    if (spdlog::get("MANGOHUD"))
       return;
 
-   spdlog::set_default_logger(spdlog::stderr_color_mt("MANGOHUD")); // Just to get the name in log
-   if (getenv("MANGOHUD_USE_LOGFILE"))
-   {
-      try
-      {
+   auto logger = spdlog::stderr_color_mt("MANGOHUD");
+   spdlog::set_default_logger(logger);
+
+   if (getenv("MANGOHUD_USE_LOGFILE")) {
+      try {
          // Not rotating when opening log as proton/wine create multiple (sub)processes
-         auto log = std::make_shared<spdlog::sinks::rotating_file_sink_mt> (get_config_dir() + "/MangoHud/MangoHud.log", 10*1024*1024, 5, false);
-         spdlog::get("MANGOHUD")->sinks().push_back(log);
-      }
-      catch (const spdlog::spdlog_ex &ex)
-      {
+         auto log = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+            get_config_dir() + "/MangoHud/MangoHud.log",
+            10 * 1024 * 1024,
+            5,
+            false);
+         logger->sinks().push_back(log);
+      } catch (const spdlog::spdlog_ex &ex) {
          SPDLOG_ERROR("{}", ex.what());
       }
    }
+
 #ifdef DEBUG
-   spdlog::set_level(spdlog::level::level_enum::debug);
+   spdlog::set_level(spdlog::level::debug);
 #endif
+
    spdlog::cfg::load_env_levels();
 
-   // Use MANGOHUD_LOG_LEVEL to correspond to SPDLOG_LEVEL
-   if (getenv("MANGOHUD_LOG_LEVEL")) {
-      std::string log_level = getenv("MANGOHUD_LOG_LEVEL");
-      vector<string> levels;
-      levels = {"off","info","err","debug"};
-      for (auto & element : levels) {
-         transform(log_level.begin(), log_level.end(), log_level.begin(), ::tolower);
-         if(log_level == element ) {
+   const char* env = getenv("MANGOHUD_LOG_LEVEL");
+   if (env && *env) {
+      std::string log_level = env;
+      std::transform(log_level.begin(), log_level.end(), log_level.begin(), ::tolower);
+
+      static const std::array<const char*, 4> levels = { "off", "info", "err", "debug" };
+      for (auto lvl : levels) {
+         if (log_level == lvl) {
             spdlog::set_level(spdlog::level::from_str(log_level));
+            break;
          }
       }
 #ifndef DEBUG
    } else {
       std::string log_level = "info";
-      transform(log_level.begin(), log_level.end(), log_level.begin(), ::tolower);
+      std::transform(log_level.begin(), log_level.end(), log_level.begin(), ::tolower);
       spdlog::set_level(spdlog::level::from_str(log_level));
 #endif
    }
-
 }
 
 void update_hw_info(const struct overlay_params& params, uint32_t vendorID)
@@ -166,11 +173,11 @@ void update_hw_info(const struct overlay_params& params, uint32_t vendorID)
 
 struct hw_info_updater
 {
-   bool quit = false;
+   std::atomic<bool> quit{false};
    std::thread thread {};
    const struct overlay_params* params = nullptr;
-   uint32_t vendorID;
-   bool update_hw_info_thread = false;
+   uint32_t vendorID = 0;
+   std::atomic<bool> update_hw_info_thread{false};
 
    std::condition_variable cv_hwupdate;
    std::mutex m_cv_hwupdate, m_hw_updating;
@@ -178,13 +185,15 @@ struct hw_info_updater
    hw_info_updater()
    {
       thread = std::thread(&hw_info_updater::run, this);
+#if defined(__linux__) || defined(__ANDROID__)
       // Anything longer than this wouldn't fit in the 15 byte limit
       pthread_setname_np(thread.native_handle(), "mangohud-hwinfo");
+#endif
    }
 
    ~hw_info_updater()
    {
-      quit = true;
+      quit.store(true, std::memory_order_relaxed);
       cv_hwupdate.notify_all();
       if (thread.joinable())
          thread.join();
@@ -193,27 +202,30 @@ struct hw_info_updater
    void update(const struct overlay_params* params_, uint32_t vendorID_)
    {
       std::unique_lock<std::mutex> lk_hw_updating(m_hw_updating, std::try_to_lock);
-      if (lk_hw_updating.owns_lock())
-      {
-         params = params_;
+      if (lk_hw_updating.owns_lock()) {
+         params   = params_;
          vendorID = vendorID_;
-         update_hw_info_thread = true;
+         update_hw_info_thread.store(true, std::memory_order_relaxed);
          cv_hwupdate.notify_all();
       }
    }
 
-   void run(){
-      while (!quit){
+   void run()
+   {
+      while (!quit.load(std::memory_order_relaxed)) {
          std::unique_lock<std::mutex> lk_cv_hwupdate(m_cv_hwupdate);
-         cv_hwupdate.wait(lk_cv_hwupdate, [&]{ return update_hw_info_thread || quit; });
-         if (quit) break;
+         cv_hwupdate.wait(lk_cv_hwupdate, [&]{
+            return update_hw_info_thread.load(std::memory_order_relaxed) ||
+                   quit.load(std::memory_order_relaxed);
+         });
+         if (quit.load(std::memory_order_relaxed))
+            break;
 
-         if (params)
-         {
+         if (params) {
             std::unique_lock<std::mutex> lk_hw_updating(m_hw_updating);
             update_hw_info(*params, vendorID);
          }
-         update_hw_info_thread = false;
+         update_hw_info_thread.store(false, std::memory_order_relaxed);
       }
    }
 };
@@ -226,19 +238,32 @@ void stop_hw_updater()
       hw_update_thread.reset();
 }
 
-void update_hud_info_with_frametime(struct swapchain_stats& sw_stats, const struct overlay_params& params, uint32_t vendorID, uint64_t frametime_ns){
+void update_hud_info_with_frametime(struct swapchain_stats& sw_stats,
+                                    const struct overlay_params& params,
+                                    uint32_t vendorID,
+                                    uint64_t frametime_ns)
+{
    auto real_params = get_params();
    uint32_t f_idx = sw_stats.n_frames % ARRAY_SIZE(sw_stats.frames_stats);
    uint64_t now = os_time_get_nano(); /* ns */
    auto elapsed = now - sw_stats.last_fps_update; /* ns */
+
    float frametime_ms = frametime_ns / 1000000.f;
+   if (frametime_ms <= 0.0f)
+      frametime_ms = 0.0001f; // 방어용, fps 계산 분모 보호
 
    if (sw_stats.last_present_time) {
-        sw_stats.frames_stats[f_idx].stats[OVERLAY_PLOTS_frame_timing] =
-            frametime_ns;
-      frametime_data.push_back(frametime_ms);
-      frametime_data.erase(frametime_data.begin());
+      sw_stats.frames_stats[f_idx].stats[OVERLAY_PLOTS_frame_timing] = frametime_ns;
+
+      const auto history_size = frametime_data.size();
+      if (history_size) {
+         frametime_data[frametime_pos] = frametime_ms;
+         frametime_pos = (frametime_pos + 1) % history_size;
+         if (frametime_count < history_size)
+            ++frametime_count;
+      }
    }
+
 #ifdef __linux__
    if (gpus)
       gpus->update_throttling();
@@ -253,18 +278,22 @@ void update_hud_info_with_frametime(struct swapchain_stats& sw_stats, const stru
       FTrace::object->update();
    }
 #endif
+
    frametime = frametime_ms;
-   fps = double(1000 / frametime_ms);
-   if (fpsmetrics) fpsmetrics->update(frametime_ms);
+   fps = 1000.0 / frametime_ms;
+   if (fpsmetrics)
+      fpsmetrics->update(frametime_ms);
 
    if (elapsed >= real_params->fps_sampling_period) {
       if (!hw_update_thread)
          hw_update_thread = std::make_unique<hw_info_updater>();
       hw_update_thread->update(&params, vendorID);
 
-      if (fpsmetrics) fpsmetrics->update_thread();
+      if (fpsmetrics)
+         fpsmetrics->update_thread();
 #ifdef __linux__
-      if (HUDElements.net) HUDElements.net->update();
+      if (HUDElements.net)
+         HUDElements.net->update();
 #endif
 
       sw_stats.fps = 1000000000.0 * sw_stats.n_frames_since_update / elapsed;
@@ -277,7 +306,8 @@ void update_hud_info_with_frametime(struct swapchain_stats& sw_stats, const stru
       }
 
       if (real_params->autostart_log && logger && !logger->autostart_init) {
-         if ((std::chrono::steady_clock::now() - HUDElements.overlay_start) > std::chrono::seconds(real_params->autostart_log)){
+         if ((std::chrono::steady_clock::now() - HUDElements.overlay_start) >
+             std::chrono::seconds(real_params->autostart_log)) {
             logger->start_logging();
             logger->autostart_init = true;
          }
@@ -285,20 +315,21 @@ void update_hud_info_with_frametime(struct swapchain_stats& sw_stats, const stru
 
       sw_stats.n_frames_since_update = 0;
       sw_stats.last_fps_update = now;
-
    }
-   auto min = std::min_element(frametime_data.begin(), frametime_data.end());
-   auto max = std::max_element(frametime_data.begin(), frametime_data.end());
-   min_frametime = min[0];
-   max_frametime = max[0];
-   // double min_time = UINT64_MAX, max_time = 0;
-   // for (auto& stat : sw_stats.frames_stats ){
-   //    min_time = MIN2(stat.stats[0], min_time);
-   //    max_time = MAX2(stat.stats[0], min_time);
-   // }
-   // min_frametime = min_time / sw_stats.time_dividor;
-   // max_frametime = max_time / sw_stats.time_dividor;
-   if (real_params->log_interval == 0){
+
+   if (frametime_count > 0) {
+      auto begin = frametime_data.begin();
+      auto end   = begin + frametime_count;
+      auto min_it = std::min_element(begin, end);
+      auto max_it = std::max_element(begin, end);
+      min_frametime = *min_it;
+      max_frametime = *max_it;
+   } else {
+      // 초기 구간: 0으로 채워진 벡터 대신, 방금 측정값으로 세팅
+      min_frametime = max_frametime = frametime_ms;
+   }
+
+   if (real_params->log_interval == 0 && logger) {
       logger->try_log();
    }
 
@@ -691,7 +722,7 @@ void render_imgui(swapchain_stats& data, struct overlay_params& params, ImVec2& 
    if(real_params->enabled[OVERLAY_PARAM_ENABLED_horizontal])
       table_flags = ImGuiTableFlags_NoClip | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoHostExtendX;
 
-   if (!real_params->no_display && !steam_focused && get_params()->table_columns){
+   if (!real_params->no_display && !steam_focused && real_params->table_columns) {
       ImGui::Begin("Main", &gui_open, ImGuiWindowFlags_NoDecoration);
       if (ImGui::BeginTable("hud", real_params->table_columns, table_flags )) {
          HUDElements.place = 0;
