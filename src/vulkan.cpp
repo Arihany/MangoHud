@@ -11,7 +11,7 @@
  * The above copyright notice and this permission notice (including the next
  * paragraph) shall be included in all copies or substantial portions of the
  * Software.
- *
+ *ㄹ
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
@@ -483,7 +483,6 @@ static void snapshot_swapchain_frame(struct swapchain_data *data)
 
       if (android_gpu_usage_get_metrics(device_data->android_gpu_ctx,
                                         &gpu_ms, &gpu_usage)) {
-         // 일단 첫 번째 선택 GPU에만 꽂는다.
          auto selected = gpus->selected_gpus();
          if (!selected.empty()) {
             auto& gpu = selected[0];
@@ -493,12 +492,11 @@ static void snapshot_swapchain_frame(struct swapchain_data *data)
             if (load > 100) load = 100;
 
             gpu->metrics.load = load;
-            // gpu_ms는 지금은 HUD에 안 쓰고, 내부 계산용으로만 유지
          }
       }
    }
 #endif
-   
+
 #ifdef __linux__
    if (instance_data->params.control >= 0) {
       control_client_check(instance_data->params.control, instance_data->control_client, gpu.c_str());
@@ -506,6 +504,7 @@ static void snapshot_swapchain_frame(struct swapchain_data *data)
    }
 #endif
 }
+
 
 static void compute_swapchain_display(struct swapchain_data *data)
 {
@@ -1680,10 +1679,6 @@ static VkResult overlay_QueuePresentKHR(
    struct queue_data *queue_data = FIND(struct queue_data, queue);
    struct device_data *device_data = queue_data->device;
 
-   /* Otherwise we need to add our overlay drawing semaphore to the list of
-    * semaphores to wait on. If we don't do that the presented picture might
-    * be have incomplete overlay drawings.
-    */
    VkResult result = VK_SUCCESS;
    for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
       VkSwapchainKHR swapchain = pPresentInfo->pSwapchains[i];
@@ -1715,11 +1710,6 @@ static VkResult overlay_QueuePresentKHR(
                                                    i == 0 ? pPresentInfo->waitSemaphoreCount : 0,
                                                    image_index);
 
-      /* Because the submission of the overlay draw waits on the semaphores
-         * handed for present, we don't need to have this present operation
-         * wait on them as well, we can just wait on the overlay submission
-         * semaphore.
-         */
       if (draw) {
          present_info.pWaitSemaphores = &draw->semaphore;
          present_info.waitSemaphoreCount = 1;
@@ -1837,7 +1827,6 @@ static VkResult overlay_QueueSubmit(
 
 #if defined(__ANDROID__)
    if (device_data->android_gpu_ctx) {
-      // 여기서 queue_family_index를 android 측에 넘겨준다.
       return android_gpu_usage_queue_submit(
           device_data->android_gpu_ctx,
           queue,
@@ -1848,7 +1837,6 @@ static VkResult overlay_QueueSubmit(
    }
 #endif
 
-   // 안드로이드 아니거나 ctx 없는 경우: 기존 동작 그대로
    return device_data->vtable.QueueSubmit(queue, submitCount, pSubmits, fence);
 }
 
@@ -1920,19 +1908,19 @@ static VkResult overlay_CreateDevice(
 #if defined(__ANDROID__)
 {
     AndroidVkGpuDispatch disp {};
-    disp.QueueSubmit          = device_data->vtable.QueueSubmit;
-    disp.CreateQueryPool      = device_data->vtable.CreateQueryPool;
-    disp.DestroyQueryPool     = device_data->vtable.DestroyQueryPool;
-    disp.GetQueryPoolResults  = device_data->vtable.GetQueryPoolResults;
-    disp.CreateCommandPool    = device_data->vtable.CreateCommandPool;
-    disp.DestroyCommandPool   = device_data->vtable.DestroyCommandPool;
+    disp.QueueSubmit            = device_data->vtable.QueueSubmit;
+    disp.CreateQueryPool        = device_data->vtable.CreateQueryPool;
+    disp.DestroyQueryPool       = device_data->vtable.DestroyQueryPool;
+    disp.GetQueryPoolResults    = device_data->vtable.GetQueryPoolResults;
+    disp.CreateCommandPool      = device_data->vtable.CreateCommandPool;
+    disp.DestroyCommandPool     = device_data->vtable.DestroyCommandPool;
     disp.AllocateCommandBuffers = device_data->vtable.AllocateCommandBuffers;
-    disp.FreeCommandBuffers   = device_data->vtable.FreeCommandBuffers;
-    disp.ResetCommandBuffer   = device_data->vtable.ResetCommandBuffer;
-    disp.BeginCommandBuffer   = device_data->vtable.BeginCommandBuffer;
-    disp.EndCommandBuffer     = device_data->vtable.EndCommandBuffer;
-    disp.CmdWriteTimestamp    = device_data->vtable.CmdWriteTimestamp;
-    disp.CmdResetQueryPool    = device_data->vtable.CmdResetQueryPool;
+    disp.FreeCommandBuffers     = device_data->vtable.FreeCommandBuffers;
+    disp.ResetCommandBuffer     = device_data->vtable.ResetCommandBuffer;
+    disp.BeginCommandBuffer     = device_data->vtable.BeginCommandBuffer;
+    disp.EndCommandBuffer       = device_data->vtable.EndCommandBuffer;
+    disp.CmdWriteTimestamp      = device_data->vtable.CmdWriteTimestamp;
+    disp.CmdResetQueryPool      = device_data->vtable.CmdResetQueryPool;
 
     float ts_ns = device_data->properties.limits.timestampPeriod;
     device_data->android_gpu_ctx =
