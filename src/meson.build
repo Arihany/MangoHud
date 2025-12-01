@@ -97,6 +97,13 @@ if is_unixy or host_machine.system() == 'android'
     'ftrace.cpp',
   )
 
+  # Android Vulkan GPU usage backend
+  if host_machine.system() == 'android'
+    vklayer_files += files(
+      'android_gpu_vk_usage.cpp',
+    )
+  endif
+
   if get_option('with_fex')
     pre_args += '-DHAVE_FEX'
     vklayer_files += files(
