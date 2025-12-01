@@ -65,27 +65,12 @@
 #include "android_gpu_vk_usage.h" 
 #endif
 
-struct device_data {
-   instance_data *instance;
-
-   PFN_vkSetDeviceLoaderData set_device_loader_data;
-   vk_device_dispatch_table vtable;
-   VkPhysicalDevice physical_device;
-   VkDevice device;
-   VkPhysicalDeviceProperties properties;
-   queue_data *graphic_queue;
-   std::vector<queue_data *> queues;
-
-#if defined(__ANDROID__)
-   AndroidVkGpuContext* android_gpu_ctx = nullptr;
-#endif
-};
-
 using namespace std;
 
 float offset_x, offset_y, hudSpacing;
 int hudFirstRow, hudSecondRow;
 VkPhysicalDeviceDriverProperties driverProps = {};
+std::string gpu;
 
 #if !defined(_WIN32)
 namespace MangoHud { namespace GL {
@@ -122,6 +107,10 @@ struct device_data {
    struct queue_data *graphic_queue;
 
    std::vector<struct queue_data *> queues;
+
+#if defined(__ANDROID__)
+   AndroidVkGpuContext* android_gpu_ctx = nullptr;
+#endif
 };
 
 /* Mapped from VkCommandBuffer */
@@ -1978,10 +1967,8 @@ static VkResult overlay_CreateInstance(
    enum EngineTypes engine = EngineTypes::UNKNOWN;
    const char* pEngineName = nullptr;
 
-   struct instance_data *instance_data = new_instance_data(*pInstance); 
    if (pCreateInfo->pApplicationInfo) {
       pEngineName = pCreateInfo->pApplicationInfo->pEngineName;
-      instance_data->applicationVersion = pCreateInfo->pApplicationInfo->applicationVersion;
    }
    if (pEngineName)
    {
@@ -2030,6 +2017,10 @@ static VkResult overlay_CreateInstance(
    VkResult result = fpCreateInstance(pCreateInfo, pAllocator, pInstance);
    if (result != VK_SUCCESS) return result;
 
+  struct instance_data *instance_data = new_instance_data(*pInstance);
+  if (pCreateInfo->pApplicationInfo)
+      instance_data->applicationVersion = pCreateInfo->pApplicationInfo->applicationVersion;
+   
    vk_load_instance_commands(instance_data->instance,
                              fpGetInstanceProcAddr,
                              &instance_data->vtable);
