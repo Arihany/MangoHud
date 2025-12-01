@@ -1932,6 +1932,7 @@ static VkResult overlay_CreateDevice(
     disp.BeginCommandBuffer   = device_data->vtable.BeginCommandBuffer;
     disp.EndCommandBuffer     = device_data->vtable.EndCommandBuffer;
     disp.CmdWriteTimestamp    = device_data->vtable.CmdWriteTimestamp;
+    disp.CmdResetQueryPool    = device_data->vtable.CmdResetQueryPool;
 
     float ts_ns = device_data->properties.limits.timestampPeriod;
     device_data->android_gpu_ctx =
