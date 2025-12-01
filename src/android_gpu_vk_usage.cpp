@@ -168,7 +168,14 @@ static void android_gpu_usage_record_slot_cmds(AndroidVkGpuContext* ctx,
     ctx->disp.BeginCommandBuffer(slot.cmd_begin, &bi);
 
     // 해당 슬롯의 2개 쿼리 reset
-    vkCmdResetQueryPool(slot.cmd_begin, ctx->query_pool, slot.query_first, 2);
+    if (ctx->disp.CmdResetQueryPool) {
+        ctx->disp.CmdResetQueryPool(
+            cmd_buf,
+            query_pool,
+            first_query,
+            query_count
+        );
+    }
 
     ctx->disp.CmdWriteTimestamp(
         slot.cmd_begin,
