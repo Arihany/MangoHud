@@ -9,18 +9,24 @@ void BatteryStats::numBattery() {
     batt_count = 0;
     batt_check = true;
 
-#if defined(__ANDROID__)
-    // 안드로이드/Winlator: /sys/class/power_supply는 의미도 없고
-    // 컨테이너 권한 문제까지 있으니까 그냥 기능 자체를 죽인다.
-    SPDLOG_DEBUG("Battery: disabled on Android build, skipping power_supply scan");
-    return;
-#endif
-
     const fs::path path("/sys/class/power_supply/");
+
+#if defined(__ANDROID__)
+    // 안드로이드: 배터리 후보가 전혀 없을 때 INFO 한 번만 찍기 위한 플래그
+    static bool android_batt_info_logged = false;
+#endif
 
     try {
         if (!fs::exists(path)) {
+#if defined(__ANDROID__)
+            if (!android_batt_info_logged) {
+                SPDLOG_INFO(
+                    "Battery: /sys/class/power_supply not accessible, disabling battery stats");
+                android_batt_info_logged = true;
+            }
+#else
             SPDLOG_DEBUG("Battery: {} not present", path.string());
+#endif
             return;
         }
 
@@ -28,35 +34,91 @@ void BatteryStats::numBattery() {
 
         for (const auto& p : fs::directory_iterator(path)) {
             const std::string fileName = p.path().filename().string();
+
+#if defined(__ANDROID__)
+            // Android / rooted 환경:
+            // 1) type == "Battery" 우선
+            // 2) fallback: 이름이 battery / BAT* / bat* 인 것
+            const fs::path syspath    = p.path();
+            const fs::path type_path  = syspath / "type";
+            bool is_battery = false;
+
+            if (fs::exists(type_path)) {
+                std::ifstream input(type_path.string());
+                std::string type;
+                if (std::getline(input, type)) {
+                    if (type == "Battery")
+                        is_battery = true;
+                }
+            }
+
+            if (!is_battery) {
+                if (fileName == "battery" ||
+                    fileName.rfind("BAT", 0) == 0 ||
+                    fileName.rfind("bat", 0) == 0) {
+                    is_battery = true;
+                }
+            }
+
+            if (!is_battery)
+                continue;
+
+            battPath[batteryCount] = syspath.string();
+            batteryCount += 1;
+#else
+            // 비-안드로이드: 기존 BAT* 탐색 유지
             if (fileName.find("BAT") != std::string::npos) {
                 battPath[batteryCount] = p.path();
                 batteryCount += 1;
             }
+#endif
         }
 
         batt_count = batteryCount;
+
+#if defined(__ANDROID__)
+        if (batt_count == 0 && !android_batt_info_logged) {
+            SPDLOG_INFO(
+                "Battery: no usable power_supply entries under {}, disabling battery stats",
+                path.string());
+            android_batt_info_logged = true;
+        }
+#endif
     }
     catch (const fs::filesystem_error& e) {
+#if defined(__ANDROID__)
+        // 안드로이드는 여기서도 INFO 한 번만
+        static bool android_batt_fs_logged = false;
+        if (!android_batt_fs_logged) {
+            SPDLOG_INFO(
+                "Battery: filesystem error while scanning {}: {}, disabling battery stats",
+                path.string(), e.what());
+            android_batt_fs_logged = true;
+        }
+#else
         SPDLOG_DEBUG("Battery: failed to scan {}: {}", path.string(), e.what());
+#endif
         batt_count = 0;
     }
 }
 
 void BatteryStats::update() {
 #if defined(__ANDROID__)
-    // 안드로이드: 모든 배터리 값은 0으로 고정, sysfs 접근도 없음
+    // 안드로이드:
+    //  - 첫 호출에서만 numBattery() 실행 (권한/경로 체크 + INFO 로그 가능)
+    //  - batt_count == 0 이면 이후로는 조용히 0 리턴
     if (!batt_check) {
-        batt_check = true;
-        batt_count = 0;
-        SPDLOG_DEBUG("Battery: update() on Android, battery stats disabled");
+        numBattery();
     }
 
-    current_watt = 0.0f;
-    current_percent = 0.0f;
-    remaining_time = 0.0f;
-    return;
-#endif
-
+    if (batt_count <= 0) {
+        current_watt    = 0.0f;
+        current_percent = 0.0f;
+        remaining_time  = 0.0f;
+        return;
+    }
+#else
+    // 일반 리눅스 쪽은 기존 로직 유지
     if (!batt_check) {
         numBattery();
         if (batt_count == 0) {
@@ -64,15 +126,18 @@ void BatteryStats::update() {
         }
     }
 
-    if (batt_count > 0) {
-        current_watt    = getPower();
-        current_percent = getPercent();
-        remaining_time  = getTimeRemaining();
-    } else {
+    if (batt_count <= 0) {
         current_watt    = 0.0f;
         current_percent = 0.0f;
         remaining_time  = 0.0f;
+        return;
     }
+#endif
+
+    // 여기까지 왔으면 batt_count > 0
+    current_watt    = getPower();
+    current_percent = getPercent();
+    remaining_time  = getTimeRemaining();
 }
 
 float BatteryStats::getPercent()
