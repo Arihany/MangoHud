@@ -60,52 +60,56 @@ Elf32_Word eh_hash_gnu(const char *name);
 
 int eh_find_callback(struct dl_phdr_info *info, size_t size, void *argptr)
 {
-	eh_obj_t *find = (eh_obj_t *) argptr;
+    eh_obj_t *find = (eh_obj_t *) argptr;
+    const char *soname = info->dlpi_name ? info->dlpi_name : "";
 
-	if (find->name == NULL) {
-		if (strcmp(info->dlpi_name, ""))
-			return 0;
-	} else if (fnmatch(find->name, info->dlpi_name, 0))
-		return 0;
+    if (find->name == NULL) {
+        /* 메인 실행 파일: dlpi_name == "" 또는 NULL 둘 다 허용 */
+        if (soname[0] != '\0')
+            return 0;
+    } else if (fnmatch(find->name, soname, 0)) {
+        return 0;
+    }
 
-	if (find->name == NULL) /* TODO readlink? */
-		find->name = "/proc/self/exe";
-	else
-		find->name = info->dlpi_name;
-	find->addr = info->dlpi_addr;
+    if (find->name == NULL) /* TODO readlink? */
+        find->name = "/proc/self/exe";
+    else
+        find->name = soname;
 
-	/* segment headers */
-	find->phdr = info->dlpi_phdr;
-	find->phnum = info->dlpi_phnum;
+    find->addr = info->dlpi_addr;
 
-	return 0;
+    /* segment headers */
+    find->phdr = info->dlpi_phdr;
+    find->phnum = info->dlpi_phnum;
+
+    return 0;
 }
 
 int eh_iterate_callback(struct dl_phdr_info *info, size_t size, void *argptr)
 {
-	struct eh_iterate_callback_args *args = argptr;
-	eh_obj_t obj;
-	int ret = 0;
+    struct eh_iterate_callback_args *args = argptr;
+    eh_obj_t obj;
+    int ret = 0;
 
-	/* eh_init_obj needs phdr and phnum */
-	obj.phdr = info->dlpi_phdr;
-	obj.phnum = info->dlpi_phnum;
-	obj.addr = info->dlpi_addr;
-	obj.name = info->dlpi_name;
+    /* eh_init_obj needs phdr and phnum */
+    obj.phdr = info->dlpi_phdr;
+    obj.phnum = info->dlpi_phnum;
+    obj.addr = info->dlpi_addr;
+    obj.name = info->dlpi_name ? info->dlpi_name : "";
 
-	if ((ret = eh_init_obj(&obj))) {
-		if (ret == ENOTSUP) /* just skip */
-			return 0;
-		return ret;
-	}
+    if ((ret = eh_init_obj(&obj))) {
+        if (ret == ENOTSUP) /* just skip */
+            return 0;
+        return ret;
+    }
 
-	if ((ret = args->callback(&obj, args->arg)))
-		return ret;
+    if ((ret = args->callback(&obj, args->arg)))
+        return ret;
 
-	if ((ret = eh_destroy_obj(&obj)))
-		return ret;
+    if ((ret = eh_destroy_obj(&obj)))
+        return ret;
 
-	return 0;
+    return 0;
 }
 
 int eh_iterate_obj(eh_iterate_obj_callback_func callback, void *arg)
@@ -222,10 +226,10 @@ int eh_init_obj(eh_obj_t *obj)
 		p++;
 	}
 
-	/* This is here to catch b0rken headers (vdso) */
-	if ((eh_check_addr(obj, (const void *) obj->strtab)) |
-	    (eh_check_addr(obj, (const void *) obj->symtab)))
-		return ENOTSUP;
+    /* This is here to catch b0rken headers (vdso) */
+    if (eh_check_addr(obj, (const void *) obj->strtab) != 0 ||
+        eh_check_addr(obj, (const void *) obj->symtab) != 0)
+        return ENOTSUP;
 
 	if (obj->hash) {
 		/* DT_HASH found */
