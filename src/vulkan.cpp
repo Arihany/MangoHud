@@ -1698,7 +1698,7 @@ static VkResult overlay_QueuePresentKHR(
       present_info.pImageIndices = &image_index;
 
 #if defined(__ANDROID__)
-      if (device_data->android_gpu_ctx) {
+      if (device_data->android_gpu_ctx && i == 0) {
          android_gpu_usage_on_present(
             device_data->android_gpu_ctx,
             queue,
@@ -1835,8 +1835,23 @@ static VkResult overlay_QueueSubmit(
    struct queue_data *queue_data = FIND(struct queue_data, queue);
    struct device_data *device_data = queue_data->device;
 
+#if defined(__ANDROID__)
+   if (device_data->android_gpu_ctx) {
+      // 여기서 queue_family_index를 android 측에 넘겨준다.
+      return android_gpu_usage_queue_submit(
+          device_data->android_gpu_ctx,
+          queue,
+          queue_data->family_index,
+          submitCount,
+          pSubmits,
+          fence);
+   }
+#endif
+
+   // 안드로이드 아니거나 ctx 없는 경우: 기존 동작 그대로
    return device_data->vtable.QueueSubmit(queue, submitCount, pSubmits, fence);
 }
+
 
 static VkResult overlay_CreateDevice(
     VkPhysicalDevice                            physicalDevice,
