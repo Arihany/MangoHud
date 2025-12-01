@@ -61,6 +61,26 @@
 #endif
 #include "fps_limiter.h"
 
+#if defined(__ANDROID__)
+#include "android_gpu_vk_usage.h" 
+#endif
+
+struct device_data {
+   instance_data *instance;
+
+   PFN_vkSetDeviceLoaderData set_device_loader_data;
+   vk_device_dispatch_table vtable;
+   VkPhysicalDevice physical_device;
+   VkDevice device;
+   VkPhysicalDeviceProperties properties;
+   queue_data *graphic_queue;
+   std::vector<queue_data *> queues;
+
+#if defined(__ANDROID__)
+   AndroidVkGpuContext* android_gpu_ctx = nullptr;
+#endif
+};
+
 using namespace std;
 
 float offset_x, offset_y, hudSpacing;
@@ -466,6 +486,17 @@ static void snapshot_swapchain_frame(struct swapchain_data *data)
    struct instance_data *instance_data = device_data->instance;
    update_hud_info(data->sw_stats, instance_data->params, device_data->properties.vendorID);
    check_keybinds(instance_data->params);
+
+#if defined(__ANDROID__)
+   if (device_data->android_gpu_ctx) {
+      float gpu_ms = 0.f, gpu_usage = 0.f;
+      if (android_gpu_usage_get_metrics(device_data->android_gpu_ctx, &gpu_ms, &gpu_usage)) {
+         data->sw_stats.gpu_time_ms = gpu_ms;
+         data->sw_stats.gpu_load    = gpu_usage;
+      }
+   }
+#endif   
+   
 #ifdef __linux__
    if (instance_data->params.control >= 0) {
       control_client_check(instance_data->params.control, instance_data->control_client, gpu.c_str());
@@ -1645,6 +1676,7 @@ static VkResult overlay_QueuePresentKHR(
       fps_limiter->limit(true);
 
    struct queue_data *queue_data = FIND(struct queue_data, queue);
+   struct device_data *device_data = queue_data->device;
 
    /* Otherwise we need to add our overlay drawing semaphore to the list of
     * semaphores to wait on. If we don't do that the presented picture might
@@ -1662,6 +1694,18 @@ static VkResult overlay_QueuePresentKHR(
       present_info.swapchainCount = 1;
       present_info.pSwapchains = &swapchain;
       present_info.pImageIndices = &image_index;
+
+#if defined(__ANDROID__)
+      if (device_data->android_gpu_ctx) {
+         android_gpu_usage_on_present(
+            device_data->android_gpu_ctx,
+            queue,
+            queue_data->family_index,
+            &present_info,
+            i,
+            image_index);
+      }
+#endif
 
       struct overlay_draw *draw = before_present(swapchain_data,
                                                    queue_data,
@@ -1856,6 +1900,16 @@ static VkResult overlay_CreateDevice(
    instance_data->vtable.GetPhysicalDeviceProperties(device_data->physical_device,
                                                      &device_data->properties);
 
+#if defined(__ANDROID__)
+{
+    const float ts_period_ns = device_data->properties.limits.timestampPeriod;
+    device_data->android_gpu_ctx =
+        android_gpu_usage_create(device_data->physical_device,
+                                 device_data->device,
+                                 ts_period_ns);
+}
+#endif
+
    VkLayerDeviceCreateInfo *load_data_info =
       get_device_chain_info(pCreateInfo, VK_LOADER_DATA_CALLBACK);
    device_data->set_device_loader_data = load_data_info->u.pfnSetDeviceLoaderData;
@@ -1883,6 +1937,14 @@ static void overlay_DestroyDevice(
     const VkAllocationCallbacks*                pAllocator)
 {
    struct device_data *device_data = FIND(struct device_data, device);
+
+#if defined(__ANDROID__)
+   if (device_data->android_gpu_ctx) {
+      android_gpu_usage_destroy(device_data->android_gpu_ctx);
+      device_data->android_gpu_ctx = nullptr;
+   }
+#endif
+
    if (!is_blacklisted())
       device_unmap_queues(device_data);
    device_data->vtable.DestroyDevice(device, pAllocator);
