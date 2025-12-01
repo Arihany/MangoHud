@@ -52,8 +52,13 @@ struct CoreCtlEntry {
     bool has_online = false;
 };
 
+#if defined(__ANDROID__)
+static bool g_logged_fallback_switch = false;
+#endif
+
 static bool g_logged_corectl_summary = false;
 static bool g_logged_fallback_once   = false;
+static bool g_corectl_logged_summary = false;
 
 // ANDROID: sysfs 기반 CPU 코어 enum
 // ANDROID: sysfs 기반 CPU 코어 enum
@@ -183,6 +188,14 @@ static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& ou
 
     out.clear();
 
+    int header_count        = 0;
+    int busy_field_count    = 0;
+    int online_field_count  = 0;
+
+    // 너무 시끄럽지 않게, 최초 몇 개만 상세 로그
+    static int debug_fields_logged = 0;
+    constexpr int MAX_DEBUG_FIELDS = 8;
+
     auto trim = [](std::string& s) {
         auto first = s.find_first_not_of(" \t\r\n");
         auto last  = s.find_last_not_of(" \t\r\n");
@@ -207,35 +220,29 @@ static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& ou
         file.clear();
         file.seekg(0, std::ios::beg);
 
-        SPDLOG_DEBUG("core_ctl: parsing {}", src.path);
-
         std::string line;
-        int current_cpu = -1;
+        int current_cpu       = -1;  // 실제 cpuid (CPU: N 기준)
+        int current_header_id = -1;  // "CPU0" 헤더 인덱스 (디버그용)
 
         while (std::getline(file, line)) {
             trim(line);
             if (line.empty())
                 continue;
 
-            // "CPU0" / "CPU1" / "CPU 0" 등 허용
-            if (starts_with(line, "CPU")) {
+            // 헤더 라인: "CPU0", "CPU1" ...
+            if (starts_with(line, "CPU") && line.find(':') == std::string::npos) {
                 std::string rest = line.substr(3);
                 trim(rest);
-                int id = -1;
-                if (!try_stoi(id, rest)) {
-                    SPDLOG_DEBUG("core_ctl: failed to parse CPU header '{}' in {}", line, src.path);
-                    current_cpu = -1;
+                int hid = -1;
+                if (!try_stoi(hid, rest)) {
+                    SPDLOG_DEBUG("core_ctl: failed to parse header '{}'", line);
+                    current_header_id = -1;
                     continue;
                 }
-
-                current_cpu = id;
-                auto& e = out[id];
-                e.cpu_id = id;
+                current_header_id = hid;
+                header_count++;
                 continue;
             }
-
-            if (current_cpu < 0)
-                continue;
 
             auto colon = line.find(':');
             if (colon == std::string::npos)
@@ -246,46 +253,90 @@ static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& ou
             trim(key);
             trim(val);
 
+            // 디버그: 실제로 뭐가 들어오는지 몇 개만 찍어본다
+            if (debug_fields_logged < MAX_DEBUG_FIELDS) {
+                SPDLOG_DEBUG("core_ctl: src={} header={} raw key='{}' val='{}'",
+                             src.path, current_header_id, key, val);
+                debug_fields_logged++;
+            }
+
+            // "CPU: N" 라인에서 실제 cpuid를 잡는다
+            if (key == "CPU") {
+                int id = -1;
+                if (!try_stoi(id, val)) {
+                    SPDLOG_DEBUG("core_ctl: failed to parse CPU id from '{}: {}'", key, val);
+                    continue;
+                }
+                current_cpu = id;
+                auto& e = out[id];
+                e.cpu_id = id;
+                continue;
+            }
+
+            if (current_cpu < 0)
+                continue;
+
             auto it = out.find(current_cpu);
             if (it == out.end())
                 continue;
             auto& e = it->second;
 
             int v = 0;
-            if (key == "Online") {
+
+            // Online: 조금 관대하게 매칭
+            if (key == "Online" || key.find("Online") != std::string::npos) {
                 if (try_stoi(v, val)) {
                     e.online     = v;
                     e.has_online = true;
+                    online_field_count++;
+                } else {
+                    SPDLOG_DEBUG("core_ctl: failed to parse Online='{}' for cpu{}", val, current_cpu);
                 }
-            } else if (key == "Busy%") {
+            }
+            // Busy%: '%' 유무에 상관없이 Busy가 들어가면 다 받아준다
+            else if (key == "Busy%" || key == "Busy" || key.find("Busy") != std::string::npos) {
                 if (try_stoi(v, val)) {
                     e.busy     = v;
                     e.has_busy = true;
+                    busy_field_count++;
+                } else {
+                    SPDLOG_DEBUG("core_ctl: failed to parse Busy='{}' for cpu{}", val, current_cpu);
                 }
             }
         }
     }
 
     if (out.empty()) {
-        SPDLOG_INFO("core_ctl: parsed no CPU entries from global_state");
+        SPDLOG_INFO("core_ctl: parsed zero CPU entries from {} global_state file(s)",
+                    g_corectl_sources.size());
         return false;
     }
 
-    int busy_cnt   = 0;
-    int online_cnt = 0;
-    for (const auto& kv : out) {
-        const auto& e = kv.second;
-        if (e.has_busy)
-            busy_cnt++;
-        if (e.has_online && e.online)
-            online_cnt++;
+    // 요약 로그는 딱 한 번만
+    if (!g_corectl_logged_summary) {
+        int busy_entries   = 0;
+        int online_entries = 0;
+
+        for (const auto& kv : out) {
+            const auto& e = kv.second;
+            if (e.has_busy)
+                busy_entries++;
+            if (e.has_online && e.online > 0)
+                online_entries++;
+        }
+
+        SPDLOG_INFO(
+            "core_ctl: parsed {} CPU entries from {} global_state file(s)"
+            " (Busy%% fields={} -> entries with Busy%%={} , Online fields={} -> entries with online>0={})",
+            out.size(), g_corectl_sources.size(),
+            busy_field_count, busy_entries,
+            online_field_count, online_entries);
+
+        g_corectl_logged_summary = true;
     }
 
-    SPDLOG_INFO("core_ctl: parsed {} CPU entries (has Busy%={}, online>0={})",
-                out.size(), busy_cnt, online_cnt);
     return true;
 }
-
 // ===== /proc/self/stat 기반 total CPU fallback =====
 
 static long g_clk_tck = 0;
@@ -1022,14 +1073,6 @@ bool CPUStats::UpdateCPUData()
     // 여기서부터는 hack fallback:
     // per-core hack(core_ctl)이 터졌으므로 코어별 %는 전부 죽이고,
     // total CPU만 /proc/self/stat 기반으로 근사한다.
-    if (!g_logged_fallback_once) {
-        SPDLOG_INFO(
-            "Android CPU: core_ctl unusable (have_corectl={} online+Busy%% cores={}), "
-            "switching to /proc/self/stat fallback (total-only)",
-            have_corectl, count_online);
-        g_logged_fallback_once = true;
-    }
-
     for (auto &cpu : m_cpuData) {
         cpu.percent       = 0.0f;
         cpu.totalPeriod   = 0;
@@ -1040,11 +1083,15 @@ bool CPUStats::UpdateCPUData()
     if (android_update_total_cpu_fallback(m_cpuDataTotal, m_cpuData)) {
         m_cpuPeriod   = 1.0;
         m_updatedCPUs = true;
-        // 세부 수치는 DEBUG 로그에서만
+
+        if (!g_logged_fallback_switch) {
+            SPDLOG_INFO("Android CPU: core_ctl unusable, using /proc/self/stat fallback (total-only)");
+            g_logged_fallback_switch = true;
+        }
         return true;
     }
 
-    // fallback도 실패하면 이것도 DEBUG로 내려서 도배 방지
+    // 이건 아예 DEBUG로 내려서 조용히
     SPDLOG_DEBUG("Android CPU: no core_ctl and fallback failed, CPU stats disabled");
     m_cpuDataTotal.percent     = 0.0f;
     m_cpuDataTotal.totalPeriod = 0;
