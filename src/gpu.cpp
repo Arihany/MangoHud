@@ -5,69 +5,49 @@
 namespace fs = ghc::filesystem;
 
 GPUS::GPUS() {
-    std::set<std::string> gpu_entries;
-
 #if defined(__ANDROID__)
-    // ANDROID: /sys/class/drm 존재/권한 확인 후 renderD* 나열
-    const fs::path drm_root{"/sys/class/drm"};
-    std::error_code ec;
 
-    const bool exists = fs::exists(drm_root, ec);
+    // ANDROID:
+    // - drm/kgsl/sysfs 전부 무시
+    // - Vulkan timestamp backend에서 넘겨주는 gpu_usage%를 위한
+    //   "논리 GPU 슬롯" 하나만 등록한다.
+    //
+    //   실제 % 값은 vulkan.cpp 쪽 snapshot_swapchain_frame에서
+    //   sw_stats.gpu_load / gpu_time_ms로 덮어쓴다.
 
-    if (!exists || ec) {
-        if (ec == std::errc::permission_denied) {
-            SPDLOG_DEBUG(
-                "Android: skipping {} enumeration (permission denied)",
-                drm_root.string()
-            );
-        } else if (!exists && !ec) {
-            SPDLOG_DEBUG(
-                "Android: {} does not exist, skipping DRM GPU discovery",
-                drm_root.string()
-            );
-        } else {
-            SPDLOG_WARN(
-                "Android: error probing {}: {}",
-                drm_root.string(),
-                ec ? ec.message() : "no error_code"
-            );
-        }
-    } else {
-        fs::directory_iterator it{drm_root, ec};
-        fs::directory_iterator end{};
+    const std::string node_name = "android-vulkan";
+    const std::string driver    = "vulkan_timestamp";
+    const char*       pci_dev   = "";
 
-        for (; !ec && it != end; it.increment(ec)) {
-            const auto& entry = *it;
-            if (!entry.is_directory())
-                continue;
+    uint32_t vendor_id = 0;
+    uint32_t device_id = 0;
 
-            const std::string node_name = entry.path().filename().string();
+    auto ptr = std::make_shared<GPU>(
+        node_name,
+        vendor_id,
+        device_id,
+        pci_dev,
+        driver
+    );
 
-            if (node_name.rfind("renderD", 0) != 0 || node_name.length() <= 7)
-                continue;
+    // Android: 항상 이 하나만 활성 GPU로 취급
+    ptr->is_active = true;
+    available_gpus.emplace_back(ptr);
 
-            const std::string render_number = node_name.substr(7);
-            if (std::all_of(render_number.begin(), render_number.end(), ::isdigit))
-                gpu_entries.insert(node_name);
-        }
+    SPDLOG_INFO(
+        "Android: registered synthetic GPU node '{}' (driver={}) for Vulkan timestamp backend",
+        node_name,
+        driver
+    );
 
-        if (ec == std::errc::permission_denied) {
-            SPDLOG_DEBUG(
-                "Android: permission denied while iterating {} – treating as no DRM GPUs",
-                drm_root.string()
-            );
-            gpu_entries.clear();
-        } else if (ec) {
-            SPDLOG_WARN(
-                "Android: error while iterating {}: {}",
-                drm_root.string(),
-                ec.message()
-            );
-        }
-    }
+    // Android에서는 항상 1개만, multi-GPU 경고 같은 것도 필요 없음.
+    return;
 
 #else
-    // 일반 리눅스: /sys/class/drm에서 renderD* 나열
+    // ===== 일반 리눅스: 기존 DRM 기반 GPU 열거 로직 유지 =====
+    std::set<std::string> gpu_entries;
+
+    // /sys/class/drm 에서 renderD* 노드 찾기
     for (const auto& entry : fs::directory_iterator("/sys/class/drm")) {
         if (!entry.is_directory())
             continue;
@@ -81,66 +61,9 @@ GPUS::GPUS() {
         if (std::all_of(render_number.begin(), render_number.end(), ::isdigit))
             gpu_entries.insert(node_name);
     }
-#endif
 
     uint8_t idx = 0;
     uint8_t total_active = 0;
-
-#if defined(__ANDROID__)
-    // DRM renderD*가 하나도 안 보일 때: KGSL fallback
-    if (gpu_entries.empty()) {
-        const fs::path kgsl_root{"/sys/class/kgsl/kgsl-3d0"};
-        std::error_code kgsl_ec;
-        const bool kgsl_exists = fs::exists(kgsl_root, kgsl_ec);
-
-        if (kgsl_exists && !kgsl_ec) {
-            SPDLOG_INFO(
-                "Android: no DRM render nodes visible, using KGSL fallback at {}",
-                kgsl_root.string()
-            );
-
-            const std::string node_name = "kgsl-3d0";
-            const std::string driver    = "msm_drm";
-            const char* pci_dev         = "";
-
-            uint32_t vendor_id = 0;
-            uint32_t device_id = 0;
-
-            auto ptr = std::make_shared<GPU>(
-                node_name, vendor_id, device_id, pci_dev, driver
-            );
-
-            ptr->is_active = true;
-            available_gpus.emplace_back(ptr);
-
-            SPDLOG_DEBUG(
-                "GPU Found (KGSL fallback): node_name: {}, driver: {}, "
-                "vendor_id: {:x} device_id: {:x} pci_dev: {}",
-                node_name, driver, vendor_id, device_id, pci_dev
-            );
-
-            total_active = 1;
-        } else {
-            if (kgsl_ec == std::errc::permission_denied) {
-                SPDLOG_DEBUG(
-                    "Android: KGSL node {} present but permission denied; skipping GPU discovery",
-                    kgsl_root.string()
-                );
-            } else if (kgsl_ec) {
-                SPDLOG_DEBUG(
-                    "Android: error probing KGSL node {}: {}",
-                    kgsl_root.string(),
-                    kgsl_ec.message()
-                );
-            } else {
-                SPDLOG_DEBUG(
-                    "Android: KGSL node {} not present; no Android GPUs discovered",
-                    kgsl_root.string()
-                );
-            }
-        }
-    }
-#endif
 
     // DRM 기반 GPU들 처리
     for (const auto& node_name : gpu_entries) {
@@ -160,17 +83,17 @@ GPUS::GPUS() {
             if (d == std::end(supported_drivers)) {
                 SPDLOG_WARN(
                     "node \"{}\" is using driver \"{}\" which is unsupported by MangoHud. Skipping...",
-                    node_name, driver
+                    node_name,
+                    driver
                 );
                 continue;
             }
         }
 
-        uint32_t vendor_id = 0;
-        uint32_t device_id = 0;
-        const char* pci_dev = "";
+        uint32_t    vendor_id = 0;
+        uint32_t    device_id = 0;
+        const char* pci_dev   = "";
 
-#if !defined(__ANDROID__)
         // 데스크탑/일반 리눅스: PCI 경로에서 vendor/device 조회
         const std::string path = "/sys/class/drm/" + node_name;
         const std::string device_address = get_pci_device_address(path);
@@ -195,11 +118,6 @@ GPUS::GPUS() {
                 SPDLOG_DEBUG("stoul failed on device path: {}", device_path);
             }
         }
-#else
-        // ANDROID:
-        // - 모바일 SoC는 일반적으로 PCI 버스를 안 쓰므로 vendor/device는 0으로 둔다.
-        (void)node_name;
-#endif
 
         auto ptr = std::make_shared<GPU>(node_name, vendor_id, device_id, pci_dev, driver);
 
@@ -213,13 +131,21 @@ GPUS::GPUS() {
 
         SPDLOG_DEBUG(
             "GPU Found: node_name: {}, driver: {}, vendor_id: {:x} device_id: {:x} pci_dev: {}",
-            node_name, driver, vendor_id, device_id, pci_dev
+            node_name,
+            driver,
+            vendor_id,
+            device_id,
+            pci_dev
         );
 
         if (ptr->is_active) {
             SPDLOG_INFO(
                 "Set {} as active GPU (driver={} id={:x}:{:x} pci_dev={})",
-                node_name, driver, vendor_id, device_id, pci_dev
+                node_name,
+                driver,
+                vendor_id,
+                device_id,
+                pci_dev
             );
             total_active++;
         }
@@ -236,10 +162,14 @@ GPUS::GPUS() {
             "You have more than 1 active GPU, check if you use both pci_dev "
             "and gpu_list. If you use fps logging, MangoHud will log only "
             "this GPU: name = {}, driver = {}, vendor = {:x}, pci_dev = {}",
-            gpu->drm_node, gpu->driver, gpu->vendor_id, gpu->pci_dev
+            gpu->drm_node,
+            gpu->driver,
+            gpu->vendor_id,
+            gpu->pci_dev
         );
         break;
     }
+#endif
 }
 
 std::string GPUS::get_driver(const std::string& node) {
