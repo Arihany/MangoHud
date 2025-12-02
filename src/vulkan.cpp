@@ -1921,8 +1921,6 @@ static VkResult overlay_CreateDevice(
     disp.DestroyCommandPool     = device_data->vtable.DestroyCommandPool;
     disp.ResetCommandPool       = device_data->vtable.ResetCommandPool;
     disp.AllocateCommandBuffers = device_data->vtable.AllocateCommandBuffers;
-    disp.FreeCommandBuffers     = device_data->vtable.FreeCommandBuffers;
-    disp.ResetCommandBuffer     = device_data->vtable.ResetCommandBuffer;
     disp.BeginCommandBuffer     = device_data->vtable.BeginCommandBuffer;
     disp.EndCommandBuffer       = device_data->vtable.EndCommandBuffer;
     disp.CmdWriteTimestamp      = device_data->vtable.CmdWriteTimestamp;
