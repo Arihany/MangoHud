@@ -17,46 +17,56 @@ char *(*__dlerror)(void) = NULL;
 static bool print_dlopen;
 static bool print_dlsym;
 
-static void get_real_functions()
+static void get_real_functions(void)
 {
+    print_dlopen = getenv("MANGOHUD_DEBUG_DLOPEN") != NULL;
+    print_dlsym  = getenv("MANGOHUD_DEBUG_DLSYM") != NULL;
+
+#if defined(__ANDROID__)
+
+    // ANDROID:
+    // elfhacks는 ENOTSUP 스텁으로 막혀 있으므로 여기서는
+    // 그냥 Bionic의 dlopen/dlsym/dlerror를 직접 쓴다.
+    __dlopen  = &dlopen;
+    __dlsym   = &dlsym;
+    __dlerror = &dlerror;
+
+#else
     eh_obj_t libdl;
-    int ret;
+    int ret = 0;
 
     const char* libs[] = {
-#if defined(__GLIBC__)
+    #if defined(__GLIBC__)
         "*libdl.so*",
-#endif
+    #endif
         "*libc.so*",
         "*libc.*.so*",
         "*ld-musl-*.so*",
     };
 
-    print_dlopen = getenv("MANGOHUD_DEBUG_DLOPEN") != NULL;
-    print_dlsym = getenv("MANGOHUD_DEBUG_DLSYM") != NULL;
-
-    for (size_t i = 0; i < sizeof(libs) / sizeof(*libs); i++)
-    {
+    for (size_t i = 0; i < sizeof(libs) / sizeof(*libs); i++) {
         ret = eh_find_obj(&libdl, libs[i]);
         if (ret)
             continue;
 
-        eh_find_sym(&libdl, "dlopen", (void **) &__dlopen);
-        eh_find_sym(&libdl, "dlsym", (void **) &__dlsym);
+        eh_find_sym(&libdl, "dlopen",  (void **) &__dlopen);
+        eh_find_sym(&libdl, "dlsym",   (void **) &__dlsym);
         eh_find_sym(&libdl, "dlerror", (void **) &__dlerror);
         eh_destroy_obj(&libdl);
 
         if (__dlopen && __dlsym && __dlerror)
             break;
-        __dlopen = NULL;
-        __dlsym = NULL;
+
+        __dlopen  = NULL;
+        __dlsym   = NULL;
         __dlerror = NULL;
     }
 
-    if (!__dlopen && !__dlsym && !__dlerror)
-    {
+    if (!__dlopen && !__dlsym && !__dlerror) {
         fprintf(stderr, "MANGOHUD: Can't get dlopen(), dlsym() and dlerror()\n");
         exit(ret ? ret : 1);
     }
+#endif
 }
 
 /**
@@ -80,9 +90,9 @@ void *real_dlopen(const char *filename, int flag)
         FLAG(RTLD_LOCAL)
         FLAG(RTLD_NODELETE)
         FLAG(RTLD_NOLOAD)
-#ifdef RTLD_DEEPBIND
+    #ifdef RTLD_DEEPBIND
         FLAG(RTLD_DEEPBIND)
-#endif
+    #endif
         #undef FLAG
         printf(") = %p\n", result);
     }
@@ -114,6 +124,7 @@ char* real_dlerror(void)
     return __dlerror();
 }
 
-void* get_proc_address(const char* name) {
+void* get_proc_address(const char* name)
+{
     return real_dlsym(RTLD_NEXT, name);
 }
