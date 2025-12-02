@@ -6,6 +6,41 @@
  * For conditions of distribution and use, see copyright notice in elfhacks.h
  */
 
+#ifdef __ANDROID__
+
+#include <errno.h>
+#include "elfhacks.h"
+
+int eh_iterate_obj(eh_iterate_obj_callback_func, void *) {
+    return ENOTSUP;
+}
+
+int eh_find_obj(eh_obj_t *obj, const char *soname) {
+    (void)obj; (void)soname;
+    return ENOTSUP;
+}
+
+int eh_find_sym(eh_obj_t *obj, const char *name, void **to) {
+    (void)obj; (void)name; (void)to;
+    return ENOTSUP;
+}
+
+int eh_set_rel(eh_obj_t *obj, const char *sym, void *val) {
+    (void)obj; (void)sym; (void)val;
+    return ENOTSUP;
+}
+
+int eh_iterate_rel(eh_obj_t *obj, eh_iterate_rel_callback_func cb, void *arg) {
+    (void)obj; (void)cb; (void)arg;
+    return ENOTSUP;
+}
+
+int eh_destroy_obj(eh_obj_t *obj) {
+    (void)obj;
+    return 0;
+}
+#else
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -620,3 +655,4 @@ int eh_destroy_obj(eh_obj_t *obj)
 }
 
 /**  \} */
+#endif
