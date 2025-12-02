@@ -492,10 +492,26 @@ static void snapshot_swapchain_frame(struct swapchain_data *data)
             if (load > 100) load = 100;
 
             gpu->metrics.load = load;
+
+            SPDLOG_INFO(
+                "Android GPU HUD: inject metrics (gpu_ms={} usage={} load={}%)",
+                gpu_ms,
+                gpu_usage,
+                load
+            );
+         } else {
+            SPDLOG_INFO(
+                "Android GPU HUD: no selected GPU, metrics dropped (gpu_ms={} usage={})",
+                gpu_ms,
+                gpu_usage
+            );
          }
+      } else {
+         SPDLOG_INFO("Android GPU HUD: get_metrics() returned false");
       }
    }
 #endif
+
 
 #ifdef __linux__
    if (instance_data->params.control >= 0) {
