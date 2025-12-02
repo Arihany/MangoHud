@@ -12,23 +12,53 @@ float memused, memmax, swapused;
 uint64_t proc_mem_resident, proc_mem_shared, proc_mem_virt;
 
 void update_meminfo() {
-    std::ifstream file("/proc/meminfo");
-    std::map<std::string, float> meminfo;
+    static float cached_memtotal = 0.0f;
 
+    std::ifstream file("/proc/meminfo");
     if (!file.is_open()) {
         SPDLOG_ERROR("can't open /proc/meminfo");
         return;
     }
 
-    for (std::string line; std::getline(file, line);) {
-        auto key = line.substr(0, line.find(":"));
-        auto val = line.substr(key.length() + 2);
-        meminfo[key] = std::stoull(val) / 1024.f / 1024.f;
+    float mem_total = cached_memtotal;
+    float mem_avail = 0.0f;
+    float swap_total = 0.0f;
+    float swap_free  = 0.0f;
+
+    unsigned found = 0;
+    std::string line;
+
+    auto parse_val_mb = [](const std::string& s) -> float {
+        size_t start = s.find_first_of("0123456789");
+        if (start == std::string::npos)
+            return 0.0f;
+        unsigned long long kb = std::strtoull(s.c_str() + start, nullptr, 10);
+        return static_cast<float>(kb) / 1024.0f / 1024.0f;
+    };
+
+    while (std::getline(file, line) && found < 4) {
+        if (line.rfind("MemTotal:", 0) == 0) {
+            mem_total = parse_val_mb(line);
+            cached_memtotal = mem_total;
+            ++found;
+        } else if (line.rfind("MemAvailable:", 0) == 0) {
+            mem_avail = parse_val_mb(line);
+            ++found;
+        } else if (line.rfind("SwapTotal:", 0) == 0) {
+            swap_total = parse_val_mb(line);
+            ++found;
+        } else if (line.rfind("SwapFree:", 0) == 0) {
+            swap_free = parse_val_mb(line);
+            ++found;
+        }
     }
 
-    memmax = meminfo["MemTotal"];
-    memused = meminfo["MemTotal"] - meminfo["MemAvailable"];
-    swapused = meminfo["SwapTotal"] - meminfo["SwapFree"];
+    if (mem_total <= 0.0f)
+        return;
+
+    memmax   = mem_total;
+    memused  = mem_total - mem_avail;
+    swapused = swap_total - swap_free;
 }
 
 void update_procmem()
