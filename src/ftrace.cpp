@@ -218,12 +218,15 @@ void FTrace::handle_ftrace_entry(std::string entry)
 
 void FTrace::update()
 {
+   // ftrace가 실질적으로 비활성인 경우 (Android 경로 포함)
+   // tracepoints가 비어 있으니 아무 일도 할 필요가 없다.
+   if (data.tracepoints.empty())
+      return;
+
    auto update_index = ++data.update_index % Tracepoint::PLOT_DATA_CAPACITY;
    for (auto& tp : data.tracepoints) {
       tp->update_index = update_index;
 
-      // Iterate over the stored plot values often enough to keep
-      // the data range updated and plot presentation visually useful.
       if (!(update_index % (Tracepoint::PLOT_DATA_CAPACITY / 4))) {
          auto max = tp->data.plot.values[0];
          for (auto v : tp->data.plot.values)
