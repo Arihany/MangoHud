@@ -53,6 +53,10 @@ struct AndroidVkGpuContext {
     // present 기준 frame serial (QueueSubmit는 "현재 serial"을 사용)
     uint64_t                frame_index   = 0;
 
+    // 쿼리 결과용 스크래치 버퍼 (value + availability 쌍)
+    // 최대: MAX_QUERIES_PER_FRAME * 2 * sizeof(uint64_t)
+    std::vector<uint64_t>   query_scratch;
+
     // CPU/GPU 사용률 + smoothing용 상태
     std::mutex                                      lock;
     std::chrono::steady_clock::time_point           last_present{};   // 마지막 present 시각
@@ -161,6 +165,12 @@ android_gpu_usage_init_timestamp_resources(AndroidVkGpuContext* ctx,
         static_cast<void*>(ctx->query_pool),
         AndroidVkGpuContext::MAX_FRAMES,
         AndroidVkGpuContext::MAX_QUERIES_PER_FRAME
+    );
+
+    // 쿼리 결과용 스크래치 버퍼를 한 번만 확보
+    ctx->query_scratch.clear();
+    ctx->query_scratch.resize(
+        AndroidVkGpuContext::MAX_QUERIES_PER_FRAME * 2u
     );
 
     return true;
@@ -372,23 +382,30 @@ android_gpu_usage_collect_frame_gpu_ms(AndroidVkGpuContext*            ctx,
     const uint32_t query_count = fr.query_used;
     const uint32_t pair_count  = query_count / 2;
 
-    // value + availability 쌍 → scratch 재사용
-    auto& data = ctx->scratch_query_data;
-    const size_t needed = static_cast<size_t>(query_count) * 2u;
-    if (data.size() < needed)
-        data.resize(needed);
+    // 방어적 체크: 설계상 여기 걸리면 버그다
+    if (query_count > AndroidVkGpuContext::MAX_QUERIES_PER_FRAME)
+        return 0.0f;
+
+    // 스크래치 버퍼 크기 보장 (정상이라면 init에서 이미 충분히 확보됨)
+    const uint32_t needed_u64 = query_count * 2u;
+    if (ctx->query_scratch.size() < needed_u64) {
+        // 치명 버그 방지용 fallback: 한 번만 리사이즈하고 계속 사용
+        ctx->query_scratch.resize(needed_u64);
+    }
+
+    uint64_t* data = ctx->query_scratch.data();
 
     VkResult r = ctx->disp.GetQueryPoolResults(
         ctx->device,
         ctx->query_pool,
         fr.query_start,
         query_count,
-        static_cast<uint32_t>(needed * sizeof(uint64_t)),
-        data.data(),
+        needed_u64 * sizeof(uint64_t),
+        data,
         sizeof(uint64_t) * 2,
         VK_QUERY_RESULT_64_BIT |
         VK_QUERY_RESULT_WITH_AVAILABILITY_BIT |
-        VK_QUERY_RESULT_WAIT_BIT   // 여기서 블록해도, FRAME_LAG 뒤 슬롯만 읽으므로 괜찮음
+        VK_QUERY_RESULT_WAIT_BIT
     );
 
     if (r < 0) {
@@ -411,7 +428,9 @@ android_gpu_usage_collect_frame_gpu_ms(AndroidVkGpuContext*            ctx,
         mask = (1ULL << ctx->ts_valid_bits) - 1ULL;
     }
 
-    double total_ms = 0.0;
+    double   sum_ms      = 0.0;
+    uint64_t min_start_ts= std::numeric_limits<uint64_t>::max();
+    uint64_t max_end_ts  = 0;
 
     for (uint32_t i = 0; i < pair_count; ++i) {
         const uint32_t q_start = 2u * i;
@@ -436,23 +455,50 @@ android_gpu_usage_collect_frame_gpu_ms(AndroidVkGpuContext*            ctx,
         if (end_ts <= start_ts)
             continue;
 
+        // 1) 순수 합산 시간
         const uint64_t delta_ticks = end_ts - start_ts;
         const double   ns          = double(delta_ticks) * double(ctx->ts_period_ns);
         const double   ms          = ns * 1e-6;
-
         if (ms > 0.0 && std::isfinite(ms))
-            total_ms += ms;
+            sum_ms += ms;
+
+        // 2) 활성 구간 추적
+        if (start_ts < min_start_ts)
+            min_start_ts = start_ts;
+        if (end_ts > max_end_ts)
+            max_end_ts = end_ts;
     }
 
-    // 이 슬롯은 한 번 읽고 나면 재사용 가능 상태로 되돌린다
+    // 슬롯 상태 리셋
     fr.has_queries = false;
     fr.query_used  = 0;
     fr.frame_serial= std::numeric_limits<uint64_t>::max();
 
-    if (total_ms <= 0.0 || !std::isfinite(total_ms))
+    // 활성 구간 기반 range_ms 계산
+    double range_ms = 0.0;
+    if (max_end_ts > min_start_ts &&
+        min_start_ts != std::numeric_limits<uint64_t>::max()) {
+
+        const uint64_t range_ticks = max_end_ts - min_start_ts;
+        const double   ns          = double(range_ticks) * double(ctx->ts_period_ns);
+        range_ms                   = ns * 1e-6;
+    }
+
+    double gpu_ms = 0.0;
+
+    // 1순위: range_ms (DXVK HUD 스타일)
+    if (range_ms > 0.0 && std::isfinite(range_ms)) {
+        gpu_ms = range_ms;
+    }
+    // fallback: sum_ms
+    else if (sum_ms > 0.0 && std::isfinite(sum_ms)) {
+        gpu_ms = sum_ms;
+    }
+
+    if (gpu_ms <= 0.0 || !std::isfinite(gpu_ms))
         return 0.0f;
 
-    return static_cast<float>(total_ms);
+    return static_cast<float>(gpu_ms);
 }
 
 // ====================== 외부 API ======================
