@@ -360,7 +360,7 @@ static float android_gpu_usage_collect_frame_gpu_ms(
     if (r < 0) {
         SPDLOG_WARN(
             "Android GPU usage: GetQueryPoolResults failed (r={} used={} start={})",
-            r,
+            static_cast<int>(r),
             fr.query_used,
             fr.query_start
         );
