@@ -15,22 +15,26 @@ void getIoStats(iostats& io)
     Clock::time_point now = Clock::now();
 
 #if defined(__ANDROID__)
-    // Android / Winlator:
-    // /proc/<pid>/io 의 rchar / wchar 를 "논리 IO 바이트"로 보고
-    // 데스크탑과 동일하게 MiB, MiB/s 로 환산한다.
+    static bool io_disabled = false;
 
-    // 최초 호출: 기준점만 잡고 종료
+    if (io_disabled) {
+        io.diff.read = io.diff.write = 0.0f;
+        io.per_second.read = io.per_second.write = 0.0f;
+        io.last_update = now;
+        return;
+    }
+
     if (io.last_update.time_since_epoch().count() == 0) {
         io.last_update = now;
 
         std::string f = "/proc/";
         {
-#ifndef TEST_ONLY
+    #ifndef TEST_ONLY
             const auto gs_pid = HUDElements.g_gamescopePid;
             f += (gs_pid < 1) ? "self" : std::to_string(gs_pid);
-#else
+    #else
             f += "self";
-#endif
+    #endif
             f += "/io";
         }
 
@@ -47,6 +51,7 @@ void getIoStats(iostats& io)
             io.prev.write_bytes = 0;
             io.diff.read = io.diff.write = 0.0f;
             io.per_second.read = io.per_second.write = 0.0f;
+            io_disabled = true; // 여기서 진짜로 영구 disable
             return;
         }
 
@@ -107,6 +112,7 @@ void getIoStats(iostats& io)
         io.diff.read = io.diff.write = 0.0f;
         io.per_second.read = io.per_second.write = 0.0f;
         io.last_update = now;
+        io_disabled = true; // 여기서도 실패하면 포기
         return;
     }
 
