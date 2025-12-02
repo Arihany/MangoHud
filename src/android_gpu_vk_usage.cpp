@@ -5,6 +5,7 @@
 #include <cmath>
 #include <vector>
 #include <limits>
+#include <cstdint>
 #include <spdlog/spdlog.h>
 
 // ====================== 내부 상태 ======================
@@ -67,6 +68,16 @@ struct AndroidVkGpuContext {
     float                                           last_gpu_ms   = 0.0f;
     float                                           last_usage    = 0.0f;
     bool                                            have_metrics  = false;
+
+    // ===== queue_submit용 scratch 버퍼 =====
+    std::vector<VkSubmitInfo>   scratch_wrapped;      // 크기: submitCount
+    std::vector<VkCommandBuffer> scratch_cmds;        // 평면화된 pCommandBuffers
+    std::vector<uint32_t>        scratch_cb_offsets;  // submit별 offset
+    std::vector<uint32_t>        scratch_cb_counts;   // submit별 CB 개수
+    std::vector<uint8_t>         scratch_instrument;  // submit별 계측 여부 (0/1)
+
+    // ===== 쿼리 결과용 scratch =====
+    std::vector<uint64_t>        scratch_query_data;  // size >= query_count * 2
 };
 
 // ====================== 헬퍼: 타임스탬프 리소스 초기화 ======================
@@ -118,7 +129,8 @@ android_gpu_usage_init_timestamp_resources(AndroidVkGpuContext* ctx,
         VkCommandPoolCreateInfo cp{};
         cp.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         cp.queueFamilyIndex = queue_family_index;
-        cp.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cp.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT |
+                              VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
 
         VkCommandPool pool = VK_NULL_HANDLE;
         if (ctx->disp.CreateCommandPool(ctx->device, &cp, nullptr, &pool) != VK_SUCCESS) {
@@ -186,7 +198,11 @@ android_gpu_usage_begin_frame(AndroidVkGpuContext* ctx,
 
     // 이 슬롯에서 쓰던 CB들 전부 초기화 (핸들은 유지, 내용만 리셋)
     if (ctx->disp.ResetCommandPool && fr.cmd_pool != VK_NULL_HANDLE) {
-        ctx->disp.ResetCommandPool(ctx->device, fr.cmd_pool, 0);
+        ctx->disp.ResetCommandPool(
+            ctx->device,
+            fr.cmd_pool,
+            VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT
+        );
     }
 
     return true;
@@ -273,7 +289,7 @@ android_gpu_usage_record_timestamp_pair(AndroidVkGpuContext*            ctx,
     const uint32_t begin_idx = pair_index * 2;
     const uint32_t end_idx   = begin_idx + 1;
 
-    // 타임스탬프용 CB 핸들 부족하면 2개씩 추가 할당
+    // 타임스탬프용 CB 핸들 부족하면 2개씩 추가 할당 (1회성 증가, 상한 = MAX_QUERIES_PER_FRAME)
     if (fr.timestamp_cmds.size() <= end_idx) {
         VkCommandBufferAllocateInfo ai{};
         ai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -356,16 +372,18 @@ android_gpu_usage_collect_frame_gpu_ms(AndroidVkGpuContext*            ctx,
     const uint32_t query_count = fr.query_used;
     const uint32_t pair_count  = query_count / 2;
 
-    // value + availability 쌍
-    std::vector<uint64_t> data;
-    data.resize(query_count * 2);
+    // value + availability 쌍 → scratch 재사용
+    auto& data = ctx->scratch_query_data;
+    const size_t needed = static_cast<size_t>(query_count) * 2u;
+    if (data.size() < needed)
+        data.resize(needed);
 
     VkResult r = ctx->disp.GetQueryPoolResults(
         ctx->device,
         ctx->query_pool,
         fr.query_start,
         query_count,
-        static_cast<uint32_t>(data.size() * sizeof(uint64_t)),
+        static_cast<uint32_t>(needed * sizeof(uint64_t)),
         data.data(),
         sizeof(uint64_t) * 2,
         VK_QUERY_RESULT_64_BIT |
@@ -521,7 +539,7 @@ android_gpu_usage_destroy(AndroidVkGpuContext* ctx)
     delete ctx;
 }
 
-// 핵심: QueueSubmit 래핑 (샌드위치 + resetCmd)
+// 핵심: QueueSubmit 래핑 (샌드위치 + resetCmd) - 2-pass + scratch
 VkResult
 android_gpu_usage_queue_submit(AndroidVkGpuContext* ctx,
                                VkQueue              queue,
@@ -560,81 +578,150 @@ android_gpu_usage_queue_submit(AndroidVkGpuContext* ctx,
             return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
         }
 
-        std::vector<VkSubmitInfo> wrapped;
-        wrapped.reserve(submitCount);
+        // ===== 1-pass: 어떤 submit을 계측할지 + CB 개수 계산 =====
+        auto& wrapped  = ctx->scratch_wrapped;
+        auto& flat_cbs = ctx->scratch_cmds;
+        auto& offsets  = ctx->scratch_cb_offsets;
+        auto& counts   = ctx->scratch_cb_counts;
+        auto& inst     = ctx->scratch_instrument;
 
-        // per-submit 확장된 CB 배열
-        std::vector<std::vector<VkCommandBuffer>> per_submit_cbs(submitCount);
+        const uint32_t n = submitCount;
 
-        for (uint32_t i = 0; i < submitCount; ++i) {
+        wrapped.resize(n);
+        offsets.resize(n);
+        counts.resize(n);
+        inst.resize(n);
+
+        uint32_t total_cmds = 0;
+        uint32_t tmp_used   = fr.query_used;
+        bool     any_inst   = false;
+
+        for (uint32_t i = 0; i < n; ++i) {
             const VkSubmitInfo& src = pSubmits[i];
 
-            // 커맨드 버퍼가 없으면 계측할 게 없음 → 그대로 통과
-            if (src.commandBufferCount == 0 || !src.pCommandBuffers) {
-                wrapped.push_back(src);
-                continue;
-            }
+            const uint32_t base_count = src.commandBufferCount;
 
             bool can_instrument =
+                (base_count > 0) &&
+                (src.pCommandBuffers != nullptr) &&
                 (ctx->query_pool != VK_NULL_HANDLE) &&
                 (fr.cmd_pool   != VK_NULL_HANDLE) &&
-                (fr.query_used + 2 <= fr.query_capacity);
+                (tmp_used + 2 <= fr.query_capacity);
 
             if (!can_instrument) {
-                wrapped.push_back(src);
-                continue;
+                inst[i]   = 0;
+                counts[i] = base_count;
+            } else {
+                inst[i]   = 1;
+                any_inst  = true;
+                tmp_used += 2;
+                counts[i] = base_count + 2; // begin + end
             }
 
-            // 이 슬롯에서 아직 resetCmd를 안 만들어놨으면, 지금 만든다.
-            if (!fr.reset_recorded) {
-                if (!android_gpu_usage_ensure_reset_cmd(ctx, fr)) {
-                    wrapped.push_back(src);
-                    continue;
+            total_cmds += counts[i];
+        }
+
+        // 이 프레임에 계측할 submit이 하나도 없으면 패스스루
+        if (!any_inst) {
+            return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
+        }
+
+        // reset_cmd 준비 (1회만)
+        if (!fr.reset_recorded) {
+            if (!android_gpu_usage_ensure_reset_cmd(ctx, fr)) {
+                // reset 안 되면 깔끔하게 계측 포기
+                return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
+            }
+        }
+
+        // reset_cmd를 첫 번째 계측 submit 앞에 한 번만 삽입
+        int32_t reset_target = -1;
+        if (fr.reset_cmd != VK_NULL_HANDLE && !fr.reset_submitted) {
+            for (uint32_t i = 0; i < n; ++i) {
+                if (inst[i]) {
+                    reset_target = static_cast<int32_t>(i);
+                    counts[i]   += 1;
+                    total_cmds  += 1;
+                    break;
                 }
             }
+        }
 
-            // 이 submit에 대한 begin/end 타임스탬프 커맨드 버퍼 준비
-            uint32_t       query_first = 0;
-            VkCommandBuffer cmd_begin  = VK_NULL_HANDLE;
-            VkCommandBuffer cmd_end    = VK_NULL_HANDLE;
+        // flat_cbs 크기 확보 (capacity 증가는 드물게만 일어남)
+        if (flat_cbs.size() < total_cmds)
+            flat_cbs.resize(total_cmds);
 
-            if (!android_gpu_usage_record_timestamp_pair(
-                    ctx, fr, query_first, cmd_begin, cmd_end)) {
-                wrapped.push_back(src);
+        // offset 계산
+        uint32_t cursor = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            offsets[i] = cursor;
+            cursor     += counts[i];
+        }
+
+        // ===== 2-pass: scratch에 CB 채우고 VkSubmitInfo 구성 =====
+        for (uint32_t i = 0; i < n; ++i) {
+            const VkSubmitInfo& src = pSubmits[i];
+            VkSubmitInfo&       dst = wrapped[i];
+
+            const bool do_inst   = (inst[i] != 0);
+            const bool add_reset = (reset_target == static_cast<int32_t>(i));
+
+            // 계측도 없고 reset도 없으면 그냥 복사
+            if (!do_inst && !add_reset) {
+                dst = src;
                 continue;
             }
 
-            auto& dst_cbs = per_submit_cbs[i];
-            dst_cbs.reserve(src.commandBufferCount + 3);
+            VkCommandBuffer* dst_bufs = flat_cbs.data() + offsets[i];
+            uint32_t         idx_cb   = 0;
 
-            // 아직 resetCmd를 큐에 넣은 적이 없으면, 이 submit 앞에 끼운다.
-            if (fr.reset_recorded && !fr.reset_submitted && fr.reset_cmd != VK_NULL_HANDLE) {
-                dst_cbs.push_back(fr.reset_cmd);
+            // reset_cmd를 이 submit 앞에 한 번만 삽입
+            if (add_reset && fr.reset_cmd != VK_NULL_HANDLE) {
+                dst_bufs[idx_cb++] = fr.reset_cmd;
                 fr.reset_submitted = true;
             }
 
-            // begin timestamp CB
-            dst_cbs.push_back(cmd_begin);
+            VkCommandBuffer cmd_begin = VK_NULL_HANDLE;
+            VkCommandBuffer cmd_end   = VK_NULL_HANDLE;
+
+            if (do_inst) {
+                uint32_t query_first = 0;
+                if (!android_gpu_usage_record_timestamp_pair(
+                        ctx, fr, query_first, cmd_begin, cmd_end)) {
+                    // 드문 실패 케이스: 이 submit만 계측 포기하고 그냥 원본 CB만 쓴다.
+                    for (uint32_t j = 0; j < src.commandBufferCount; ++j)
+                        dst_bufs[idx_cb++] = src.pCommandBuffers[j];
+
+                    dst = src;
+                    dst.commandBufferCount = idx_cb;
+                    dst.pCommandBuffers    = dst_bufs;
+                    inst[i] = 0;
+                    continue;
+                }
+
+                // begin timestamp CB
+                dst_bufs[idx_cb++] = cmd_begin;
+            }
 
             // 앱의 원래 커맨드 버퍼들
             for (uint32_t j = 0; j < src.commandBufferCount; ++j) {
-                dst_cbs.push_back(src.pCommandBuffers[j]);
+                dst_bufs[idx_cb++] = src.pCommandBuffers[j];
             }
 
             // end timestamp CB
-            dst_cbs.push_back(cmd_end);
+            if (do_inst) {
+                dst_bufs[idx_cb++] = cmd_end;
+            }
 
-            VkSubmitInfo dst = src;
-            dst.commandBufferCount = static_cast<uint32_t>(dst_cbs.size());
-            dst.pCommandBuffers   = dst_cbs.data();
-
-            wrapped.push_back(dst);
+            dst = src;
+            dst.commandBufferCount = idx_cb;
+            dst.pCommandBuffers    = dst_bufs;
         }
 
         // 실제 QueueSubmit 호출
         return ctx->disp.QueueSubmit(
             queue,
-            static_cast<uint32_t>(wrapped.size()),
+            submitCount,
             wrapped.data(),
             fence
         );
