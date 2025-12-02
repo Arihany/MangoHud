@@ -1849,6 +1849,38 @@ static VkResult overlay_QueueSubmit(
    return device_data->vtable.QueueSubmit(queue, submitCount, pSubmits, fence);
 }
 
+static VkResult overlay_QueueSubmit2(
+    VkQueue                 queue,
+    uint32_t                submitCount,
+    const VkSubmitInfo2*    pSubmits)
+{
+   struct queue_data *queue_data = FIND(struct queue_data, queue);
+   struct device_data *device_data = queue_data->device;
+
+#if defined(__ANDROID__)
+   // DXVK 2.x / vkd3d 등이 QueueSubmit2*만 쓰는 경우까지 계측
+   if (device_data->android_gpu_ctx &&
+       submitCount > 0 &&
+       (queue_data->flags & VK_QUEUE_GRAPHICS_BIT)) {
+      return android_gpu_usage_queue_submit2(
+          device_data->android_gpu_ctx,
+          queue,
+          queue_data->family_index,
+          submitCount,
+          pSubmits);
+   }
+#endif
+
+   // 기본 패스스루: 코어 1.3 → QueueSubmit2, 아니면 KHR
+   if (device_data->vtable.QueueSubmit2)
+      return device_data->vtable.QueueSubmit2(queue, submitCount, pSubmits);
+   if (device_data->vtable.QueueSubmit2KHR)
+      return device_data->vtable.QueueSubmit2KHR(queue, submitCount, pSubmits);
+
+   // 여기에 들어오면 애초에 앱이 QueueSubmit2를 부르면 안 되는 상황이긴 하다
+   return VK_ERROR_EXTENSION_NOT_PRESENT;
+}
+
 static VkResult overlay_CreateDevice(
     VkPhysicalDevice                            physicalDevice,
     const VkDeviceCreateInfo*                   pCreateInfo,
@@ -1917,15 +1949,21 @@ static VkResult overlay_CreateDevice(
 {
     AndroidVkGpuDispatch disp{};
     disp.QueueSubmit            = device_data->vtable.QueueSubmit;
+    disp.QueueSubmit2           = device_data->vtable.QueueSubmit2;
+    disp.QueueSubmit2KHR        = device_data->vtable.QueueSubmit2KHR;
+
     disp.CreateQueryPool        = device_data->vtable.CreateQueryPool;
     disp.DestroyQueryPool       = device_data->vtable.DestroyQueryPool;
     disp.GetQueryPoolResults    = device_data->vtable.GetQueryPoolResults;
+
     disp.CreateCommandPool      = device_data->vtable.CreateCommandPool;
     disp.DestroyCommandPool     = device_data->vtable.DestroyCommandPool;
     disp.ResetCommandPool       = device_data->vtable.ResetCommandPool;
     disp.AllocateCommandBuffers = device_data->vtable.AllocateCommandBuffers;
+    disp.FreeCommandBuffers     = device_data->vtable.FreeCommandBuffers;
     disp.BeginCommandBuffer     = device_data->vtable.BeginCommandBuffer;
     disp.EndCommandBuffer       = device_data->vtable.EndCommandBuffer;
+
     disp.CmdWriteTimestamp      = device_data->vtable.CmdWriteTimestamp;
     disp.CmdResetQueryPool      = device_data->vtable.CmdResetQueryPool;
     disp.CmdPipelineBarrier     = device_data->vtable.CmdPipelineBarrier;
@@ -1942,7 +1980,7 @@ static VkResult overlay_CreateDevice(
         instance_data->vtable.GetPhysicalDeviceQueueFamilyProperties(
             device_data->physical_device, &qf_count, qf.data());
 
-        // 1차: graphics 큐에서 timestampValidBits 탐색
+        // 1차: graphics 큐 우선
         for (uint32_t i = 0; i < qf_count; ++i) {
             if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
                 ts_valid_bits = qf[i].timestampValidBits;
@@ -1951,7 +1989,7 @@ static VkResult overlay_CreateDevice(
             }
         }
 
-        // 2차: 그래픽 큐가 0인 경우, 아무 큐나 validBits > 0인 것 하나 더 탐색
+        // 2차: 그래픽 큐에 validBits 없으면, 아무 큐나 하나
         if (!ts_valid_bits) {
             for (uint32_t i = 0; i < qf_count; ++i) {
                 if (qf[i].timestampValidBits) {
@@ -2234,6 +2272,8 @@ static const struct {
    ADD_HOOK(CreateSampler),
 
    ADD_HOOK(QueueSubmit),
+   ADD_HOOK(QueueSubmit2),
+   ADD_ALIAS_HOOK(QueueSubmit2KHR, QueueSubmit2),
 
    ADD_HOOK(CreateDevice),
    ADD_HOOK(DestroyDevice),
