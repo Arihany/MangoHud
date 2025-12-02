@@ -23,12 +23,20 @@ static std::istream& get_uncommented_line(std::istream& is, std::string &line)
 
 void parse_pciids()
 {
+#if defined(__ANDROID__)
+    // Android: 보통 pci.ids 자체가 없고, 모바일 GPU는 PCI 안 타니까
+    // 조용히 스킵. 로깅도 하지 않는다.
+    return;
+#endif
+
     std::ifstream file;
     file.open("/usr/share/hwdata/pci.ids");
     if (file.fail()){
         file.open("/usr/share/misc/pci.ids");
-        if (file.fail())
-            SPDLOG_ERROR("can't find file pci.ids");
+        if (file.fail()) {
+            SPDLOG_DEBUG("pci.ids not found, skipping PCI vendor/device lookup");
+            return;
+        }
     }
 
     std::string line;
@@ -37,31 +45,34 @@ void parse_pciids()
     uint32_t ven_id = 0, dev_id = 0, subsys_ven_id = 0, subsys_dev_id = 0;
     std::string desc;
     std::stringstream ss;
-    while(get_uncommented_line(file, line))
+
+    while (get_uncommented_line(file, line))
     {
         tabs = line.find_first_not_of("\t");
+        if (tabs == std::string::npos)
+            continue;
 
-        ss.str(""); ss.clear();
+        ss.str("");
+        ss.clear();
         ss << line;
 
-        switch(tabs)
+        switch (tabs)
         {
             case 0:
                 ss >> std::hex >> ven_id;
                 if (ven_id == 0xFFFF)
                     return;
-
                 std::getline(ss, desc);
                 pci_ids[ven_id].first = desc;
-            break;
+                break;
             case 1:
             {
                 ss >> std::hex >> dev_id;
-                std::getline(ss, desc); //TODO trim whitespace
+                std::getline(ss, desc);
                 auto& dev = pci_ids[ven_id].second[dev_id];
                 dev.desc = desc;
+                break;
             }
-            break;
             case 2:
             {
                 ss >> std::hex >> subsys_ven_id;
@@ -69,10 +80,10 @@ void parse_pciids()
                 std::getline(ss, desc);
                 auto& dev = pci_ids[ven_id].second[dev_id];
                 dev.subsys.push_back({subsys_ven_id, subsys_dev_id, desc});
+                break;
             }
-            break;
             default:
-            break;
+                break;
         }
     }
 }
