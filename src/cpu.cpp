@@ -60,7 +60,6 @@ static bool g_logged_fallback_once   = false;
 static bool g_corectl_logged_summary = false;
 
 // ANDROID: sysfs 기반 CPU 코어 enum
-// ANDROID: sysfs 기반 CPU 코어 enum
 static bool android_enumerate_cpus(std::vector<CPUData>& out, CPUData& total)
 {
     const char* base = "/sys/devices/system/cpu";
@@ -534,15 +533,15 @@ bool CPUStats::Init()
     if (!android_enumerate_cpus(m_cpuData, m_cpuDataTotal)) {
         SPDLOG_ERROR("Android CPU: sysfs enumeration failed, disabling CPU stats");
         return false;
-    }
+}
 
 #ifndef TEST_ONLY
     if (get_params()->enabled[OVERLAY_PARAM_ENABLED_core_type])
         get_cpu_cores_types();
 #endif
 
-        m_inited = true;
-        return UpdateCPUData();
+    m_inited = true;
+    return UpdateCPUData();
 
 #else
 
