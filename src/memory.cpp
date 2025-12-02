@@ -1,15 +1,37 @@
 #include <spdlog/spdlog.h>
-#include <map>
 #include <fstream>
 #include <string>
 #include <unistd.h>
-#include <array>
+#include <cstdlib> // std::strtoull
 
 #include "memory.h"
+
+#ifndef TEST_ONLY
 #include "hud_elements.h"
+#endif
 
 float memused, memmax, swapused;
 uint64_t proc_mem_resident, proc_mem_shared, proc_mem_virt;
+
+static inline float parse_val_mb(const std::string& s) {
+    const char* cstr = s.c_str();
+    const char* p = cstr;
+
+    // 숫자 시작 위치 찾기
+    while (*p && (*p < '0' || *p > '9'))
+        ++p;
+
+    if (!*p)
+        return 0.0f;
+
+    char* end = nullptr;
+    unsigned long long kb = std::strtoull(p, &end, 10);
+    if (end == p)
+        return 0.0f;
+
+    // kB -> GiB (kB / 1024 / 1024)
+    return static_cast<float>(kb) / (1024.0f * 1024.0f);
+}
 
 void update_meminfo() {
     static float cached_memtotal = 0.0f;
@@ -20,22 +42,15 @@ void update_meminfo() {
         return;
     }
 
-    float mem_total = cached_memtotal;
-    float mem_avail = 0.0f;
+    float mem_total  = cached_memtotal;
+    float mem_avail  = 0.0f;
     float swap_total = 0.0f;
     float swap_free  = 0.0f;
 
     unsigned found = 0;
     std::string line;
 
-    auto parse_val_mb = [](const std::string& s) -> float {
-        size_t start = s.find_first_of("0123456789");
-        if (start == std::string::npos)
-            return 0.0f;
-        unsigned long long kb = std::strtoull(s.c_str() + start, nullptr, 10);
-        return static_cast<float>(kb) / 1024.0f / 1024.0f;
-    };
-
+    // 필요한 4개 키만 읽고 끝내기
     while (std::getline(file, line) && found < 4) {
         if (line.rfind("MemTotal:", 0) == 0) {
             mem_total = parse_val_mb(line);
@@ -61,44 +76,49 @@ void update_meminfo() {
     swapused = swap_total - swap_free;
 }
 
-void update_procmem()
-{
-    auto page_size = sysconf(_SC_PAGESIZE);
-    if (page_size < 0) page_size = 4096;
+void update_procmem() {
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0)
+        page_size = 4096;
+    const unsigned long long page_bytes =
+        static_cast<unsigned long long>(page_size);
 
     std::string f = "/proc/";
 
+#ifndef TEST_ONLY
     {
         auto gs_pid = HUDElements.g_gamescopePid;
-        f += gs_pid < 1 ? "self" : std::to_string(gs_pid);
-        f += "/statm";
+        f += (gs_pid < 1) ? "self" : std::to_string(gs_pid);
     }
+#else
+    f += "self";
+#endif
+
+    f += "/statm";
 
     std::ifstream file(f);
-
     if (!file.is_open()) {
         SPDLOG_ERROR("can't open {}", f);
         return;
     }
 
-    size_t last_idx = 0;
     std::string line;
-    std::getline(file, line);
-
-    if (line.empty())
+    if (!std::getline(file, line) || line.empty())
         return;
 
-    std::array<uint64_t, 3> meminfo;
+    const char* c = line.c_str();
+    char* end = nullptr;
 
-    for (auto i = 0; i < 3; i++) {
-        auto idx = line.find(" ", last_idx);
-        auto val = line.substr(last_idx, idx);
+    // /proc/<pid>/statm 포맷:
+    // size resident shared ...
+    unsigned long long size_pages = std::strtoull(c, &end, 10);
+    if (end == c)
+        return;
 
-        meminfo[i] = std::stoull(val) * page_size;
-        last_idx = idx + 1;
-    }
+    unsigned long long resident_pages = std::strtoull(end, &end, 10);
+    unsigned long long shared_pages   = std::strtoull(end, nullptr, 10);
 
-    proc_mem_virt = meminfo[0];
-    proc_mem_resident = meminfo[1];
-    proc_mem_shared = meminfo[2];
+    proc_mem_virt     = size_pages     * page_bytes;
+    proc_mem_resident = resident_pages * page_bytes;
+    proc_mem_shared   = shared_pages   * page_bytes;
 }
