@@ -18,7 +18,6 @@
 #include <chrono>
 #include <unistd.h>
 #include <unordered_map>
-#include <dirent.h>
 #endif
 
 #ifndef TEST_ONLY
@@ -612,7 +611,22 @@ bool CPUStats::UpdateCoreMhz() {
     FILE *fp;
 
 #if defined(__ANDROID__)
-    // Android: best-effort cpufreq only, no /proc/cpuinfo fallback
+    constexpr int ANDROID_MHZ_MIN_UPDATE_MS = 500;
+    static auto last_ts = std::chrono::steady_clock::time_point{};
+    auto now = std::chrono::steady_clock::now();
+
+    if (last_ts.time_since_epoch().count() != 0) {
+        auto delta_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_ts).count();
+        if (delta_ms < ANDROID_MHZ_MIN_UPDATE_MS) {
+            // 기존 값만 유지하고 빠르게 반환
+            for (const auto &cpu : m_cpuData)
+                m_coreMhz.push_back(cpu.mhz);
+            return true;
+        }
+    }
+    last_ts = now;
+
     for (auto& cpu : m_cpuData) {
         std::string path = "/sys/devices/system/cpu/cpu" +
                            std::to_string(cpu.cpu_id) +
