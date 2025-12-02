@@ -54,7 +54,7 @@ struct AndroidVkGpuContext {
     uint64_t                frame_index   = 0;
 
     // 쿼리 결과용 스크래치 버퍼 (value + availability 쌍)
-    // 최대: MAX_QUERIES_PER_FRAME * 2 * sizeof(uint64_t)
+    // 크기: 최대 MAX_QUERIES_PER_FRAME * 2
     std::vector<uint64_t>   query_scratch;
 
     // CPU/GPU 사용률 + smoothing용 상태
@@ -74,14 +74,11 @@ struct AndroidVkGpuContext {
     bool                                            have_metrics  = false;
 
     // ===== queue_submit용 scratch 버퍼 =====
-    std::vector<VkSubmitInfo>   scratch_wrapped;      // 크기: submitCount
+    std::vector<VkSubmitInfo>    scratch_wrapped;     // 크기: submitCount
     std::vector<VkCommandBuffer> scratch_cmds;        // 평면화된 pCommandBuffers
     std::vector<uint32_t>        scratch_cb_offsets;  // submit별 offset
     std::vector<uint32_t>        scratch_cb_counts;   // submit별 CB 개수
     std::vector<uint8_t>         scratch_instrument;  // submit별 계측 여부 (0/1)
-
-    // ===== 쿼리 결과용 scratch =====
-    std::vector<uint64_t>        scratch_query_data;  // size >= query_count * 2
 };
 
 // ====================== 헬퍼: 타임스탬프 리소스 초기화 ======================
@@ -208,10 +205,14 @@ android_gpu_usage_begin_frame(AndroidVkGpuContext* ctx,
 
     // 이 슬롯에서 쓰던 CB들 전부 초기화 (핸들은 유지, 내용만 리셋)
     if (ctx->disp.ResetCommandPool && fr.cmd_pool != VK_NULL_HANDLE) {
+        VkCommandPoolResetFlags reset_flags = 0;
+    #ifdef VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT
+        reset_flags |= VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT;
+    #endif
         ctx->disp.ResetCommandPool(
             ctx->device,
             fr.cmd_pool,
-            VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT
+            reset_flags
         );
     }
 
@@ -365,7 +366,7 @@ android_gpu_usage_record_timestamp_pair(AndroidVkGpuContext*            ctx,
     return true;
 }
 
-// 특정 슬롯에 대해 GPU time(ms) 합산 + 슬롯 해제
+// 특정 슬롯에 대해 GPU time(ms) 계산 + 슬롯 해제
 static float
 android_gpu_usage_collect_frame_gpu_ms(AndroidVkGpuContext*            ctx,
                                        AndroidVkGpuContext::FrameResources& fr)
@@ -428,9 +429,9 @@ android_gpu_usage_collect_frame_gpu_ms(AndroidVkGpuContext*            ctx,
         mask = (1ULL << ctx->ts_valid_bits) - 1ULL;
     }
 
-    double   sum_ms      = 0.0;
-    uint64_t min_start_ts= std::numeric_limits<uint64_t>::max();
-    uint64_t max_end_ts  = 0;
+    double   sum_ms       = 0.0;
+    uint64_t min_start_ts = std::numeric_limits<uint64_t>::max();
+    uint64_t max_end_ts   = 0;
 
     for (uint32_t i = 0; i < pair_count; ++i) {
         const uint32_t q_start = 2u * i;
@@ -457,10 +458,10 @@ android_gpu_usage_collect_frame_gpu_ms(AndroidVkGpuContext*            ctx,
 
         // 1) 순수 합산 시간
         const uint64_t delta_ticks = end_ts - start_ts;
-        const double   ns          = double(delta_ticks) * double(ctx->ts_period_ns);
-        const double   ms          = ns * 1e-6;
-        if (ms > 0.0 && std::isfinite(ms))
-            sum_ms += ms;
+        const double   ns_sum      = double(delta_ticks) * double(ctx->ts_period_ns);
+        const double   ms_sum      = ns_sum * 1e-6;
+        if (ms_sum > 0.0 && std::isfinite(ms_sum))
+            sum_ms += ms_sum;
 
         // 2) 활성 구간 추적
         if (start_ts < min_start_ts)
@@ -480,8 +481,8 @@ android_gpu_usage_collect_frame_gpu_ms(AndroidVkGpuContext*            ctx,
         min_start_ts != std::numeric_limits<uint64_t>::max()) {
 
         const uint64_t range_ticks = max_end_ts - min_start_ts;
-        const double   ns          = double(range_ticks) * double(ctx->ts_period_ns);
-        range_ms                   = ns * 1e-6;
+        const double   ns_range    = double(range_ticks) * double(ctx->ts_period_ns);
+        range_ms                   = ns_range * 1e-6;
     }
 
     double gpu_ms = 0.0;
@@ -607,6 +608,13 @@ android_gpu_usage_queue_submit(AndroidVkGpuContext* ctx,
 
     try {
         std::lock_guard<std::mutex> g(ctx->lock);
+
+        // 이미 특정 queue family로 초기화된 경우, 다른 family는 계측하지 않는다.
+        if (ctx->query_pool != VK_NULL_HANDLE &&
+            ctx->queue_family_index != VK_QUEUE_FAMILY_IGNORED &&
+            ctx->queue_family_index != queue_family_index) {
+            return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
+        }
 
         // 리소스 lazy init
         if (!android_gpu_usage_init_timestamp_resources(ctx, queue_family_index)) {
