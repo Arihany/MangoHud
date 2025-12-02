@@ -116,13 +116,6 @@ bool dir_exists(const std::string& path)
     return !stat(path.c_str(), &s) && S_ISDIR(s.st_mode);
 }
 
-std::string read_symlink(const char * link)
-{
-    char result[PATH_MAX] {};
-    ssize_t count = readlink(link, result, PATH_MAX);
-    return std::string(result, (count > 0) ? count : 0);
-}
-
 std::string read_symlink(const char* link)
 {
     char result[PATH_MAX] {};
