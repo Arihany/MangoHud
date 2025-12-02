@@ -11,6 +11,39 @@
 int global_control_client;
 
 using namespace std;
+
+#if defined(__ANDROID__)
+
+// ANDROID: MangoApp-style control socket은 사용하지 않는다.
+// 모든 엔트리 포인트를 no-op으로 막아서 핫패스에서 syscall을 제거.
+
+static void parse_command(overlay_params&, const char*, unsigned,
+                          const char*, unsigned)
+{
+    // Android에서는 외부 제어 자체를 지원하지 않음.
+}
+
+void control_send(int, const char*, unsigned,
+                  const char*, unsigned)
+{
+    // 아무 것도 보내지 않음.
+}
+
+void control_client_check(int /*control*/, int& control_client,
+                          const std::string& /*deviceName*/)
+{
+    // 연결 안 받는다.
+    control_client = -1;
+    global_control_client = -1;
+}
+
+void process_control_socket(int& /*control_client*/, overlay_params& /*params*/)
+{
+    // no-op
+}
+
+#else  // !__ANDROID__
+
 static void parse_command(overlay_params &params,
                           const char *cmd, unsigned cmdlen,
                           const char *param, unsigned paramlen)
@@ -18,37 +51,26 @@ static void parse_command(overlay_params &params,
    if (!strncmp(cmd, "hud", cmdlen)) {
       get_params()->no_display = !get_params()->no_display;
    } else if (!strncmp(cmd, "logging", cmdlen)) {
-      if (param && param[0])
-      {
+      if (param && param[0]) {
          int value = atoi(param);
          if (!value && logger->is_active())
             logger->stop_logging();
          else if (value > 0 && !logger->is_active())
             logger->start_logging();
-      }
-      else
-      {
+      } else {
          if (logger->is_active())
             logger->stop_logging();
          else
             logger->start_logging();
       }
    } else if (!strncmp(cmd, "fcat", cmdlen)) {
-      params.enabled[OVERLAY_PARAM_ENABLED_fcat] = !params.enabled[OVERLAY_PARAM_ENABLED_fcat];
+      params.enabled[OVERLAY_PARAM_ENABLED_fcat] =
+         !params.enabled[OVERLAY_PARAM_ENABLED_fcat];
    }
 }
 
 #define BUFSIZE 4096
 
-/**
- * This function will process commands through the control file.
- *
- * A command starts with a colon, followed by the command, and followed by an
- * option '=' and a parameter.  It has to end with a semi-colon. A full command
- * + parameter looks like:
- *
- *    :cmd=param;
- */
 static void process_char(const int control_client, overlay_params &params, char c)
 {
    static char cmd[BUFSIZE];
@@ -85,29 +107,25 @@ static void process_char(const int control_client, overlay_params &params, char 
          break;
 
       if (reading_param) {
-         /* overflow means an invalid parameter */
          if (parampos >= BUFSIZE - 1) {
             reading_cmd = false;
             reading_param = false;
             break;
          }
-
          param[parampos++] = c;
       } else {
-         /* overflow means an invalid command */
          if (cmdpos >= BUFSIZE - 1) {
             reading_cmd = false;
             break;
          }
-
          cmd[cmdpos++] = c;
       }
    }
 }
 
 void control_send(int control_client,
-                         const char *cmd, unsigned cmdlen,
-                         const char *param, unsigned paramlen)
+                  const char *cmd, unsigned cmdlen,
+                  const char *param, unsigned paramlen)
 {
    unsigned msglen = 0;
    char buffer[BUFSIZE];
@@ -147,13 +165,11 @@ static void control_send_connection_string(int control_client, const std::string
 
    control_send(control_client, versionCmd, strlen(versionCmd),
                 versionString, strlen(versionString));
-
 }
 
 void control_client_check(int control, int& control_client, const std::string& deviceName)
 {
-   /* Already connected, just return. */
-   if (control_client >= 0){
+   if (control_client >= 0) {
       global_control_client = control_client;
       return;
    }
@@ -180,38 +196,35 @@ static void control_client_disconnected(int& control_client)
 
 void process_control_socket(int& control_client, overlay_params &params)
 {
-   if (control_client >= 0) {
-      char buf[BUFSIZE];
+   if (control_client < 0)
+      return;
 
-      while (true) {
-         ssize_t n = os_socket_recv(control_client, buf, BUFSIZE, 0);
+   char buf[BUFSIZE];
 
-         if (n == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-               /* nothing to read, try again later */
-               break;
-            }
+   while (true) {
+      ssize_t n = os_socket_recv(control_client, buf, BUFSIZE, 0);
 
-            if (errno != ECONNRESET)
-               fprintf(stderr, "ERROR on connection: %s\n", strerror(errno));
-
-            control_client_disconnected(control_client);
-         } else if (n == 0) {
-            /* recv() returns 0 when the client disconnects */
-            control_client_disconnected(control_client);
-         }
-
-         for (ssize_t i = 0; i < n; i++) {
-            process_char(control_client, params, buf[i]);
-         }
-
-         /* If we try to read BUFSIZE and receive BUFSIZE bytes from the
-          * socket, there's a good chance that there's still more data to be
-          * read, so we will try again. Otherwise, simply be done for this
-          * iteration and try again on the next frame.
-          */
-         if (n < BUFSIZE)
+      if (n == -1) {
+         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             break;
+         }
+
+         if (errno != ECONNRESET)
+            fprintf(stderr, "ERROR on connection: %s\n", strerror(errno));
+
+         control_client_disconnected(control_client);
+         break;
+      } else if (n == 0) {
+         control_client_disconnected(control_client);
+         break;
       }
+
+      for (ssize_t i = 0; i < n; i++)
+         process_char(control_client, params, buf[i]);
+
+      if (n < BUFSIZE)
+         break;
    }
 }
+
+#endif // __ANDROID__
