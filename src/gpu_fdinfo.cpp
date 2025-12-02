@@ -401,9 +401,8 @@ int GPU_fdinfo::get_gpu_load()
     static bool logged_once = false;
     if (!logged_once) {
         const char* backend =
-            (module == "xe")      ? "xe fdinfo cycles" :
-            (module == "msm_drm") ? "kgsl busy%" :
-                                     "drm fdinfo time";
+            (module == "xe") ? "xe fdinfo cycles"
+                             : "drm fdinfo time";
 
         SPDLOG_INFO(
             "GPU_fdinfo load path: module=\"{}\", backend={}",
@@ -431,13 +430,6 @@ int GPU_fdinfo::get_gpu_load()
 
     if (delta_time > 0.0f)
         result = (delta_gpu_time / delta_time) * 100.0f;  // drm-engine-*
-
-    if (module == "msm_drm" && result <= 0.0f) {
-        int kgsl = get_kgsl_load();
-        SPDLOG_DEBUG("gpu_load: msm_drm fallback to kgsl load={}", kgsl);
-        if (kgsl > 0)
-            result = static_cast<float>(kgsl);
-    }
 
     if (result > 100.0f)
         result = 100.0f;
