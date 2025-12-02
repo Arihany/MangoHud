@@ -8,10 +8,6 @@
 namespace fs = ghc::filesystem;
 using namespace std;
 
-// ============================================================================
-// Fast I/O helpers (Zero-Allocation & Inline)
-// ============================================================================
-
 static inline float readFloatFast(const char* path, float divisor, bool* ok) {
     if (ok)
         *ok = false;
@@ -52,10 +48,6 @@ template <size_t N>
 static inline void make_path(char (&buf)[N], const std::string& base, const char* file) {
     snprintf(buf, N, "%s/%s", base.c_str(), file);
 }
-
-// ============================================================================
-// BatteryStats 구현
-// ============================================================================
 
 void BatteryStats::numBattery() {
     batt_count = 0;
