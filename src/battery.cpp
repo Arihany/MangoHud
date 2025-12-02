@@ -1,33 +1,61 @@
 #include <spdlog/spdlog.h>
 #include <filesystem.h>
 #include "battery.h"
+#include <cstdio>
+#include <cstring>
+#include <cmath>
 
 namespace fs = ghc::filesystem;
 using namespace std;
 
-// 헬퍼 함수: 파일에서 float 값 읽기 (실패 시 0.0f 반환)
-static float readFloatFromFile(const std::string& path, float divisor = 1.0f) {
-    if (!fs::exists(path)) return 0.0f;
-    std::ifstream input(path);
-    std::string line;
-    if (std::getline(input, line)) {
-        try {
-            return std::stof(line) / divisor;
-        } catch (...) {
-            return 0.0f;
-        }
+// ============================================================================
+// Fast I/O helpers (Zero-Allocation & Inline)
+// ============================================================================
+
+static inline float readFloatFast(const char* path, float divisor, bool* ok) {
+    if (ok)
+        *ok = false;
+
+    FILE* f = fopen(path, "r");
+    if (!f)
+        return 0.0f;
+
+    float value = 0.0f;
+    if (fscanf(f, "%f", &value) == 1) {
+        if (ok)
+            *ok = true;
     }
-    return 0.0f;
+
+    fclose(f);
+    return value / divisor;
 }
 
-// 헬퍼 함수: 파일에서 string 값 읽기
-static std::string readStringFromFile(const std::string& path) {
-    if (!fs::exists(path)) return "";
-    std::ifstream input(path);
-    std::string line;
-    std::getline(input, line);
-    return line;
+static inline float readFloatFast(const char* path, float divisor = 1.0f) {
+    return readFloatFast(path, divisor, nullptr);
 }
+
+static inline char readStatusChar(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f)
+        return 0;
+
+    char c = 0;
+    if (fscanf(f, " %c", &c) != 1)
+        c = 0;
+
+    fclose(f);
+    return c;
+}
+
+// 경로 합성용 템플릿 (매크로 대체)
+template <size_t N>
+static inline void make_path(char (&buf)[N], const std::string& base, const char* file) {
+    snprintf(buf, N, "%s/%s", base.c_str(), file);
+}
+
+// ============================================================================
+// BatteryStats 구현
+// ============================================================================
 
 void BatteryStats::numBattery() {
     batt_count = 0;
@@ -43,11 +71,9 @@ void BatteryStats::numBattery() {
         if (!fs::exists(path)) {
 #if defined(__ANDROID__)
             if (!android_batt_info_logged) {
-                SPDLOG_INFO("Battery: /sys/class/power_supply not accessible, disabling battery stats");
+                SPDLOG_INFO("Battery: /sys/class/power_supply not accessible");
                 android_batt_info_logged = true;
             }
-#else
-            SPDLOG_DEBUG("Battery: {} not present", path.string());
 #endif
             return;
         }
@@ -56,60 +82,36 @@ void BatteryStats::numBattery() {
 
         for (const auto& p : fs::directory_iterator(path)) {
             const std::string fileName = p.path().filename().string();
-            // 안전 장치: 배열 크기를 넘지 않도록 (배열 크기가 헤더에 정의되어 있다고 가정)
-            // if (batteryCount >= MAX_BATTERY_COUNT) break; 
 
 #if defined(__ANDROID__)
-            const fs::path syspath   = p.path();
-            const fs::path type_path = syspath / "type";
             bool is_battery = false;
 
-            // 1. type 파일 확인
-            std::string type = readStringFromFile(type_path.string());
-            if (type == "Battery") {
+            if (fileName.find("battery") != std::string::npos ||
+                fileName.find("bat")     != std::string::npos ||
+                fileName.find("BAT")     != std::string::npos) {
                 is_battery = true;
             }
 
-            // 2. 이름으로 fallback 확인
-            if (!is_battery) {
-                if (fileName == "battery" ||
-                    fileName.find("BAT") == 0 || 
-                    fileName.find("bat") == 0) { // rfind(..., 0) == 0 은 starts_with 의미
-                    is_battery = true;
-                }
-            }
-
-            if (!is_battery) continue;
-
-            battPath[batteryCount] = syspath.string();
-            batteryCount++;
+            if (!is_battery)
+                continue;
 #else
-            if (fileName.find("BAT") != std::string::npos) {
-                battPath[batteryCount] = p.path().string(); // p.path()는 path객체이므로 string변환
-                batteryCount++;
-            }
+            if (fileName.find("BAT") == std::string::npos)
+                continue;
 #endif
+
+            if (batteryCount >= MAX_BATTERY_COUNT) {
+                SPDLOG_WARN("Battery: MAX_BATTERY_COUNT ({}) exceeded", MAX_BATTERY_COUNT);
+                break;
+            }
+
+            battPath[batteryCount] = p.path().string();
+            batteryCount++;
         }
 
         batt_count = batteryCount;
-
-#if defined(__ANDROID__)
-        if (batt_count == 0 && !android_batt_info_logged) {
-            SPDLOG_INFO("Battery: no usable power_supply entries under {}, disabling battery stats", path.string());
-            android_batt_info_logged = true;
-        }
-#endif
     }
     catch (const fs::filesystem_error& e) {
-#if defined(__ANDROID__)
-        static bool android_batt_fs_logged = false;
-        if (!android_batt_fs_logged) {
-            SPDLOG_INFO("Battery: filesystem error while scanning {}: {}, disabling battery stats", path.string(), e.what());
-            android_batt_fs_logged = true;
-        }
-#else
-        SPDLOG_DEBUG("Battery: failed to scan {}: {}", path.string(), e.what());
-#endif
+        SPDLOG_ERROR("Battery: filesystem scan error: {}", e.what());
         batt_count = 0;
     }
 }
@@ -117,11 +119,6 @@ void BatteryStats::numBattery() {
 void BatteryStats::update() {
     if (!batt_check) {
         numBattery();
-#if !defined(__ANDROID__)
-        if (batt_count == 0) {
-            SPDLOG_ERROR("No battery found");
-        }
-#endif
     }
 
     if (batt_count <= 0) {
@@ -137,134 +134,179 @@ void BatteryStats::update() {
 }
 
 float BatteryStats::getPercent() {
-    if (batt_count <= 0) return 0.0f;
+    if (batt_count <= 0)
+        return 0.0f;
 
-    float total_charge_now = 0.0f;
-    float total_charge_full = 0.0f;
+    float total_now  = 0.0f;
+    float total_full = 0.0f;
+    char pathBuf[256];
 
     for (int i = 0; i < batt_count; i++) {
-        const string syspath = battPath[i];
-        
-        // 우선순위: charge_now (Ah) -> energy_now (Wh) -> capacity (%)
-        // 단위를 통일하기 위해 단순히 값을 읽어서 비율만 계산합니다.
-        
-        if (fs::exists(syspath + "/charge_now")) {
-            total_charge_now  += readFloatFromFile(syspath + "/charge_now", 1000000.0f);
-            total_charge_full += readFloatFromFile(syspath + "/charge_full", 1000000.0f);
-        } 
-        else if (fs::exists(syspath + "/energy_now")) {
-            total_charge_now  += readFloatFromFile(syspath + "/energy_now", 1000000.0f);
-            total_charge_full += readFloatFromFile(syspath + "/energy_full", 1000000.0f);
-        } 
-        else {
-            // 정보가 부족한 구형 기기: % 자체를 읽어서 평균을 내기 위해 누적
-            total_charge_now  += readFloatFromFile(syspath + "/capacity", 100.0f); // 0.xx 형태로 변환
-            total_charge_full += 1.0f; // 100% 기준
+        const string& basePath = battPath[i];
+
+        bool  ok_now  = false;
+        bool  ok_full = false;
+        float now     = 0.0f;
+        float full    = 0.0f;
+
+        // 1순위: charge_*
+        make_path(pathBuf, basePath, "charge_now");
+        now = readFloatFast(pathBuf, 1000000.0f, &ok_now);
+
+        if (ok_now) {
+            make_path(pathBuf, basePath, "charge_full");
+            full = readFloatFast(pathBuf, 1000000.0f, &ok_full);
+        }
+
+        // 2순위: energy_*
+        if (!ok_now || !ok_full) {
+            ok_now  = false;
+            ok_full = false;
+
+            make_path(pathBuf, basePath, "energy_now");
+            now = readFloatFast(pathBuf, 1000000.0f, &ok_now);
+
+            if (ok_now) {
+                make_path(pathBuf, basePath, "energy_full");
+                full = readFloatFast(pathBuf, 1000000.0f, &ok_full);
+            }
+        }
+
+        // 3순위: capacity
+        if (!ok_now || !ok_full) {
+            ok_now  = false;
+            ok_full = false;
+
+            make_path(pathBuf, basePath, "capacity");
+            now = readFloatFast(pathBuf, 100.0f, &ok_now); // 0.xx ~ 1.0
+
+            if (ok_now) {
+                full    = 1.0f;
+                ok_full = true;
+            }
+        }
+
+        if (ok_now && ok_full) {
+            total_now  += now;
+            total_full += full;
         }
     }
 
-    if (total_charge_full <= 0.0f) return 0.0f;
+    if (total_full <= 0.0001f)
+        return 0.0f;
 
-    return (total_charge_now / total_charge_full) * 100.0f;
+    return (total_now / total_full) * 100.0f;
 }
 
 float BatteryStats::getPower() {
-    if (batt_count <= 0) return 0.0f;
+    if (batt_count <= 0)
+        return 0.0f;
 
     float total_watts = 0.0f;
+    char pathBuf[256];
 
     for (int i = 0; i < batt_count; i++) {
-        const string syspath = battPath[i];
-        
-        // 상태 확인
-        string s = readStringFromFile(syspath + "/status");
-        if (!s.empty()) {
-            current_status = s;
-            state[i] = s;
-        }
+        const string& basePath = battPath[i];
 
-        // 충전 중이거나 완충 상태면 방전 전력(소모량)은 0으로 간주
-        if (state[i] == "Charging" || state[i] == "Unknown" || state[i] == "Full") {
-            continue; // 이 배터리의 소모 전력은 0W
-        }
+        make_path(pathBuf, basePath, "status");
+        char status = readStatusChar(pathBuf);
 
-        float inst_current = 0.0f;
-        float inst_voltage = 0.0f;
-        
-        if (fs::exists(syspath + "/current_now")) {
-            inst_current = readFloatFromFile(syspath + "/current_now", 1000000.0f);
-            inst_voltage = readFloatFromFile(syspath + "/voltage_now", 1000000.0f);
-        
-            inst_current = std::fabs(inst_current);
-            inst_voltage = std::fabs(inst_voltage);
-            total_watts += (inst_current * inst_voltage);
+        // Charging(C) or Full(F) -> 방전량 0 처리
+        if (status == 'C' || status == 'F')
+            continue;
+
+        float watts      = 0.0f;
+        bool  ok_current = false;
+
+        make_path(pathBuf, basePath, "current_now");
+        float current = readFloatFast(pathBuf, 1000000.0f, &ok_current); // uA -> A
+
+        if (ok_current) {
+            make_path(pathBuf, basePath, "voltage_now");
+            float voltage = readFloatFast(pathBuf, 1000000.0f);          // uV -> V
+            watts = std::fabs(current) * std::fabs(voltage);
         } else {
-            float power = readFloatFromFile(syspath + "/power_now", 1000000.0f);
-            total_watts += std::fabs(power);
+            make_path(pathBuf, basePath, "power_now");
+            float power = readFloatFast(pathBuf, 1000000.0f);            // uW -> W
+            watts = std::fabs(power);
         }
 
-        // [중요 수정] 배터리별로 (V * I)를 계산 후 합산해야 정확함
-        total_watts += (inst_current * inst_voltage);
+        total_watts += watts;
     }
 
     return total_watts;
 }
 
 float BatteryStats::getTimeRemaining() {
-    if (batt_count <= 0) return 0.0f;
+    if (batt_count <= 0)
+        return 0.0f;
 
-    float system_current_sum = 0.0f; // 현재 시점의 모든 배터리 전류 합
-    float total_charge = 0.0f;       // 현재 모든 배터리의 잔여 용량 합
+    float current_sum_ah = 0.0f;
+    float charge_sum_ah  = 0.0f;
+    char pathBuf[256];
 
     for (int i = 0; i < batt_count; i++) {
-        const string syspath = battPath[i];
+        const string& basePath = battPath[i];
 
-        // 1. 전류 읽기 (Ah 계산용 전류)
-        float inst_current = 0.0f;
-        
-        if (fs::exists(syspath + "/current_now")) {
-            inst_current = readFloatFromFile(syspath + "/current_now"); // 단위 보정 없이 raw값 읽음 (나중에 나눌 때 상쇄되거나, 일관성 유지)
-        } else if (fs::exists(syspath + "/power_now")) {
-            float p = readFloatFromFile(syspath + "/power_now");
-            float v = readFloatFromFile(syspath + "/voltage_now");
-            if (v > 0.0f) inst_current = p / v; // W / V = A
-        }
-        
-        system_current_sum += inst_current;
+        // 1. 전류(A)
+        bool  ok_current = false;
+        make_path(pathBuf, basePath, "current_now");
+        float current = readFloatFast(pathBuf, 1000000.0f, &ok_current); // uA -> A
 
-        // 2. 잔여 용량 읽기
-        if (fs::exists(syspath + "/charge_now")) {
-            total_charge += readFloatFromFile(syspath + "/charge_now");
-        } 
-        else if (fs::exists(syspath + "/energy_now")) {
-            // Wh -> Ah 변환 필요 (Ah = Wh / V)
-            float e = readFloatFromFile(syspath + "/energy_now");
-            float v = readFloatFromFile(syspath + "/voltage_now");
-            if (v > 0.0f) {
-                total_charge += (e / v); 
-            }
+        if (!ok_current) {
+            make_path(pathBuf, basePath, "power_now");
+            float power = readFloatFast(pathBuf, 1000000.0f);            // uW -> W
+
+            make_path(pathBuf, basePath, "voltage_now");
+            float volt  = readFloatFast(pathBuf, 1000000.0f);           // uV -> V
+
+            if (volt > 0.0001f)
+                current = power / volt;
         }
+
+        current_sum_ah += std::fabs(current);
+
+        // 2. 잔량(Ah)
+        bool  ok_charge = false;
+        make_path(pathBuf, basePath, "charge_now");
+        float charge = readFloatFast(pathBuf, 1000000.0f, &ok_charge);  // uAh -> Ah
+
+        if (!ok_charge) {
+            make_path(pathBuf, basePath, "energy_now");
+            float energy = readFloatFast(pathBuf, 1000000.0f);          // uWh -> Wh
+
+            make_path(pathBuf, basePath, "voltage_now");
+            float volt   = readFloatFast(pathBuf, 1000000.0f);         // uV -> V
+
+            if (volt > 0.0001f)
+                charge = energy / volt;
+        }
+
+        charge_sum_ah += charge;
     }
 
-    // [수정] 모든 배터리의 전류 합을 벡터에 한 번만 저장 (시스템 전체 부하)
-    current_now_vec.push_back(system_current_sum);
-
-    if (current_now_vec.size() > 25) {
-        current_now_vec.erase(current_now_vec.begin());
+    // 전류가 흐를 때만 기록
+    if (current_sum_ah > 0.0001f) {
+        if (current_now_vec.size() >= 25) {
+            current_now_vec.erase(current_now_vec.begin());
+        }
+        current_now_vec.push_back(current_sum_ah);
     }
 
-    if (current_now_vec.empty() || total_charge <= 0.0f) return 0.0f;
+    if (current_now_vec.empty() || charge_sum_ah <= 0.0001f)
+        return 0.0f;
 
-    // 평균 전류 계산
     float avg_current = 0.0f;
-    for (float c : current_now_vec) {
+    for (float c : current_now_vec)
         avg_current += c;
-    }
+
     avg_current /= static_cast<float>(current_now_vec.size());
 
-    if (avg_current <= 0.0f) return 0.0f;
+    if (avg_current <= 0.0001f)
+        return 0.0f;
 
-    return total_charge / avg_current;
+    // 시간(시간 단위) = 용량(Ah) / 전류(A)
+    return charge_sum_ah / avg_current;
 }
 
 BatteryStats Battery_Stats;
