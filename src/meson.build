@@ -62,8 +62,11 @@ vklayer_files = files(
   'file_utils.cpp',
   'nvidia.cpp',
   'gpu_fdinfo.cpp',
-  'amdgpu.cpp'
 )
+
+if host_machine.system() != 'android'
+  vklayer_files += files('amdgpu.cpp')
+endif
 
 opengl_files  = []
 if ['windows', 'mingw'].contains(host_machine.system())
