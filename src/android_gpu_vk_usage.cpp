@@ -369,7 +369,7 @@ static float android_gpu_usage_collect_frame_gpu_ms(
         return 0.0f;
     }
 
-    SPDLOG_DEBUG(
+    SPDLOG_INFO(
         "Android GPU usage: collect_frame_gpu_ms start (query_count={} pair_count={} valid_bits={})",
         query_count,
         pair_count,
@@ -420,14 +420,14 @@ static float android_gpu_usage_collect_frame_gpu_ms(
     fr.query_used  = 0;
 
     if (total_ms <= 0.0 || !std::isfinite(total_ms)) {
-        SPDLOG_DEBUG(
+        SPDLOG_INFO(
             "Android GPU usage: collect_frame_gpu_ms result <= 0 (total_ms={})",
             total_ms
         );
         return 0.0f;
     }
 
-    SPDLOG_DEBUG(
+    SPDLOG_INFO(
         "Android GPU usage: collect_frame_gpu_ms done (total_ms={})",
         total_ms
     );
@@ -706,8 +706,35 @@ void android_gpu_usage_on_present(
             auto& fr = ctx->frames[read_idx];
             if (fr.frame_serial == read_serial) {
                 gpu_ms = android_gpu_usage_collect_frame_gpu_ms(ctx, fr);
+                SPDLOG_INFO(
+                    "Android GPU usage: present read slot={} serial={} gpu_ms={}",
+                    read_idx,
+                    read_serial,
+                    gpu_ms
+                );
+            } else {
+                SPDLOG_INFO(
+                    "Android GPU usage: present skip read (slot={} serial={} stored_serial={} has_queries={} used={})",
+                    read_idx,
+                    read_serial,
+                    fr.frame_serial,
+                    fr.has_queries,
+                    fr.query_used
+                );
             }
+        } else {
+            SPDLOG_INFO(
+                "Android GPU usage: present early frame (frame_index={} MIN={})",
+                ctx->frame_index,
+                AndroidVkGpuContext::MAX_FRAMES - 1
+            );
         }
+    } else {
+        SPDLOG_INFO(
+            "Android GPU usage: present ts_disabled (ts_supported={} qpool={})",
+            ctx->ts_supported,
+            static_cast<void*>(ctx->query_pool)
+        );
     }
 
     ctx->last_gpu_ms = gpu_ms;
@@ -725,6 +752,14 @@ void android_gpu_usage_on_present(
 
     ctx->last_usage = usage;
 
+
+    SPDLOG_INFO(
+        "Android GPU usage: present final (frame_index={} frame_cpu_ms={} gpu_ms={} usage={})",
+        ctx->frame_index,
+        frame_cpu_ms,
+        gpu_ms,
+        usage
+    );
     // 다음 프레임으로
     ctx->frame_index++;
 }
