@@ -685,58 +685,14 @@ bool CPUStats::UpdateCoreMhz() {
 }
 
 bool CPUStats::ReadcpuTempFile(int& temp) {
-	if (!m_cpuTempFile)
-		return false;
-
-	rewind(m_cpuTempFile);
-	fflush(m_cpuTempFile);
-	bool ret = (fscanf(m_cpuTempFile, "%d", &temp) == 1);
-	temp = temp / 1000;
-
-	return ret;
+    (void)temp;
+    return false;
 }
 
 bool CPUStats::UpdateCpuTemp() {
-#if defined(__ANDROID__)
-    constexpr int ANDROID_CPU_TEMP_MIN_UPDATE_MS = 500;
-
-    static auto  last_ts  = std::chrono::steady_clock::time_point{};
-    static bool  last_ret = false;
-
-    auto now = std::chrono::steady_clock::now();
-
-    if (last_ts.time_since_epoch().count() != 0) {
-        auto delta_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_ts).count();
-
-        if (delta_ms < ANDROID_CPU_TEMP_MIN_UPDATE_MS) {
-            return last_ret;
-        }
-    }
-    last_ts = now;
-#endif
-
-    if (gpus) {
-        for (auto gpu : gpus->available_gpus) {
-            if (gpu->is_apu()) {
-                m_cpuDataTotal.temp = gpu->metrics.apu_cpu_temp;
-#if defined(__ANDROID__)
-                last_ret = true;
-#endif
-                return true;
-            }
-        }
-    }
-
-    int temp = 0;
-    bool ret = ReadcpuTempFile(temp);
-    m_cpuDataTotal.temp = temp;
-
-#if defined(__ANDROID__)
-    last_ret = ret;
-#endif
-
-    return ret;
+    // CPU 온도는 이제 GPU / metrics 쪽에서 관리한다.
+    // CPUStats는 온도 측정에 관여하지 않는다.
+    return false;
 }
 
 static bool get_cpu_power_k10temp(CPUPowerData* cpuPowerData, float& power) {
@@ -972,27 +928,6 @@ static bool find_fallback_input(const std::string& path, const char* input_prefi
     return false;
 }
 
-static void check_thermal_zones(std::string& path, std::string& input) {
-    std::string sysfs_thermal = "/sys/class/thermal/";
-
-    if (!ghc::filesystem::exists(sysfs_thermal))
-        return;
-
-    for (auto& d : ghc::filesystem::directory_iterator(sysfs_thermal)) {
-        if (d.path().filename().string().substr(0, 12) != "thermal_zone")
-            continue;
-
-        std::string type = read_line(d.path() / "type");
-        if (type.substr(0, 6) != "cpuss-")
-            continue;
-
-        path  = d.path().string();
-        input = (d.path() / "temp").string();
-
-        return;
-    }
-}
-
 bool CPUStats::UpdateCPUData()
 {
     if (!m_inited)
@@ -1160,76 +1095,9 @@ bool CPUStats::UpdateCPUData()
 }
 
 bool CPUStats::GetCpuFile() {
-    if (m_cpuTempFile)
-        return true;
-
-    std::string name, path, input;
-    std::string hwmon = "/sys/class/hwmon/";
-    std::smatch match;
-
-    auto dirs = ls(hwmon.c_str());
-    for (auto& dir : dirs) {
-        path = hwmon + dir;
-        name = read_line(path + "/name");
-        SPDLOG_DEBUG("hwmon: sensor name: {}", name);
-
-        if (name == "coretemp") {
-            find_input(path, "temp", input, "Package id 0");
-            break;
-        }
-        else if ((name == "zenpower" || name == "k10temp")) {
-            if (!find_input(path, "temp", input, "Tdie"))
-                find_input(path, "temp", input, "Tctl");
-            break;
-        } else if (name == "atk0110") {
-            find_input(path, "temp", input, "CPU Temperature");
-            break;
-        } else if (name == "it8603") {
-            find_input(path, "temp", input, "temp1");
-            break;
-        } else if (starts_with(name, "cpuss0_")) {
-            find_fallback_input(path, "temp1", input);
-            break;
-        } else if (starts_with(name, "nct")) {
-            // Only break if nct module has TSI0_TEMP node
-            if (find_input(path, "temp", input, "TSI0_TEMP"))
-                break;
-
-        } else if (name == "asusec") {
-            // Only break if module has CPU node
-            if (find_input(path, "temp", input, "CPU"))
-                break;
-        } else if (name == "l_pcs") {
-            // E2K (Elbrus 2000) CPU temperature module
-            find_input(path, "temp", input, "Node 0 Max");
-            break;
-        } else if (std::regex_match(name, match, std::regex("cpu\\d*_thermal"))) {
-            find_fallback_input(path, "temp1", input);
-            break;
-        } else if (name == "apm_xgene") {
-            find_input(path, "temp", input, "SoC Temperature");
-            break;
-        } else {
-            path.clear();
-        }
-    }
-
-    if (path.empty()) {
-        try {
-            check_thermal_zones(path, input);
-        } catch (ghc::filesystem::filesystem_error& ex) {
-            SPDLOG_DEBUG("check_thermal_zones: {}", ex.what());
-        }
-    }
-
-    if (path.empty() || (!file_exists(input) && !find_fallback_input(path, "temp", input))) {
-        SPDLOG_ERROR("Could not find cpu temp sensor location");
-        return false;
-    } else {
-        SPDLOG_DEBUG("hwmon: using input: {}", input);
-        m_cpuTempFile = fopen(input.c_str(), "r");
-    }
-    return true;
+    // CPU 온도 센서는 더 이상 여기서 찾지 않는다.
+    // GPU / metrics 백엔드에서 전담 처리.
+    return false;
 }
 
 static CPUPowerData_k10temp* init_cpu_power_data_k10temp(const std::string path) {
