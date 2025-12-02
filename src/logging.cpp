@@ -250,51 +250,63 @@ Logger::Logger(const overlay_params* in_params)
     m_logging_on(false),
     m_values_valid(false)
 {
-  if(output_folder.empty()) output_folder = std::getenv("HOME");
+  if (output_folder.empty()) {
+      if (const char* home = std::getenv("HOME"))
+          output_folder = home;
+      else
+          output_folder = ".";
+  }
   m_log_end = Clock::now() - 15s;
   SPDLOG_DEBUG("Logger constructed!");
 }
 
 void Logger::start_logging() {
-  if(m_logging_on) return;
+  if (m_logging_on) return;
   m_values_valid = false;
-  m_logging_on = true;
-  m_log_start = Clock::now();
+  m_logging_on   = true;
+  m_log_start    = Clock::now();
 
   std::string program = get_wine_exe_name();
-
   if (program.empty())
       program = get_program_name();
 
   m_log_files.emplace_back(output_folder + "/" + program + "_" + get_log_suffix());
 
-  if(log_interval != 0){
-    std::thread log_thread(&Logger::logging, this);
-    // "mangohud-logging" wouldn't fit in the 15 byte limit
-    pthread_setname_np(log_thread.native_handle(), "mangohud-log");
-    log_thread.detach();
+  if (log_interval != 0) {
+      // 이전 로그 스레드 남아있으면 정리
+      if (log_thread.joinable())
+          log_thread.join();
+
+      log_thread = std::thread(&Logger::logging, this);
+      pthread_setname_np(log_thread.native_handle(), "mangohud-log");
   }
 }
 
 void Logger::stop_logging() {
-  if(!m_logging_on) return;
+  if (!m_logging_on) return;
   m_logging_on = false;
-  m_log_end = Clock::now();
-  if (log_thread.joinable()) log_thread.join();
+  m_log_end    = Clock::now();
+
+  // log_interval == 0이면 별도 스레드 자체가 없을 수도 있음
+  if (log_interval != 0 &&
+      log_thread.joinable() &&
+      std::this_thread::get_id() != log_thread.get_id()) {
+      log_thread.join();
+  }
 
   calculate_benchmark_data();
+
   try {
-      if (output_file.is_open()) {
+      if (output_file.is_open())
           output_file.close();
-      }
   } catch (...) {
-    SPDLOG_INFO("Something went wrong when closing output_file");
+      SPDLOG_INFO("Something went wrong when closing output_file");
   }
 
   if (!m_log_files.empty())
-    writeSummary(m_log_files.back());
+      writeSummary(m_log_files.back());
   else
-    SPDLOG_INFO("Can't write summary because m_log_files is empty");
+      SPDLOG_INFO("Can't write summary because m_log_files is empty");
 
   clear_log_data();
 #ifdef __linux__
@@ -310,7 +322,6 @@ void Logger::logging(){
       try_log();
       this_thread::sleep_for(std::chrono::milliseconds(log_interval));
   }
-  clear_log_data();
 }
 
 void Logger::try_log() {
