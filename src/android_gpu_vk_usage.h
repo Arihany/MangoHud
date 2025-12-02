@@ -6,6 +6,8 @@
 struct AndroidVkGpuDispatch {
     // 큐/쿼리 관련
     PFN_vkQueueSubmit             QueueSubmit;
+    PFN_vkQueueSubmit2            QueueSubmit2;
+    PFN_vkQueueSubmit2KHR         QueueSubmit2KHR;
     PFN_vkCreateQueryPool         CreateQueryPool;
     PFN_vkDestroyQueryPool        DestroyQueryPool;
     PFN_vkGetQueryPoolResults     GetQueryPoolResults;
