@@ -429,3 +429,30 @@ class AMDGPU {
 		void get_sysfs_metrics();
 		void metrics_polling_thread();
 };
+
+#if defined(__ANDROID__)
+inline AMDGPU::AMDGPU(std::string pci_dev, uint32_t device_id, uint32_t vendor_id)
+{
+    this->pci_dev   = std::move(pci_dev);
+    this->device_id = device_id;
+    this->vendor_id = vendor_id;
+}
+
+inline void AMDGPU::get_instant_metrics(struct amdgpu_common_metrics *metrics)
+{
+    if (!metrics)
+        return;
+    *metrics = {};
+}
+
+inline void AMDGPU::get_samples_and_copy(
+    struct amdgpu_common_metrics metrics_buffer[METRICS_SAMPLE_COUNT],
+    bool &gpu_load_needs_dividing)
+{
+    gpu_load_needs_dividing = false;
+
+    for (size_t i = 0; i < METRICS_SAMPLE_COUNT; ++i)
+        metrics_buffer[i] = {};
+}
+
+#endif // defined(__ANDROID__)
