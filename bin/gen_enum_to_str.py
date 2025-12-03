@@ -53,6 +53,22 @@ SKIP_COMMANDS = {
     'vkGetFenceSciSyncFenceNV',
     'vkGetFenceSciSyncObjNV',
     'vkGetMemorySciBufNV',
+
+    'vkGetScreenBufferPropertiesQNX',
+    'vkGetSemaphoreSciSyncObjNV',
+    'vkImportFenceSciSyncFenceNV',
+    'vkImportFenceSciSyncObjNV',
+    'vkImportSemaphoreSciSyncObjNV',
+}
+
+SKIP_STRUCT_NAMES = {
+    'VkApplicationParametersEXT',
+    'VkCommandPoolMemoryConsumption',
+    'VkCommandPoolMemoryReservationCreateInfo',
+    'VkDeviceObjectReservationCreateInfo',
+    'VkDeviceSemaphoreSciSyncPoolReservationCreateInfoNV',
+    'VkExportFenceSciSyncInfoNV',
+    'VkExportMemorySciBufInfoNV',
 }
 
 COPYRIGHT = textwrap.dedent(u"""\
