@@ -489,7 +489,7 @@ android_gpu_usage_collect_frame_gpu_ms(AndroidVkGpuContext*            ctx,
 
     double gpu_ms = 0.0;
 
-    // 1순위: range_ms (DXVK HUD 스타일)
+    // range_ms (DXVK HUD 모방)
     if (range_ms > 0.0 && std::isfinite(range_ms)) {
         gpu_ms = range_ms;
     }
@@ -498,23 +498,14 @@ android_gpu_usage_collect_frame_gpu_ms(AndroidVkGpuContext*            ctx,
         gpu_ms = sum_ms;
     }
 
-    // 상식적인 sanity: 진짜 말도 안 되면 백엔드 끈다.
-    if (!std::isfinite(gpu_ms) || gpu_ms < 0.0) {
-        SPDLOG_WARN("Android GPU usage: invalid gpu_ms={} → disabling timestamp backend", gpu_ms);
-        ctx->ts_supported = false;
+    if (!std::isfinite(gpu_ms) || gpu_ms <= 0.0) {
+        // 그냥 디버그 정도로만 찍고, 샘플 무시
+        SPDLOG_DEBUG(
+            "Android GPU usage: ignoring invalid gpu_ms={} (range_ms={} sum_ms={})",
+            gpu_ms, range_ms, sum_ms
+        );
         return 0.0f;
     }
-
-    // 5초 넘는 프레임은 그냥 드라이버가 맛 간 걸로 보고 끔. (1 FPS 게임은 그냥 포기)
-    if (gpu_ms > 5000.0) {
-        SPDLOG_WARN("Android GPU usage: insane gpu_ms={}ms (>5000) → disabling timestamp backend", gpu_ms);
-        ctx->ts_supported = false;
-        return 0.0f;
-    }
-
-    if (gpu_ms <= 0.0)
-        return 0.0f;
-
     return static_cast<float>(gpu_ms);
 }
 
