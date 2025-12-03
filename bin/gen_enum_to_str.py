@@ -29,6 +29,32 @@ import xml.etree.ElementTree as et
 
 from mako.template import Template
 
+# Android/Bionic: skip enums/commands that are not present in our vulkan_core.h 
+SKIP_ENUM_TYPES = {
+    'VkFaultLevel',
+    'VkFaultQueryBehavior',
+    'VkFaultType',
+    'VkPipelineCacheValidationVersion',
+    'VkPipelineMatchControl',
+    'VkSciSyncClientTypeNV',
+    'VkSciSyncPrimitiveTypeNV',
+}
+
+SKIP_COMMANDS = {
+    'vkGetPhysicalDeviceExternalMemorySciBufPropertiesNV',
+    'vkGetPhysicalDeviceRefreshableObjectTypesKHR',
+    'vkGetPhysicalDeviceSciBufAttributesNV',
+    'vkGetPhysicalDeviceSciSyncAttributesNV',
+    'vkCmdRefreshObjectsKHR',
+    'vkCreateSemaphoreSciSyncPoolNV',
+    'vkDestroySemaphoreSciSyncPoolNV',
+    'vkGetCommandPoolMemoryConsumption',
+    'vkGetFaultData',
+    'vkGetFenceSciSyncFenceNV',
+    'vkGetFenceSciSyncObjNV',
+    'vkGetMemorySciBufNV',
+}
+
 COPYRIGHT = textwrap.dedent(u"""\
     * Copyright © 2017 Intel Corporation
     *
@@ -348,7 +374,10 @@ def parse_xml(cmd_factory, enum_factory, ext_factory, struct_factory, filename):
     xml = et.parse(filename)
 
     for enum_type in xml.findall('./enums[@type="enum"]'):
-        enum = enum_factory(enum_type.attrib['name'])
+        name = enum_type.attrib['name']
+        if name in SKIP_ENUM_TYPES:
+            continue
+        enum = enum_factory(name)
         for value in enum_type.findall('./enum'):
             enum.add_value_from_xml(value)
 
@@ -359,13 +388,19 @@ def parse_xml(cmd_factory, enum_factory, ext_factory, struct_factory, filename):
 
     for command in xml.findall('./commands/command'):
         name = command.find('./proto/name')
-        if name is not None and "ANDROID" in name.text:
+        if name is None:
             continue
+        if "ANDROID" in name.text:
+            continue
+        if name.text in SKIP_COMMANDS:
+            continue
+
         first_arg = command.find('./param/type')
         # Some commands are alias KHR -> nonKHR, ignore those
-        if name is not None:
-            cmd_factory(name.text,
-                        device_entrypoint=(first_arg.text in ('VkDevice', 'VkCommandBuffer', 'VkQueue')))
+        cmd_factory(
+            name.text,
+            device_entrypoint=(first_arg is not None and first_arg.text in ('VkDevice', 'VkCommandBuffer', 'VkQueue')),
+        )
 
     for struct_type in xml.findall('./types/type[@category="struct"]'):
         name = struct_type.attrib['name']
