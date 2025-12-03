@@ -49,6 +49,7 @@ double min_frametime, max_frametime;
 bool gpu_metrics_exists = false;
 bool steam_focused = false;
 vector<float> frametime_data(200,0.f);
+static size_t frametime_index = 0;
 int fan_speed;
 fcatoverlay fcatstatus;
 std::string drm_dev;
@@ -241,13 +242,12 @@ void update_hud_info_with_frametime(struct swapchain_stats& sw_stats, const stru
    if (sw_stats.last_present_time) {
         sw_stats.frames_stats[f_idx].stats[OVERLAY_PLOTS_frame_timing] =
             frametime_ns;
-      frametime_data.push_back(frametime_ms);
-      frametime_data.erase(frametime_data.begin());
+
+      frametime_data[frametime_index] = frametime_ms;
+      frametime_index++;
+      if (frametime_index >= frametime_data.size())
+         frametime_index = 0;
    }
-#ifdef __linux__
-   if (gpus)
-      gpus->update_throttling();
-#endif
 #ifdef HAVE_FEX
    fex::update_fex_stats();
 #endif
@@ -269,7 +269,10 @@ void update_hud_info_with_frametime(struct swapchain_stats& sw_stats, const stru
 
       if (fpsmetrics) fpsmetrics->update_thread();
 #ifdef __linux__
-      if (HUDElements.net) HUDElements.net->update();
+      if (gpus)
+         gpus->update_throttling();
+      if (HUDElements.net)
+         HUDElements.net->update();
 #endif
 
       sw_stats.fps = 1000000000.0 * sw_stats.n_frames_since_update / elapsed;
@@ -664,9 +667,12 @@ void horizontal_separator(struct overlay_params& params) {
 
 void render_imgui(swapchain_stats& data, struct overlay_params& params, ImVec2& window_size, bool is_vulkan)
 {
-   {
+   // config_ready barrier는 한 번만 기다리면 충분
+   static bool config_wait_done = false;
+   if (!config_wait_done) {
       std::unique_lock<std::mutex> lock(config_mtx);
       config_cv.wait(lock, []{ return config_ready; });
+      config_wait_done = true;
    }
    // data.engine = EngineTypes::GAMESCOPE;
    HUDElements.sw_stats = &data;
