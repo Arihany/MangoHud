@@ -1852,7 +1852,8 @@ static VkResult overlay_QueueSubmit(
 static VkResult overlay_QueueSubmit2(
     VkQueue                 queue,
     uint32_t                submitCount,
-    const VkSubmitInfo2*    pSubmits)
+    const VkSubmitInfo2*    pSubmits,
+    VkFence                 fence)
 {
    struct queue_data *queue_data = FIND(struct queue_data, queue);
    struct device_data *device_data = queue_data->device;
@@ -1867,15 +1868,16 @@ static VkResult overlay_QueueSubmit2(
           queue,
           queue_data->family_index,
           submitCount,
-          pSubmits);
+          pSubmits,
+          fence);
    }
 #endif
 
    // 기본 패스스루: 코어 1.3 → QueueSubmit2, 아니면 KHR
    if (device_data->vtable.QueueSubmit2)
-      return device_data->vtable.QueueSubmit2(queue, submitCount, pSubmits);
+      return device_data->vtable.QueueSubmit2(queue, submitCount, pSubmits, fence);
    if (device_data->vtable.QueueSubmit2KHR)
-      return device_data->vtable.QueueSubmit2KHR(queue, submitCount, pSubmits);
+      return device_data->vtable.QueueSubmit2KHR(queue, submitCount, pSubmits, fence);
 
    // 여기에 들어오면 애초에 앱이 QueueSubmit2를 부르면 안 되는 상황이긴 하다
    return VK_ERROR_EXTENSION_NOT_PRESENT;
