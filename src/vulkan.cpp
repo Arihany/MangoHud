@@ -485,24 +485,21 @@ static void snapshot_swapchain_frame(struct swapchain_data *data)
 
       if (android_gpu_usage_get_metrics(device_data->android_gpu_ctx,
                                         &gpu_ms, &gpu_usage)) {
-        // [최적화] 캐싱된 GPU 포인터 사용
-         static gpu_info* cached_gpu = nullptr;
-         if (!cached_gpu) {
-             auto selected = gpus->selected_gpus();
-             if (!selected.empty()) cached_gpu = selected[0];
-         }
 
-         if (cached_gpu) {
+         // 타입 이름 안 씀. selected_gpus() 결과에서 auto로 추론.
+         auto selected = gpus->selected_gpus();
+         if (!selected.empty() && selected[0]) {
+            auto *gpu = selected[0];
+
             int load = static_cast<int>(gpu_usage + 0.5f);
             if (load < 0)   load = 0;
             if (load > 100) load = 100;
-            cached_gpu->metrics.load = load;
+
+            gpu->metrics.load = load;
          }
       }
    }
 #endif
-
-
 
 #ifdef __linux__
    if (instance_data->params.control >= 0) {
