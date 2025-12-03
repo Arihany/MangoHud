@@ -1873,6 +1873,7 @@ static VkResult overlay_QueueSubmit2(
    }
 #endif
 
+   // 기본 패스스루: 드라이버에서 직접 엔트리포인트 조회
    PFN_vkQueueSubmit2 pfn2 =
        (PFN_vkQueueSubmit2) device_data->vtable.GetDeviceProcAddr(
            device_data->device, "vkQueueSubmit2");
@@ -1883,10 +1884,10 @@ static VkResult overlay_QueueSubmit2(
 
    if (pfn2)
       return pfn2(queue, submitCount, pSubmits, fence);
-
    if (pfn2khr)
       return pfn2khr(queue, submitCount, pSubmits, fence);
 
+   // 드라이버가 sync2를 전혀 안 노출하는데 앱이 호출했다 → 사양상 에러
    return VK_ERROR_EXTENSION_NOT_PRESENT;
 }
 
@@ -1958,9 +1959,10 @@ static VkResult overlay_CreateDevice(
 {
     AndroidVkGpuDispatch disp{};
 
+    // 1.x path는 기존 vtable 그대로
     disp.QueueSubmit = device_data->vtable.QueueSubmit;
 
-    // sync2 계열은 항상 GetDeviceProcAddr로 직접 로드
+    // sync2 계열은 항상 GetDeviceProcAddr로 동적 로드
     disp.QueueSubmit2 =
         (PFN_vkQueueSubmit2) device_data->vtable.GetDeviceProcAddr(
             device_data->device, "vkQueueSubmit2");
