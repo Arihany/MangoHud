@@ -60,7 +60,6 @@ C_TEMPLATE = Template(textwrap.dedent(u"""\
 
     #include <string.h>
     #include <vulkan/vulkan.h>
-    #include <vulkan/vk_android_native_buffer.h>
     #include <vulkan/vk_layer.h>
     #include "../src/mesa/util/macros.h"
     #include "vk_enum_to_str.h"
@@ -156,7 +155,6 @@ H_TEMPLATE = Template(textwrap.dedent(u"""\
     #define MESA_VK_ENUM_TO_STR_H
 
     #include <vulkan/vulkan.h>
-    #include <vulkan/vk_android_native_buffer.h>
 
     #ifdef __cplusplus
     extern "C" {
@@ -205,7 +203,6 @@ H_DEFINE_TEMPLATE = Template(textwrap.dedent(u"""\
     #define MESA_VK_ENUM_DEFINES_H
 
     #include <vulkan/vulkan_core.h>
-    #include <vulkan/vk_android_native_buffer.h>
 
     #ifdef __cplusplus
     extern "C" {
