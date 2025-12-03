@@ -182,24 +182,16 @@ endif
 #endif
 
 
+
 vk_enum_to_str = custom_target(
   'vk_enum_to_str',
   input : ['bin/gen_enum_to_str.py', vk_api_xml],
-  output : [
-    'vk_enum_to_str.c',
-    'vk_enum_to_str.h',
-    'vk_enum_defines.h',
-  ],
+  output : ['vk_enum_to_str.c', 'vk_enum_to_str.h'],
   command : [
-    prog_python, '@INPUT0@',
-    '--beta=false',
-    '--xml', '@INPUT1@',
-    '--out-c', join_paths(meson.current_build_dir(), 'vk_enum_to_str.c'),
-    '--out-h', join_paths(meson.current_build_dir(), 'vk_enum_to_str.h'),
-    '--out-d', join_paths(meson.current_build_dir(), 'vk_enum_defines.h'),
+    prog_python, '@INPUT0@', '--xml', '@INPUT1@',
+    '--outdir', meson.current_build_dir()
   ],
 )
-
 
 imgui_options = [
   'default_library=static',
