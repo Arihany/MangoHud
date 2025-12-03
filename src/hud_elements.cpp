@@ -388,19 +388,44 @@ void HudElements::gpu_stats(){
 
             if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_efficiency]) {
                 ImguiNextColumnOrNewRow();
-                float efficiency;
-                const char* efficiency_unit;
-                if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_flip_efficiency]) {
-                    efficiency=gpu->metrics.powerUsage/HUDElements.sw_stats->fps;
-                    efficiency_unit="J/F";
+            
+                const float fps_val = HUDElements.sw_stats->fps;
+                const float power   = gpu->metrics.powerUsage;
+                const bool  flip    = HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_flip_efficiency];
+            
+                float efficiency    = 0.0f;
+                const char* efficiency_unit = flip ? "J/F" : "F/J";
+                bool have_efficiency = true;
+            
+                if (flip) {
+                    // J/F = W / FPS
+                    if (fps_val > 0.0f && std::isfinite(fps_val)) {
+                        efficiency = power / fps_val;
+                    } else {
+                        have_efficiency = false;
+                    }
                 } else {
-                    efficiency=HUDElements.sw_stats->fps/gpu->metrics.powerUsage;
-                    efficiency_unit="F/J";
+                    // F/J = FPS / W
+                    if (power > 0.0f && std::isfinite(power)) {
+                        efficiency = fps_val / power;
+                    } else {
+                        have_efficiency = false;
+                    }
                 }
-                right_aligned_text(text_color, HUDElements.ralign_width, "%.2f", efficiency);
+            
+                if (have_efficiency && std::isfinite(efficiency)) {
+                    right_aligned_text(text_color,
+                                       HUDElements.ralign_width,
+                                       "%.2f", efficiency);
+                } else {
+                    right_aligned_text(text_color,
+                                       HUDElements.ralign_width,
+                                       "%s", "--");
+                }
+            
                 ImGui::SameLine(0, 1.0f);
                 ImGui::PushFont(HUDElements.sw_stats->font_small);
-                HUDElements.TextColored(HUDElements.colors.text, efficiency_unit);
+                HUDElements.TextColored(HUDElements.colors.text, "%s", efficiency_unit);
                 ImGui::PopFont();
             }
 
@@ -493,19 +518,44 @@ void HudElements::cpu_stats(){
 
         if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_efficiency]) {
             ImguiNextColumnOrNewRow();
-            float efficiency;
-            const char* efficiency_unit;
-            if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_flip_efficiency]) {
-                efficiency=cpuStats.GetCPUDataTotal().power/HUDElements.sw_stats->fps;
-                efficiency_unit="J/F";
+        
+            const float fps_val = HUDElements.sw_stats->fps;
+            const float power   = cpuStats.GetCPUDataTotal().power;
+            const bool  flip    = HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_flip_efficiency];
+        
+            float efficiency    = 0.0f;
+            const char* efficiency_unit = flip ? "J/F" : "F/J";
+            bool have_efficiency = true;
+        
+            if (flip) {
+                // J/F = W / FPS
+                if (fps_val > 0.0f && std::isfinite(fps_val)) {
+                    efficiency = power / fps_val;
+                } else {
+                    have_efficiency = false;
+                }
             } else {
-                efficiency=HUDElements.sw_stats->fps/cpuStats.GetCPUDataTotal().power;
-                efficiency_unit="F/J";
+                // F/J = FPS / W
+                if (power > 0.0f && std::isfinite(power)) {
+                    efficiency = fps_val / power;
+                } else {
+                    have_efficiency = false;
+                }
             }
-            right_aligned_text(text_color, HUDElements.ralign_width, "%.2f", efficiency);
+        
+            if (have_efficiency && std::isfinite(efficiency)) {
+                right_aligned_text(text_color,
+                                   HUDElements.ralign_width,
+                                   "%.2f", efficiency);
+            } else {
+                right_aligned_text(text_color,
+                                   HUDElements.ralign_width,
+                                   "%s", "--");
+            }
+        
             ImGui::SameLine(0, 1.0f);
             ImGui::PushFont(HUDElements.sw_stats->font_small);
-            HUDElements.TextColored(HUDElements.colors.text, efficiency_unit);
+            HUDElements.TextColored(HUDElements.colors.text, "%s", efficiency_unit);
             ImGui::PopFont();
         }
     }
@@ -700,7 +750,8 @@ void HudElements::proc_vram() {
         return;
 
     auto gpu = gpus->active_gpu();
-    if (!gpu)
+    if (!gpu) {
+        ImGui::PopFont();
         return;
 
     ImguiNextColumnFirstItem();
@@ -811,43 +862,61 @@ void HudElements::procmem()
 }
 
 void HudElements::fps(){
-    if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_fps] && !HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_fps_only]){
+    if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_fps] &&
+        !HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_fps_only]) {
+
         ImguiNextColumnFirstItem();
         HUDElements.TextColored(HUDElements.colors.engine, "%s", engine_name(*HUDElements.sw_stats));
 
         ImguiNextColumnOrNewRow();
-        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_fps_color_change]){
-            int fps = int(HUDElements.sw_stats->fps);
+        const float fps_val = HUDElements.sw_stats->fps;
+
+        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_fps_color_change]) {
+            const int fps_i = int(fps_val);
             struct LOAD_DATA fps_data = {
-            HUDElements.colors.fps_value_low,
-            HUDElements.colors.fps_value_med,
-            HUDElements.colors.fps_value_high,
-            HUDElements.params->fps_value[0],
-            HUDElements.params->fps_value[1]
+                HUDElements.colors.fps_value_low,
+                HUDElements.colors.fps_value_med,
+                HUDElements.colors.fps_value_high,
+                HUDElements.params->fps_value[0],
+                HUDElements.params->fps_value[1]
             };
-            auto load_color = change_on_load_temp(fps_data, fps);
-            right_aligned_text(load_color, HUDElements.ralign_width, "%.0f", HUDElements.sw_stats->fps);
+            auto load_color = change_on_load_temp(fps_data, fps_i);
+            right_aligned_text(load_color, HUDElements.ralign_width, "%.0f", fps_val);
+        } else {
+            right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%.0f", fps_val);
         }
-        else {
-            right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%.0f", HUDElements.sw_stats->fps);
-        }
+
         ImGui::SameLine(0, 1.0f);
-        if(!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_hide_fps_superscript]){
+        if (!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_hide_fps_superscript]) {
             ImGui::PushFont(HUDElements.sw_stats->font_small);
             HUDElements.TextColored(HUDElements.colors.text, "FPS");
             ImGui::PopFont();
         }
-        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_frametime]){
+
+        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_frametime]) {
             ImguiNextColumnOrNewRow();
-            right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%.1f", 1000 / HUDElements.sw_stats->fps);
+
+            if (fps_val > 0.0f && std::isfinite(fps_val)) {
+                const float frametime_ms = 1000.0f / fps_val;
+                right_aligned_text(HUDElements.colors.text,
+                                   HUDElements.ralign_width,
+                                   "%.1f", frametime_ms);
+            } else {
+                // fps 안 잡히는 구간은 그냥 "--" 처리
+                right_aligned_text(HUDElements.colors.text,
+                                   HUDElements.ralign_width,
+                                   "%s", "--");
+            }
+
             ImGui::SameLine(0, 1.0f);
             ImGui::PushFont(HUDElements.sw_stats->font_small);
             HUDElements.TextColored(HUDElements.colors.text, "ms");
             ImGui::PopFont();
         }
-    } else if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_engine_version]){
+    } else if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_engine_version]) {
         ImguiNextColumnOrNewRow();
-        HUDElements.TextColored(HUDElements.colors.engine, "%s", HUDElements.sw_stats->engineName.c_str());
+        HUDElements.TextColored(HUDElements.colors.engine, "%s",
+                                HUDElements.sw_stats->engineName.c_str());
     }
 }
 
