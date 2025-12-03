@@ -1873,13 +1873,20 @@ static VkResult overlay_QueueSubmit2(
    }
 #endif
 
-   // 기본 패스스루: 코어 1.3 → QueueSubmit2, 아니면 KHR
-   if (device_data->vtable.QueueSubmit2)
-      return device_data->vtable.QueueSubmit2(queue, submitCount, pSubmits, fence);
-   if (device_data->vtable.QueueSubmit2KHR)
-      return device_data->vtable.QueueSubmit2KHR(queue, submitCount, pSubmits, fence);
+   PFN_vkQueueSubmit2 pfn2 =
+       (PFN_vkQueueSubmit2) device_data->vtable.GetDeviceProcAddr(
+           device_data->device, "vkQueueSubmit2");
 
-   // 여기에 들어오면 애초에 앱이 QueueSubmit2를 부르면 안 되는 상황이긴 하다
+   PFN_vkQueueSubmit2KHR pfn2khr =
+       (PFN_vkQueueSubmit2KHR) device_data->vtable.GetDeviceProcAddr(
+           device_data->device, "vkQueueSubmit2KHR");
+
+   if (pfn2)
+      return pfn2(queue, submitCount, pSubmits, fence);
+
+   if (pfn2khr)
+      return pfn2khr(queue, submitCount, pSubmits, fence);
+
    return VK_ERROR_EXTENSION_NOT_PRESENT;
 }
 
@@ -1950,9 +1957,17 @@ static VkResult overlay_CreateDevice(
 #if defined(__ANDROID__)
 {
     AndroidVkGpuDispatch disp{};
-    disp.QueueSubmit            = device_data->vtable.QueueSubmit;
-    disp.QueueSubmit2           = device_data->vtable.QueueSubmit2;
-    disp.QueueSubmit2KHR        = device_data->vtable.QueueSubmit2KHR;
+
+    disp.QueueSubmit = device_data->vtable.QueueSubmit;
+
+    // sync2 계열은 항상 GetDeviceProcAddr로 직접 로드
+    disp.QueueSubmit2 =
+        (PFN_vkQueueSubmit2) device_data->vtable.GetDeviceProcAddr(
+            device_data->device, "vkQueueSubmit2");
+
+    disp.QueueSubmit2KHR =
+        (PFN_vkQueueSubmit2KHR) device_data->vtable.GetDeviceProcAddr(
+            device_data->device, "vkQueueSubmit2KHR");
 
     disp.CreateQueryPool        = device_data->vtable.CreateQueryPool;
     disp.DestroyQueryPool       = device_data->vtable.DestroyQueryPool;
@@ -1991,7 +2006,6 @@ static VkResult overlay_CreateDevice(
             }
         }
 
-        // 2차: 그래픽 큐에 validBits 없으면, 아무 큐나 하나
         if (!ts_valid_bits) {
             for (uint32_t i = 0; i < qf_count; ++i) {
                 if (qf[i].timestampValidBits) {
