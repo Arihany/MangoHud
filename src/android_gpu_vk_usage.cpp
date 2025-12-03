@@ -827,6 +827,12 @@ android_gpu_usage_queue_submit2(AndroidVkGpuContext* ctx,
     try {
         std::lock_guard<std::mutex> g(ctx->lock);
 
+        if (ctx->query_pool != VK_NULL_HANDLE &&
+            ctx->queue_family_index != VK_QUEUE_FAMILY_IGNORED &&
+            ctx->queue_family_index != queue_family_index) {
+            return fpSubmit2(queue, submitCount, pSubmits, fence);
+        }
+        
         // 리소스 lazy init
         if (!android_gpu_usage_init_timestamp_resources(ctx, queue_family_index)) {
             return fpSubmit2(queue, submitCount, pSubmits, fence);
