@@ -1,6 +1,10 @@
 #pragma once
 #include <string>
 
+#ifndef MAX_BATTERY_COUNT
+#define MAX_BATTERY_COUNT 4
+#endif
+
 class BatteryStats{
     public:
         void numBattery();
