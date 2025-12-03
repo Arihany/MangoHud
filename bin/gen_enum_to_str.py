@@ -378,25 +378,13 @@ def parse_xml(cmd_factory, enum_factory, ext_factory, struct_factory, filename):
     platform_define = {}
     for platform in xml.findall('./platforms/platform'):
         name = platform.attrib['name']
-        define = platform.attrib.get('protect')
-        if define is not None:
-            platform_define[name] = define
+        define = platform.attrib['protect']
+        platform_define[name] = define
 
     for ext_elem in xml.findall('./extensions/extension[@supported="vulkan"]'):
-        # 확장 보호 매크로 처리:
-        #  - platform="win32"  → VK_USE_PLATFORM_WIN32_KHR
-        #  - protect="VK_ENABLE_BETA_EXTENSIONS" 같은 것도 지원
         define = None
-
-        platform = ext_elem.attrib.get('platform')
-        if platform is not None:
-            define = platform_define.get(platform)
-
-        protect = ext_elem.attrib.get('protect')
-        if protect is not None:
-            # 베타/프리뷰 확장 쪽은 대부분 여기서 들어온다
-            define = protect
-
+        if "platform" in ext_elem.attrib:
+            define = platform_define[ext_elem.attrib['platform']]
         extension = ext_factory(ext_elem.attrib['name'],
                                 number=int(ext_elem.attrib['number']),
                                 define=define)
