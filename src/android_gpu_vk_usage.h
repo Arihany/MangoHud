@@ -54,7 +54,8 @@ VkResult android_gpu_usage_queue_submit2(
     VkQueue                       queue,
     uint32_t                      queue_family_index,
     uint32_t                      submitCount,
-    const VkSubmitInfo2*          pSubmits);
+    const VkSubmitInfo2*          pSubmits,
+    VkFence                       fence);
 
 // vkQueuePresentKHR에서 호출
 void android_gpu_usage_on_present(
