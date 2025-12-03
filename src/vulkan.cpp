@@ -111,8 +111,10 @@ struct device_data {
 #if defined(__ANDROID__)
    AndroidVkGpuContext* android_gpu_ctx = nullptr;
 #endif
-};
 
+   PFN_vkQueueSubmit2    real_QueueSubmit2    = nullptr;
+   PFN_vkQueueSubmit2KHR real_QueueSubmit2KHR = nullptr;
+};
 /* Mapped from VkCommandBuffer */
 struct command_buffer_data {
    struct device_data *device;
@@ -483,17 +485,19 @@ static void snapshot_swapchain_frame(struct swapchain_data *data)
 
       if (android_gpu_usage_get_metrics(device_data->android_gpu_ctx,
                                         &gpu_ms, &gpu_usage)) {
-         auto selected = gpus->selected_gpus();
-         if (!selected.empty()) {
-            auto& gpu = selected[0];
+        // [최적화] 캐싱된 GPU 포인터 사용
+         static gpu_info* cached_gpu = nullptr;
+         if (!cached_gpu) {
+             auto selected = gpus->selected_gpus();
+             if (!selected.empty()) cached_gpu = selected[0];
+         }
 
+         if (cached_gpu) {
             int load = static_cast<int>(gpu_usage + 0.5f);
             if (load < 0)   load = 0;
             if (load > 100) load = 100;
-
-            gpu->metrics.load = load;
+            cached_gpu->metrics.load = load;
          }
-         // selected 비었거나, get_metrics 실패한 경우: 조용히 무시
       }
    }
 #endif
@@ -1873,14 +1877,9 @@ static VkResult overlay_QueueSubmit2(
    }
 #endif
 
-   // 기본 패스스루: 드라이버에서 직접 엔트리포인트 조회
-   PFN_vkQueueSubmit2 pfn2 =
-       (PFN_vkQueueSubmit2) device_data->vtable.GetDeviceProcAddr(
-           device_data->device, "vkQueueSubmit2");
-
-   PFN_vkQueueSubmit2KHR pfn2khr =
-       (PFN_vkQueueSubmit2KHR) device_data->vtable.GetDeviceProcAddr(
-           device_data->device, "vkQueueSubmit2KHR");
+   // 기본 패스스루: CreateDevice시 한 번만 resolve한 포인터 사용
+   PFN_vkQueueSubmit2    pfn2    = device_data->real_QueueSubmit2;
+   PFN_vkQueueSubmit2KHR pfn2khr = device_data->real_QueueSubmit2KHR;
 
    if (pfn2)
       return pfn2(queue, submitCount, pSubmits, fence);
@@ -1955,21 +1954,21 @@ static VkResult overlay_CreateDevice(
    instance_data->vtable.GetPhysicalDeviceProperties(device_data->physical_device,
                                                      &device_data->properties);
 
+   device_data->real_QueueSubmit2 =
+      (PFN_vkQueueSubmit2) fpGetDeviceProcAddr(*pDevice, "vkQueueSubmit2");
+   device_data->real_QueueSubmit2KHR =
+      (PFN_vkQueueSubmit2KHR) fpGetDeviceProcAddr(*pDevice, "vkQueueSubmit2KHR");
+
 #if defined(__ANDROID__)
 {
     AndroidVkGpuDispatch disp{};
 
     // 1.x path는 기존 vtable 그대로
-    disp.QueueSubmit = device_data->vtable.QueueSubmit;
+    disp.QueueSubmit            = device_data->vtable.QueueSubmit;
 
     // sync2 계열은 항상 GetDeviceProcAddr로 동적 로드
-    disp.QueueSubmit2 =
-        (PFN_vkQueueSubmit2) device_data->vtable.GetDeviceProcAddr(
-            device_data->device, "vkQueueSubmit2");
-
-    disp.QueueSubmit2KHR =
-        (PFN_vkQueueSubmit2KHR) device_data->vtable.GetDeviceProcAddr(
-            device_data->device, "vkQueueSubmit2KHR");
+    disp.QueueSubmit2           = device_data->real_QueueSubmit2;
+    disp.QueueSubmit2KHR        = device_data->real_QueueSubmit2KHR;
 
     disp.CreateQueryPool        = device_data->vtable.CreateQueryPool;
     disp.DestroyQueryPool       = device_data->vtable.DestroyQueryPool;
@@ -2303,12 +2302,17 @@ static const struct {
 
 static void *find_ptr(const char *name)
 {
-    std::string f(name);
-
-    if (is_blacklisted() && (f != "vkCreateInstance" && f != "vkDestroyInstance" && f != "vkCreateDevice" && f != "vkDestroyDevice"))
-    {
-        return NULL;
-    }
+   // 블랙리스트라면 필요한 최소 VK 엔트리만 노출
+   if (is_blacklisted()) {
+      if (strcmp(name, "vkCreateInstance")      != 0 &&
+          strcmp(name, "vkDestroyInstance")     != 0 &&
+          strcmp(name, "vkCreateDevice")        != 0 &&
+          strcmp(name, "vkDestroyDevice")       != 0 &&
+          strcmp(name, "vkGetInstanceProcAddr") != 0 &&
+          strcmp(name, "vkGetDeviceProcAddr")   != 0) {
+         return NULL;
+      }
+   }
 
    for (uint32_t i = 0; i < ARRAY_SIZE(name_to_funcptr_map); i++) {
       if (strcmp(name, name_to_funcptr_map[i].name) == 0)
