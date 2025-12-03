@@ -6,26 +6,24 @@
 #include "timing.hpp"
 
 struct iostats {
-    struct {
-      unsigned long long read_bytes;
-      unsigned long long write_bytes;
-    } curr;
-    struct {
-      unsigned long long read_bytes;
-      unsigned long long write_bytes;
-    } prev;
-    struct {
-      float read;
-      float write;
-    } diff;
-    struct {
-      float read;
-      float write;
-    } per_second;
-    Clock::time_point last_update;
+    struct bytes {
+        unsigned long long read_bytes;
+        unsigned long long write_bytes;
+    };
+
+    struct rate {
+        float read;
+        float write;
+    };
+
+    bytes curr{};
+    bytes prev{};
+    rate  diff{};
+    rate  per_second{};
+    Clock::time_point last_update{};
 };
 
 extern iostats g_io_stats;
 void getIoStats(iostats& io);
 
-#endif //MANGOHUD_IOSTATS_H
+#endif // MANGOHUD_IOSTATS_H
