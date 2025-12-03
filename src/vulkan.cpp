@@ -38,6 +38,7 @@
 #include <inttypes.h>
 #include <spdlog/spdlog.h>
 #include <imgui.h>
+#include <type_traits>
 
 #include "mesa/util/macros.h" // defines "restrict" for vk_util.h
 #include "mesa/util/os_socket.h"
@@ -63,7 +64,7 @@
 
 #if defined(__ANDROID__)
 #include "android_gpu_vk_usage.h"
-#include "gpu.h" 
+#include "gpu.h"
 #endif
 
 using namespace std;
@@ -473,29 +474,42 @@ static struct overlay_draw *get_overlay_draw(struct swapchain_data *data, unsign
 
 static void snapshot_swapchain_frame(struct swapchain_data *data)
 {
-   struct device_data *device_data = data->device;
+   struct device_data *device_data   = data->device;
    struct instance_data *instance_data = device_data->instance;
-   update_hud_info(data->sw_stats, instance_data->params, device_data->properties.vendorID);
+
+   update_hud_info(data->sw_stats, instance_data->params,
+                   device_data->properties.vendorID);
    check_keybinds(instance_data->params);
 
 #if defined(__ANDROID__)
    if (device_data->android_gpu_ctx && gpus) {
-      float gpu_ms = 0.f;
+      float gpu_ms    = 0.f;
       float gpu_usage = 0.f;
 
       if (android_gpu_usage_get_metrics(device_data->android_gpu_ctx,
                                         &gpu_ms, &gpu_usage)) {
 
-         // 타입 이름 안 씀. selected_gpus() 결과에서 auto로 추론.
-         auto selected = gpus->selected_gpus();
-         if (!selected.empty() && selected[0]) {
-            auto *gpu = selected[0];
+         // selected_gpus()[0]의 "참조" 타입에서 참조/const 떼고 순수 값 타입만 얻기
+         using SelectedGpuRef = decltype(gpus->selected_gpus()[0]);
+         using GpuPtr         = std::decay_t<SelectedGpuRef>;
 
+         // gpu_info* 이든 std::shared_ptr<GPU>든 둘 다 여기 수렴
+         static GpuPtr cached_gpu = nullptr;
+
+         // 아직 캐시 안 되어 있으면 한 번만 selected_gpus() 호출
+         if (!cached_gpu) {
+            auto selected = gpus->selected_gpus();
+            if (!selected.empty())
+               cached_gpu = selected[0];
+         }
+
+         if (cached_gpu) {
             int load = static_cast<int>(gpu_usage + 0.5f);
             if (load < 0)   load = 0;
             if (load > 100) load = 100;
 
-            gpu->metrics.load = load;
+            // gpu_info* / shared_ptr<GPU> 둘 다 '->'로 접근 가능
+            cached_gpu->metrics.load = load;
          }
       }
    }
