@@ -2,19 +2,10 @@
 
 #include <vulkan/vulkan.h>
 
-// ======================================================================
-// Vulkan-Headers 1.2.x 호환용 보정
-// - 1.2.158에는 VkSubmitInfo2 / PFN_vkQueueSubmit2 계열이 없다.
-// - 우리는 구조체 내용을 안 건드리고 "포인터"와 "함수 포인터"만 쓰면 되니까
-//   최소 선언만 해두고, 나중에 1.3+ 헤더를 써도 #ifndef 덕분에 충돌 안 난다.
-// ======================================================================
-
-// VkSubmitInfo2 본체는 안 건드리고, 포인터 타입만 필요
-#if !defined(VK_VERSION_1_3) && !defined(VK_KHR_synchronization2)
-typedef struct VkSubmitInfo2 VkSubmitInfo2;
-#endif
-
+// ---- sync2 stubs for old Vulkan-Headers (no VkSubmitInfo2 / PFN_vkQueueSubmit2) ----
 #ifndef PFN_vkQueueSubmit2
+typedef struct VkSubmitInfo2 VkSubmitInfo2;
+
 typedef VkResult (VKAPI_PTR *PFN_vkQueueSubmit2)(
     VkQueue               queue,
     uint32_t              submitCount,
@@ -26,9 +17,6 @@ typedef VkResult (VKAPI_PTR *PFN_vkQueueSubmit2)(
 typedef PFN_vkQueueSubmit2 PFN_vkQueueSubmit2KHR;
 #endif
 
-// ======================================================================
-// Vulkan 디스패치 테이블 모음
-// ======================================================================
 struct AndroidVkGpuDispatch {
     // 큐/쿼리 관련
     PFN_vkQueueSubmit             QueueSubmit;
