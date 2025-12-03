@@ -102,8 +102,13 @@ void init_spdlog()
 void update_hw_info(const struct overlay_params& params, uint32_t vendorID)
 {
    auto real_params = get_params();
+
+#if defined(__linux__) && !defined(__ANDROID__)
+   // Steam Deck / 일반 리눅스 전용 팬 속도 갱신
    if (real_params->enabled[OVERLAY_PARAM_ENABLED_fan])
       update_fan();
+#endif
+
    if (real_params->enabled[OVERLAY_PARAM_ENABLED_cpu_stats] || logger->is_active()) {
       cpuStats.UpdateCPUData();
 
@@ -864,25 +869,39 @@ void check_for_vkbasalt_and_gamemode() {
 
 void update_fan(){
    // This just handles steam deck fan for now
-   static bool init;
-   string hwmon_path;
+   static bool   init = false;
+   static string hwmon_path;
 
-   if (!init){
-      string path = "/sys/class/hwmon/";
-      auto dirs = ls(path.c_str(), "hwmon", LS_DIRS);
+   if (!init) {
+      init = true;
+
+      const std::string base = "/sys/class/hwmon/";
+      auto dirs = ls(base.c_str(), "hwmon", LS_DIRS);
       for (auto& dir : dirs) {
-         string full_path = (path + dir + "/name").c_str();
-         if (read_line(full_path).find("steamdeck_hwmon") != string::npos){
-            hwmon_path = path + dir + "/fan1_input";
+         const std::string name_path = base + dir + "/name";
+         const std::string name      = read_line(name_path);
+         if (name.find("steamdeck_hwmon") != std::string::npos){
+            hwmon_path = base + dir + "/fan1_input";
+            SPDLOG_DEBUG("Steam Deck fan hwmon path: {}", hwmon_path);
             break;
          }
       }
+
+      if (hwmon_path.empty()) {
+         SPDLOG_DEBUG("Steam Deck fan hwmon path not found, disabling fan read");
+      }
    }
 
-   if (!hwmon_path.empty())
-      fan_speed = stoi(read_line(hwmon_path));
-   else
+   if (!hwmon_path.empty()) {
+      const std::string v = read_line(hwmon_path);
+      try {
+         fan_speed = std::stoi(v);
+      } catch (...) {
+         fan_speed = -1;
+      }
+   } else {
       fan_speed = -1;
+   }
 }
 
 void next_hud_position(){
