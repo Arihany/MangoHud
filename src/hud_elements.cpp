@@ -740,18 +740,15 @@ void HudElements::vram(){
 }
 
 void HudElements::proc_vram() {
-    if (
-        !HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_proc_vram] ||
-        !HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_stats]
-    )
+    if (!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_proc_vram] ||
+        !HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_stats])
         return;
 
     if (!gpus)
         return;
 
     auto gpu = gpus->active_gpu();
-    if (!gpu) {
-        ImGui::PopFont();
+    if (!gpu)
         return;
 
     ImguiNextColumnFirstItem();
@@ -759,7 +756,10 @@ void HudElements::proc_vram() {
     ImguiNextColumnOrNewRow();
 
     right_aligned_text(
-        HUDElements.colors.text, HUDElements.ralign_width, "%.1f", gpu->metrics.proc_vram_used
+        HUDElements.colors.text,
+        HUDElements.ralign_width,
+        "%.1f",
+        gpu->metrics.proc_vram_used
     );
 
     if (!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_hud_compact]) {
@@ -770,28 +770,29 @@ void HudElements::proc_vram() {
     }
 
     // show only if vram is not enabled
-    if (
-        !HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_vram] &&
-        HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_mem_temp]
-    ) {
+    if (!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_vram] &&
+        HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_mem_temp] &&
+        gpu->metrics.memory_temp > -1) {
+
         ImguiNextColumnOrNewRow();
 
-        int temp;
-        std::string unit;
+        int temp = gpu->metrics.memory_temp;
+        const char* unit = "°C";
 
         if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_temp_fahrenheit]) {
-            temp = HUDElements.convert_to_fahrenheit(gpu->metrics.memory_temp);
+            temp = HUDElements.convert_to_fahrenheit(temp);
             unit = "°F";
-        } else {
-            temp = gpu->metrics.memory_temp;
-            unit = "°C";
         }
 
-        right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%i", temp);
+        right_aligned_text(
+            HUDElements.colors.text,
+            HUDElements.ralign_width,
+            "%i",
+            temp
+        );
 
         ImGui::SameLine(0, 1.0f);
-
-        HUDElements.TextColored(HUDElements.colors.text, unit.c_str());
+        HUDElements.TextColored(HUDElements.colors.text, "%s", unit);
     }
 
     if (!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_horizontal])
