@@ -1,21 +1,57 @@
 #pragma once
-
 #include <vulkan/vulkan.h>
 
-// ---- sync2 stubs for old Vulkan-Headers (no VkSubmitInfo2 / PFN_vkQueueSubmit2) ----
 #ifndef PFN_vkQueueSubmit2
-typedef struct VkSubmitInfo2 VkSubmitInfo2;
 
+// VkFlags 기반
+typedef VkFlags VkSubmitFlags;
+
+// forward decl
+typedef struct VkSemaphoreSubmitInfo VkSemaphoreSubmitInfo;
+
+// 스펙 그대로 레이아웃 맞춤
+typedef struct VkCommandBufferSubmitInfo {
+    VkStructureType sType;
+    const void*     pNext;
+    VkCommandBuffer commandBuffer;
+    uint32_t        deviceMask;
+} VkCommandBufferSubmitInfo;
+
+typedef struct VkSubmitInfo2 {
+    VkStructureType                   sType;
+    const void*                       pNext;
+    VkSubmitFlags                     flags;
+    uint32_t                          waitSemaphoreInfoCount;
+    const VkSemaphoreSubmitInfo*      pWaitSemaphoreInfos;
+    uint32_t                          commandBufferInfoCount;
+    const VkCommandBufferSubmitInfo*  pCommandBufferInfos;
+    uint32_t                          signalSemaphoreInfoCount;
+    const VkSemaphoreSubmitInfo*      pSignalSemaphoreInfos;
+} VkSubmitInfo2;
+
+// 함수 포인터 프로토타입 (vkQueueSubmit2 / vkQueueSubmit2KHR)
 typedef VkResult (VKAPI_PTR *PFN_vkQueueSubmit2)(
-    VkQueue               queue,
-    uint32_t              submitCount,
-    const VkSubmitInfo2*  pSubmits,
-    VkFence               fence);
+    VkQueue            queue,
+    uint32_t           submitCount,
+    const VkSubmitInfo2* pSubmits,
+    VkFence            fence);
+
+typedef PFN_vkQueueSubmit2 PFN_vkQueueSubmit2KHR;
+
+// 스펙 값과 맞춰둔 sType 상수들
+#ifndef VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO
+#define VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO (VkStructureType)1000267000
 #endif
 
-#ifndef PFN_vkQueueSubmit2KHR
-typedef PFN_vkQueueSubmit2 PFN_vkQueueSubmit2KHR;
+#ifndef VK_STRUCTURE_TYPE_SUBMIT_INFO_2
+#define VK_STRUCTURE_TYPE_SUBMIT_INFO_2 (VkStructureType)1000267007
 #endif
+
+#ifndef VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO
+#define VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO (VkStructureType)1000267008
+#endif
+
+#endif // PFN_vkQueueSubmit2
 
 struct AndroidVkGpuDispatch {
     // 큐/쿼리 관련
