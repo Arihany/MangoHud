@@ -343,7 +343,6 @@ static double g_last_proc_cpu = 0.0;
 static std::chrono::steady_clock::time_point g_last_proc_ts;
 
 // /proc/self/stat에서 utime+stime을 초 단위로 읽어오기
-// /proc/self/stat에서 utime+stime을 초 단위로 읽어오기
 static bool android_read_self_cpu_time(double &out_sec)
 {
     std::ifstream file("/proc/self/stat");
@@ -354,33 +353,35 @@ static bool android_read_self_cpu_time(double &out_sec)
     if (!std::getline(file, line))
         return false;
 
+    // comm 필드 괄호까지 건너뛰기
     auto rparen = line.rfind(')');
-    if (rparen == std::string::npos)
-        return false;
-
-    if (rparen + 2 >= line.size())
+    if (rparen == std::string::npos || rparen + 2 >= line.size())
         return false;
 
     std::string rest = line.substr(rparen + 2);
     std::istringstream iss(rest);
     std::string token;
     int idx = 0;
-    unsigned long long utime = 0;
-    unsigned long long stime = 0;
 
-    // state(0) ~ ... ~ utime(11) ~ stime(12)
+    unsigned long long utime  = 0;
+    unsigned long long stime  = 0;
+    unsigned long long cutime = 0;
+    unsigned long long cstime = 0;
+
+    // state(0) ~ ... ~ utime(11) ~ stime(12) ~ cutime(13) ~ cstime(14)
     while (iss >> token) {
         if (idx == 11) {
             utime = std::strtoull(token.c_str(), nullptr, 10);
         } else if (idx == 12) {
             stime = std::strtoull(token.c_str(), nullptr, 10);
-            break;
+        } else if (idx == 13) {
+            cutime = std::strtoull(token.c_str(), nullptr, 10);
+        } else if (idx == 14) {
+            cstime = std::strtoull(token.c_str(), nullptr, 10);
+            break; // 여기까지만 필요
         }
         ++idx;
     }
-
-    if (utime == 0 && stime == 0)
-        return false;
 
     if (g_clk_tck <= 0) {
         g_clk_tck = sysconf(_SC_CLK_TCK);
@@ -388,7 +389,8 @@ static bool android_read_self_cpu_time(double &out_sec)
             g_clk_tck = 100;
     }
 
-    out_sec = static_cast<double>(utime + stime) / static_cast<double>(g_clk_tck);
+    const unsigned long long total_ticks = utime + stime + cutime + cstime;
+    out_sec = static_cast<double>(total_ticks) / static_cast<double>(g_clk_tck);
     return true;
 }
 
