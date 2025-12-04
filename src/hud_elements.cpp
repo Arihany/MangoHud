@@ -1018,68 +1018,132 @@ static inline double TransformInverse_Custom(double v, void*) {
    return v;
 }
 
-void HudElements::frame_timing(){
-    if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_frame_timing]){
+void HudElements::frame_timing() {
+    if (!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_frame_timing])
+        return;
+
+    ImguiNextColumnFirstItem();
+    ImGui::PushFont(HUDElements.sw_stats->font_small);
+
+    if (!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_horizontal] &&
+        !HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_hud_compact]) {
+
+        ImGui::Dummy(ImVec2(0.0f, real_font_size.y));
+        HUDElements.TextColored(HUDElements.colors.engine, "%s", "Frametime");
+        ImGui::TableSetColumnIndex(ImGui::TableGetColumnCount() - 1);
+        ImGui::Dummy(ImVec2(0.0f, real_font_size.y));
+        right_aligned_text(HUDElements.colors.text,
+                           ImGui::GetContentRegionAvail().x,
+                           "min: %.1fms, max: %.1fms",
+                           min_frametime, max_frametime);
+        ImGui::Dummy(ImVec2(0.0f, real_font_size.y / 2));
         ImguiNextColumnFirstItem();
-        ImGui::PushFont(HUDElements.sw_stats->font_small);
-        if (!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_horizontal] && !HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_hud_compact]){
-            ImGui::Dummy(ImVec2(0.0f, real_font_size.y));
-            HUDElements.TextColored(HUDElements.colors.engine, "%s", "Frametime");
-            ImGui::TableSetColumnIndex(ImGui::TableGetColumnCount() - 1);
-            ImGui::Dummy(ImVec2(0.0f, real_font_size.y));
-            right_aligned_text(HUDElements.colors.text, ImGui::GetContentRegionAvail().x, "min: %.1fms, max: %.1fms", min_frametime, max_frametime);
-            ImGui::Dummy(ImVec2(0.0f, real_font_size.y / 2));
-            ImguiNextColumnFirstItem();
-        }
-        char hash[40];
-        snprintf(hash, sizeof(hash), "##%s", overlay_param_names[OVERLAY_PARAM_ENABLED_frame_timing]);
-        HUDElements.sw_stats->stat_selector = OVERLAY_PLOTS_frame_timing;
-        HUDElements.sw_stats->time_dividor = 1000000.0f; /* ns -> ms */
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
-        double min_time = 0.0f;
-        double max_time = 50.0f;
-        float width, height = 0;
-        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_horizontal]){
-            width = 150;
-            height = HUDElements.params->font_size * 0.85;
-        } else {
-            width = (ImGui::GetWindowContentRegionMax().x - ImGui::GetWindowContentRegionMin().x);
-            height = max_time;
-        }
+    }
 
-        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_dynamic_frame_timing]){
-            min_time = min_frametime;
-            max_time = max_frametime;
-        }
-        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_frame_timing_detailed]){
-            height = 125;
-        }
+    char hash[40];
+    snprintf(hash, sizeof(hash), "##%s",
+             overlay_param_names[OVERLAY_PARAM_ENABLED_frame_timing]);
 
-        if (ImGui::BeginChild("my_child_window", ImVec2(width, height), false, ImGuiWindowFlags_NoDecoration)) {
-            if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_histogram]){
-                ImGui::PlotHistogram(hash, get_time_stat, HUDElements.sw_stats,
-                                    ARRAY_SIZE(HUDElements.sw_stats->frames_stats), 0,
-                                    NULL, min_time, max_time,
-                                    ImVec2(width, height));
+    HUDElements.sw_stats->stat_selector = OVERLAY_PLOTS_frame_timing;
+    HUDElements.sw_stats->time_dividor  = 1000000.0f; // ns -> ms
+
+    ImGui::PushStyleColor(ImGuiCol_FrameBg,
+                          ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+
+    double min_time = 0.0;
+    double max_time = 50.0;
+
+    if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_dynamic_frame_timing]) {
+        min_time = min_frametime;
+        max_time = max_frametime;
+    }
+
+    float width  = 0.0f;
+    float height = 0.0f;
+
+    if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_horizontal]) {
+        width  = 150.0f;
+        height = HUDElements.params->font_size * 0.85f;
+    } else {
+        width  = ImGui::GetWindowContentRegionMax().x
+               - ImGui::GetWindowContentRegionMin().x;
+        height = max_time;
+    }
+
+    if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_frame_timing_detailed])
+        height = 125.0f;
+
+    // 링 버퍼 관련 공통 처리
+    const int      capacity = (int)ARRAY_SIZE(HUDElements.sw_stats->frames_stats);
+    const uint64_t total    = HUDElements.sw_stats->n_frames;
+
+    int samples = (int)std::min<uint64_t>(total, (uint64_t)capacity);
+    int offset  = 0;
+
+    if (samples == capacity && capacity > 0) {
+        // 가장 오래된 샘플 위치
+        offset = (int)(total % capacity);
+    }
+
+    if (ImGui::BeginChild("my_child_window",
+                          ImVec2(width, height),
+                          false,
+                          ImGuiWindowFlags_NoDecoration)) {
+
+        // 유효 샘플 없으면 그냥 비워둠
+        if (samples > 0) {
+
+            if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_histogram]) {
+                ImGui::PlotHistogram(hash,
+                                     get_time_stat,
+                                     HUDElements.sw_stats,
+                                     samples,
+                                     (samples == capacity) ? offset : 0,
+                                     NULL,
+                                     min_time, max_time,
+                                     ImVec2(width, height));
             } else {
 #ifndef __linux__
-                ImGui::PlotLines(hash, get_time_stat, HUDElements.sw_stats,
-                                ARRAY_SIZE(HUDElements.sw_stats->frames_stats), 0,
-                                NULL, min_time, max_time,
-                                ImVec2(width, height));
+                ImGui::PlotLines(hash,
+                                 get_time_stat,
+                                 HUDElements.sw_stats,
+                                 samples,
+                                 (samples == capacity) ? offset : 0,
+                                 NULL,
+                                 min_time, max_time,
+                                 ImVec2(width, height));
 #else
-
                 if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_horizontal]) {
-                    ImGui::PlotLines(hash, get_time_stat, HUDElements.sw_stats,
-                    ARRAY_SIZE(HUDElements.sw_stats->frames_stats), 0,
-                    NULL, min_time, max_time,
-                    ImVec2(width, height));
+                    ImGui::PlotLines(hash,
+                                     get_time_stat,
+                                     HUDElements.sw_stats,
+                                     samples,
+                                     (samples == capacity) ? offset : 0,
+                                     NULL,
+                                     min_time, max_time,
+                                     ImVec2(width, height));
                 } else {
-                    if (ImPlot::BeginPlot("My Plot", ImVec2(width, height), ImPlotFlags_CanvasOnly | ImPlotFlags_NoInputs)) {
+                    if (ImPlot::BeginPlot("My Plot",
+                                          ImVec2(width, height),
+                                          ImPlotFlags_CanvasOnly |
+                                          ImPlotFlags_NoInputs)) {
+
+                        static std::vector<float> ft_series;
+                        ft_series.resize(samples);
+
+                        // oldest -> newest 순서로 펴기
+                        for (int i = 0; i < samples; ++i) {
+                            int idx = (samples == capacity)
+                                      ? (offset + i) % capacity
+                                      : i;
+                            ft_series[i] = (float)get_time_stat(HUDElements.sw_stats, idx);
+                        }
+
                         ImPlotStyle& style = ImPlot::GetStyle();
-                        style.Colors[ImPlotCol_PlotBg] = ImVec4(0.92f, 0.92f, 0.95f, 0.00f);
+                        style.Colors[ImPlotCol_PlotBg]   = ImVec4(0.92f, 0.92f, 0.95f, 0.00f);
                         style.Colors[ImPlotCol_AxisGrid] = ImVec4(0.0f, 0.0f, 0.0f, 1.0f);
                         style.Colors[ImPlotCol_AxisTick] = ImVec4(0.0f, 0.0f, 0.0f, 1.0f);
+
                         ImPlotAxisFlags ax_flags_x = ImPlotAxisFlags_NoDecorations;
                         ImPlotAxisFlags ax_flags_y = ImPlotAxisFlags_NoDecorations;
                         if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_frame_timing_detailed])
@@ -1087,46 +1151,72 @@ void HudElements::frame_timing(){
 
                         ImPlot::SetupAxes(nullptr, nullptr, ax_flags_x, ax_flags_y);
                         ImPlot::SetupAxisScale(ImAxis_Y1, TransformForward_Custom, TransformInverse_Custom);
-                        ImPlot::SetupAxesLimits(0, 200, min_time, max_time, ImGuiCond_Always);
-                        ImPlot::SetNextLineStyle(HUDElements.colors.frametime, 1.5);
-                        ImPlot::PlotLine("frametime line", frametime_data.data(), frametime_data.size());
-                        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_throttling_status_graph] &&
-                            gpus && gpus->active_gpu() && gpus->active_gpu()->throttling()){
-                            ImPlot::SetNextLineStyle(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), 1.5);
-                            ImPlot::PlotLine("power line", gpus->active_gpu()->throttling()->power.data(), gpus->active_gpu()->throttling()->power.size());
-                            ImPlot::SetNextLineStyle(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), 1.5);
-                            ImPlot::PlotLine("thermal line", gpus->active_gpu()->throttling()->thermal.data(), gpus->active_gpu()->throttling()->thermal.size());
+
+                        if (samples <= 1) {
+                            ImPlot::SetupAxesLimits(0.0, 1.0,
+                                                    min_time, max_time,
+                                                    ImGuiCond_Always);
+                        } else {
+                            ImPlot::SetupAxesLimits(0.0, (double)(samples - 1),
+                                                    min_time, max_time,
+                                                    ImGuiCond_Always);
                         }
+
+                        ImPlot::SetNextLineStyle(HUDElements.colors.frametime, 1.5f);
+                        ImPlot::PlotLine("frametime line",
+                                         ft_series.data(),
+                                         samples);
+
+                        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_throttling_status_graph] &&
+                            gpus && gpus->active_gpu() && gpus->active_gpu()->throttling()) {
+
+                            auto* thr = gpus->active_gpu()->throttling();
+
+                            ImPlot::SetNextLineStyle(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), 1.5f);
+                            ImPlot::PlotLine("power line",
+                                             thr->power.data(),
+                                             (int)thr->power.size());
+
+                            ImPlot::SetNextLineStyle(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), 1.5f);
+                            ImPlot::PlotLine("thermal line",
+                                             thr->thermal.data(),
+                                             (int)thr->thermal.size());
+                        }
+
                         ImPlot::EndPlot();
                     }
+#endif // __linux__
                 }
-#endif
             }
         }
-        ImGui::EndChild();
-#ifdef __linux__
-        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_throttling_status_graph] &&
-            gpus && gpus->active_gpu() && gpus->active_gpu()->throttling()){
-            ImGui::Dummy(ImVec2(0.0f, real_font_size.y / 2));
-
-            if (gpus->active_gpu()->throttling()->power_throttling()) {
-                ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "%s", ICON_FK_SQUARE);
-                ImGui::SameLine();
-                ImGui::Text("Power throttling");
-            }
-
-            ImGui::Dummy(ImVec2(0.0f, real_font_size.y / 2));
-
-            if (gpus->active_gpu()->throttling()->thermal_throttling()) {
-                ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "%s", ICON_FK_SQUARE);
-                ImGui::SameLine();
-                ImGui::Text("Thermal throttling");
-            }
-        }
-        ImGui::PopFont();
-        ImGui::PopStyleColor();
-#endif
     }
+    ImGui::EndChild();
+
+#ifdef __linux__
+    if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_throttling_status_graph] &&
+        gpus && gpus->active_gpu() && gpus->active_gpu()->throttling()) {
+
+        ImGui::Dummy(ImVec2(0.0f, real_font_size.y / 2));
+
+        if (gpus->active_gpu()->throttling()->power_throttling()) {
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "%s", ICON_FK_SQUARE);
+            ImGui::SameLine();
+            ImGui::Text("Power throttling");
+        }
+
+        ImGui::Dummy(ImVec2(0.0f, real_font_size.y / 2));
+
+        if (gpus->active_gpu()->throttling()->thermal_throttling()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "%s", ICON_FK_SQUARE);
+            ImGui::SameLine();
+            ImGui::Text("Thermal throttling");
+        }
+    }
+#endif
+
+    ImGui::PopFont();
+    ImGui::PopStyleColor();
+#endif
 }
 
 void HudElements::media_player(){
