@@ -127,6 +127,42 @@ static ImVec4 LinearToHLG(ImVec4 col)
     return col;
 }
 
+#ifdef __linux__
+static ImPlotPoint frametime_implot_getter(int idx, void* user_data)
+{
+    const int samples = user_data ? *static_cast<int*>(user_data) : 0;
+    auto* stats = HUDElements.sw_stats;
+
+    if (!stats || samples <= 0 || idx < 0 || idx >= samples)
+        return ImPlotPoint(idx, 0.0);
+
+    const int capacity = (int)ARRAY_SIZE(stats->frames_stats);
+    if (capacity <= 0)
+        return ImPlotPoint(idx, 0.0);
+
+    const uint64_t total = stats->n_frames;
+    if (total == 0)
+        return ImPlotPoint(idx, 0.0);
+
+    int ring_index = 0;
+
+    if (total < (uint64_t)capacity) {
+        ring_index = idx;
+    } else {
+        const int start = (int)(total % capacity);
+        ring_index      = (start + idx) % capacity;
+    }
+
+    const auto& fr = stats->frames_stats[ring_index];
+
+    double y = 0.0;
+    if (stats->time_dividor != 0.0f)
+        y = (double)fr.stats[stats->stat_selector] / stats->time_dividor;
+
+    return ImPlotPoint(idx, y);
+}
+#endif
+
 template<typename T, typename R = float>
 R format_units(T value, const char*& unit)
 {
@@ -1128,17 +1164,6 @@ void HudElements::frame_timing() {
                                           ImPlotFlags_CanvasOnly |
                                           ImPlotFlags_NoInputs)) {
 
-                        static std::vector<float> ft_series;
-                        ft_series.resize(samples);
-
-                        // oldest -> newest 순서로 펴기
-                        for (int i = 0; i < samples; ++i) {
-                            int idx = (samples == capacity)
-                                      ? (offset + i) % capacity
-                                      : i;
-                            ft_series[i] = (float)get_time_stat(HUDElements.sw_stats, idx);
-                        }
-
                         ImPlotStyle& style = ImPlot::GetStyle();
                         style.Colors[ImPlotCol_PlotBg]   = ImVec4(0.92f, 0.92f, 0.95f, 0.00f);
                         style.Colors[ImPlotCol_AxisGrid] = ImVec4(0.0f, 0.0f, 0.0f, 1.0f);
@@ -1162,21 +1187,24 @@ void HudElements::frame_timing() {
                                                     ImGuiCond_Always);
                         }
 
+                        int plot_samples = samples;
+
                         ImPlot::SetNextLineStyle(HUDElements.colors.frametime, 1.5f);
-                        ImPlot::PlotLine("frametime line",
-                                         ft_series.data(),
-                                         samples);
+                        ImPlot::PlotLineG("frametime line",
+                                          frametime_implot_getter,
+                                          &plot_samples,
+                                          plot_samples);
 
                         if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_throttling_status_graph] &&
                             gpus && gpus->active_gpu() && gpus->active_gpu()->throttling()) {
-                        
+
                             auto thr = gpus->active_gpu()->throttling(); // shared_ptr<Throttling>
-                        
+
                             ImPlot::SetNextLineStyle(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), 1.5f);
                             ImPlot::PlotLine("power line",
                                              thr->power.data(),
                                              (int)thr->power.size());
-                        
+
                             ImPlot::SetNextLineStyle(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), 1.5f);
                             ImPlot::PlotLine("thermal line",
                                              thr->thermal.data(),
