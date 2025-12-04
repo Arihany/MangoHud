@@ -408,19 +408,22 @@ android_gpu_usage_collect_frame_gpu_ms(AndroidVkGpuContext*            ctx,
         sizeof(uint64_t) * 2,
         VK_QUERY_RESULT_64_BIT |
         VK_QUERY_RESULT_WITH_AVAILABILITY_BIT |
-        VK_QUERY_RESULT_WAIT_BIT
     );
 
-    if (r < 0) {
-        SPDLOG_WARN(
-            "Android GPU usage: GetQueryPoolResults failed (r={} used={} start={})",
-            static_cast<int>(r),
-            fr.query_used,
-            fr.query_start
-        );
+    if (r == VK_ERROR_DEVICE_LOST) {
+        SPDLOG_WARN("Android GPU usage: DEVICE_LOST on GetQueryPoolResults, disabling timestamp backend");
+        ctx->ts_supported = false;
         fr.has_queries = false;
         fr.query_used  = 0;
-        fr.frame_serial= std::numeric_limits<uint64_t>::max();
+        fr.frame_serial = std::numeric_limits<uint64_t>::max();
+        return 0.0f;
+    }
+    
+    if (r < 0) {
+        SPDLOG_WARN("Android GPU usage: GetQueryPoolResults failed (r={})", (int)r);
+        fr.has_queries = false;
+        fr.query_used  = 0;
+        fr.frame_serial = std::numeric_limits<uint64_t>::max();
         return 0.0f;
     }
 
@@ -614,8 +617,11 @@ android_gpu_usage_queue_submit(AndroidVkGpuContext* ctx,
             : VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    // 타임스탬프 미지원이면 그냥 패스스루
-    if (!ctx->ts_supported) {
+    // ★ v2와 동일한 패밀리 가드 추가
+    if (ctx->query_pool != VK_NULL_HANDLE &&
+        ctx->queue_family_index != VK_QUEUE_FAMILY_IGNORED &&
+        ctx->queue_family_index != queue_family_index) {
+        // 이 큐 패밀리는 그냥 계측 안 함
         return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
     }
 
