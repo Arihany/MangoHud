@@ -21,8 +21,6 @@ const std::vector<std::string> kIntelThrottleTemp = {
     "reason_vr_thermalert"
 };
 
-int GPU_fdinfo::kgsl_freq_norm_mode = -1;
-
 namespace fs = ghc::filesystem;
 
 void GPU_fdinfo::find_fd()
@@ -410,7 +408,7 @@ int GPU_fdinfo::get_gpu_load()
         );
         logged_once = true;
     }
-    
+
     if (module == "xe")
         return get_xe_load();
 
@@ -673,6 +671,8 @@ float GPU_fdinfo::amdgpu_helper_get_proc_vram() {
     return get_memory_used();
 }
 
+// ===== Android KGSL fallback helpers (no normalization) =====
+
 void GPU_fdinfo::init_kgsl() {
     const std::string sys_path = "/sys/class/kgsl/kgsl-3d0";
 
@@ -731,52 +731,9 @@ void GPU_fdinfo::init_kgsl() {
 }
 
 int GPU_fdinfo::get_kgsl_load() {
-    return get_kgsl_load_effective();
-}
-
-int GPU_fdinfo::get_kgsl_load_effective() {
-    if (kgsl_freq_norm_mode == -1) {
-        const char* env = std::getenv("MANGOHUD_KGSL_FREQ_NORM");
-        if (!env || *env == '\0' || *env == '0')
-            kgsl_freq_norm_mode = 0;
-        else
-            kgsl_freq_norm_mode = 1;
-
-        SPDLOG_INFO(
-            "kgsl: freq normalization {} (MANGOHUD_KGSL_FREQ_NORM={})",
-            kgsl_freq_norm_mode ? "ENABLED" : "DISABLED",
-            env ? env : "null"
-        );
-    }
-
     int raw = get_kgsl_load_raw();
     SPDLOG_DEBUG("kgsl: raw load = {}", raw);
-    if (raw <= 0)
-        return raw;
-
-    if (kgsl_freq_norm_mode == 0) {
-        SPDLOG_DEBUG("kgsl: freq normalization disabled, returning raw={}", raw);
-        return raw;
-    }
-
-    double ratio = get_kgsl_freq_ratio();
-    SPDLOG_DEBUG("kgsl: freq ratio = {}", ratio);
-    if (ratio <= 0.0) {
-        SPDLOG_DEBUG("kgsl: freq ratio invalid (<=0), returning raw={}", raw);
-        return raw;
-    }
-
-    double norm = static_cast<double>(raw) * ratio;
-    SPDLOG_DEBUG("kgsl: normalized load = raw={} * ratio={} => {}", raw, ratio, norm);
-
-    if (norm < 0.0)
-        norm = 0.0;
-    if (norm > 100.0)
-        norm = 100.0;
-
-    int result = static_cast<int>(std::lround(norm));
-    SPDLOG_DEBUG("kgsl: normalized load (clamped) = {}", result);
-    return result;
+    return raw;
 }
 
 int GPU_fdinfo::get_kgsl_load_raw() {
@@ -817,61 +774,30 @@ int GPU_fdinfo::get_kgsl_load_raw() {
     }
 }
 
-static bool read_kgsl_u64(const std::string& path, uint64_t& out) {
-    std::ifstream f(path);
-    if (!f.is_open())
-        return false;
-
-    std::string s;
-    std::getline(f, s);
-    if (s.empty())
-        return false;
-
-    try {
-        out = static_cast<uint64_t>(std::stoull(s));
-        return true;
-    } catch (...) {
-        return false;
-    }
-}
-
-double GPU_fdinfo::get_kgsl_freq_ratio() {
-    const std::string base = "/sys/class/kgsl/kgsl-3d0";
-
-    uint64_t cur = 0;
-    uint64_t max = 0;
-
-    bool cur_ok = read_kgsl_u64(base + "/devfreq/cur_freq", cur)
-               || read_kgsl_u64(base + "/gpuclk", cur);
-    bool max_ok = read_kgsl_u64(base + "/devfreq/max_freq", max)
-               || read_kgsl_u64(base + "/max_gpuclk", max);
-
-    if (!cur_ok || !max_ok || cur == 0 || max == 0) {
-        SPDLOG_DEBUG(
-            "kgsl: freq ratio unavailable (cur_ok={}, max_ok={}, cur={}, max={})",
-            cur_ok, max_ok, cur, max
-        );
-        return 0.0;
-    }
-
-    double ratio = static_cast<double>(cur) / static_cast<double>(max);
-    SPDLOG_DEBUG("kgsl: freq raw ratio cur={} max={} -> {}", cur, max, ratio);
-
-    if (ratio < 0.0)
-        ratio = 0.0;
-    if (ratio > 1.0)
-        ratio = 1.0;
-
-    SPDLOG_DEBUG("kgsl: freq ratio (clamped 0..1) = {}", ratio);
-    return ratio;
-}
-
 void GPU_fdinfo::main_thread()
 {
     // 최소 500ms 이상으로 강제
     constexpr int MIN_INTERVAL_MS = 500;
     const int interval_ms = std::max(METRICS_UPDATE_PERIOD_MS, MIN_INTERVAL_MS);
 
+#if defined(__ANDROID__)
+    // Android:
+    // - 현재는 Vulkan timestamp / Android 전용 백엔드가 GPU metrics를 담당.
+    // - fdinfo/DRM/hwmon 기반 로직은 안 쓰므로 여기서는 idle 루프만 유지해서
+    //   불필요한 /proc, /sys I/O를 전부 제거한다.
+    SPDLOG_INFO("GPU_fdinfo main thread: Android backend idle (no fdinfo sampling)");
+
+    while (!stop_thread) {
+        {
+            std::unique_lock<std::mutex> lock(metrics_mutex);
+            cond_var.wait(lock, [this]() { return !paused || stop_thread; });
+            if (stop_thread)
+                break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+    }
+#else
     while (!stop_thread) {
         {
             // 일단 pause / resume 동기화
@@ -899,29 +825,6 @@ void GPU_fdinfo::main_thread()
 
         // 공통: fdinfo 파싱은 한 번
         gather_fdinfo_data();
-
-#if defined(__ANDROID__)
-        // - fdinfo 기반 load / vram / clock만 유지
-        // - hwmon / power / fan / throttle 전부 차단
-        metrics.load           = get_gpu_load();
-        metrics.proc_vram_used = get_memory_used();
-        metrics.CoreClock      = get_gpu_clock();  // kgsl clock 있으면 이쪽에서 사용
-
-        // hwmon / powercap 계열은 전부 끔
-        metrics.powerUsage  = 0.0f;
-        metrics.powerLimit  = 0.0f;
-        metrics.voltage     = 0;
-        metrics.temp        = 0.0f;   // 온도는 Android 전용 백엔드에서 따로 채우는 쪽으로
-        metrics.memory_temp = 0.0f;
-        metrics.fan_speed   = 0;
-        metrics.fan_rpm     = false;
-
-        metrics.is_power_throttled   = false;
-        metrics.is_current_throttled = false;
-        metrics.is_temp_throttled    = false;
-        metrics.is_other_throttled   = false;
-
-#else
 
         get_current_hwmon_readings();
 
@@ -951,7 +854,6 @@ void GPU_fdinfo::main_thread()
         metrics.is_current_throttled = throttling & GPU_throttle_status::CURRENT;
         metrics.is_temp_throttled    = throttling & GPU_throttle_status::TEMP;
         metrics.is_other_throttled   = throttling & GPU_throttle_status::OTHER;
-#endif
 
         SPDLOG_DEBUG(
             "pci_dev = {}, pid = {}, module = {}, "
@@ -966,4 +868,5 @@ void GPU_fdinfo::main_thread()
 
         std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
     }
+#endif
 }
