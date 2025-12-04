@@ -700,7 +700,6 @@ void HudElements::core_load(){
     }
     else {
         for (const CPUData& cpuData : cores) {
-        {
             ImguiNextColumnFirstItem();
             HUDElements.TextColored(HUDElements.colors.cpu, "CPU");
             ImGui::SameLine(0, 1.0f);
