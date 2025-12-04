@@ -13,6 +13,7 @@
 #include "string_utils.h"
 #include "gpu.h"
 #include "file_utils.h"
+#include <cctype> // std::tolower
 
 #if defined(__ANDROID__)
 #include <chrono>
@@ -1149,24 +1150,77 @@ static bool find_fallback_input(const std::string& path, const char* input_prefi
     return false;
 }
 
-static void check_thermal_zones(std::string& path, std::string& input) {
-    std::string sysfs_thermal = "/sys/class/thermal/";
+// thermal_zone type이 CPU 계열인지 대충 판정
+static bool is_cpu_thermal_type(const std::string& type_raw)
+{
+    if (type_raw.empty())
+        return false;
 
-    if (!ghc::filesystem::exists(sysfs_thermal))
-        return;
+    std::string type = type_raw;
+    std::transform(type.begin(), type.end(), type.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-    for (auto& d : ghc::filesystem::directory_iterator(sysfs_thermal)) {
-        if (d.path().filename().string().substr(0, 12) != "thermal_zone")
+    // 원래 쓰던 cpuss- 계열은 그대로 인정
+    if (starts_with(type, "cpuss-"))
+        return true;
+
+    // 일반적인 "cpu", "cpu-thermal", "cpu-therm" 같은 놈들
+    if (starts_with(type, "cpu"))
+        return true;
+    if (type.find("cpu-thermal") != std::string::npos)
+        return true;
+    if (type.find("cpu-therm") != std::string::npos)
+        return true;
+
+    return false;
+}
+
+static void check_thermal_zones(std::string& path, std::string& input)
+{
+    // 레퍼런스: /sys/devices/virtual/thermal → 안 되면 /sys/class/thermal
+    const char* bases[] = {
+        "/sys/devices/virtual/thermal/",
+        "/sys/class/thermal/"
+    };
+
+    for (const char* base : bases) {
+        if (!ghc::filesystem::exists(base))
             continue;
 
-        std::string type = read_line(d.path() / "type");
-        if (type.substr(0, 6) != "cpuss-")
-            continue;
+        for (auto& d : ghc::filesystem::directory_iterator(base)) {
+            auto fname = d.path().filename().string();
+            if (fname.rfind("thermal_zone", 0) != 0)
+                continue;
 
-        path  = d.path().string();
-        input = (d.path() / "temp").string();
+            std::string type = read_line(d.path() / "type");
+            if (!is_cpu_thermal_type(type))
+                continue;
 
-        return;
+            path = d.path().string();
+
+            // 1순위: .../temp
+            std::string cand = (d.path() / "temp").string();
+            if (file_exists(cand)) {
+                input = cand;
+                return;
+            }
+
+            // 2순위: .../temp1_input
+            cand = (d.path() / "temp1_input").string();
+            if (file_exists(cand)) {
+                input = cand;
+                return;
+            }
+
+            // 3순위: .../freq1_input (중국 빌드에서 쓰던 애 커버용)
+            cand = (d.path() / "freq1_input").string();
+            if (file_exists(cand)) {
+                input = cand;
+                return;
+            }
+        }
+
+        // 이 base에서 못 찾았으면 다음 base(/sys/class/thermal)로 넘어감
     }
 }
 
