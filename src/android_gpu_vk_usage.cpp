@@ -407,7 +407,8 @@ android_gpu_usage_collect_frame_gpu_ms(AndroidVkGpuContext*            ctx,
         data,
         sizeof(uint64_t) * 2,
         VK_QUERY_RESULT_64_BIT |
-        VK_QUERY_RESULT_WITH_AVAILABILITY_BIT |
+        VK_QUERY_RESULT_WITH_AVAILABILITY_BIT
+        // WAIT_BIT 제거: 결과 안 나왔으면 avail 플래그로 구분
     );
 
     if (r == VK_ERROR_DEVICE_LOST) {
@@ -418,7 +419,7 @@ android_gpu_usage_collect_frame_gpu_ms(AndroidVkGpuContext*            ctx,
         fr.frame_serial = std::numeric_limits<uint64_t>::max();
         return 0.0f;
     }
-    
+
     if (r < 0) {
         SPDLOG_WARN("Android GPU usage: GetQueryPoolResults failed (r={})", (int)r);
         fr.has_queries = false;
@@ -617,7 +618,12 @@ android_gpu_usage_queue_submit(AndroidVkGpuContext* ctx,
             : VK_ERROR_INITIALIZATION_FAILED;
     }
 
-    // ★ v2와 동일한 패밀리 가드 추가
+    // 타임스탬프 백엔드 비활성화 상태면 바로 패스스루
+    if (!ctx->ts_supported) {
+        return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
+    }
+
+    // v2와 동일한 패밀리 가드 추가
     if (ctx->query_pool != VK_NULL_HANDLE &&
         ctx->queue_family_index != VK_QUEUE_FAMILY_IGNORED &&
         ctx->queue_family_index != queue_family_index) {
@@ -838,7 +844,7 @@ android_gpu_usage_queue_submit2(AndroidVkGpuContext* ctx,
             ctx->queue_family_index != queue_family_index) {
             return fpSubmit2(queue, submitCount, pSubmits, fence);
         }
-        
+
         // 리소스 lazy init
         if (!android_gpu_usage_init_timestamp_resources(ctx, queue_family_index)) {
             return fpSubmit2(queue, submitCount, pSubmits, fence);
