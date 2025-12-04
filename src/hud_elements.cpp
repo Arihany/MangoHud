@@ -489,7 +489,9 @@ void HudElements::gpu_stats(){
 }
 
 void HudElements::cpu_stats(){
-    if(HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_stats]){
+    if(!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_stats])
+        return;
+
         ImguiNextColumnFirstItem();
         const char* cpu_text;
         if (HUDElements.params->cpu_text.empty())
@@ -608,7 +610,8 @@ void HudElements::cpu_stats(){
 
 static float get_core_load_stat(void*,int);
 static float get_core_load_stat(void *data, int idx){
-    return ((CPUStats *)data)->GetCPUData().at(idx).percent;
+    auto* cores = static_cast<const std::vector<CPUData>*>(data);
+    return (*cores)[idx].percent;   // at() 대신 operator[]
 }
 
 void HudElements::core_load(){
