@@ -415,12 +415,14 @@ void HudElements::gpu_stats(){
 
             if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_power]) {
                 ImguiNextColumnOrNewRow();
-                char str[16];
-                snprintf(str, sizeof(str), "%.1f", gpu->metrics.powerUsage);
-                if (strlen(str) > 4)
-                    right_aligned_text(text_color, HUDElements.ralign_width, "%.0f", gpu->metrics.powerUsage);
-                else
-                    right_aligned_text(text_color, HUDElements.ralign_width, "%.1f", gpu->metrics.powerUsage);
+            
+                const float power = gpu->metrics.powerUsage;
+                const char* fmt   = (power >= 100.0f) ? "%.0f" : "%.1f";
+            
+                right_aligned_text(text_color,
+                                   HUDElements.ralign_width,
+                                   fmt, power);
+            
                 ImGui::SameLine(0, 1.0f);
                 ImGui::PushFont(HUDElements.sw_stats->font_small);
                 if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_power_limit])
@@ -489,168 +491,208 @@ void HudElements::gpu_stats(){
 }
 
 void HudElements::cpu_stats(){
-    if(!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_stats])
+    if (!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_stats])
         return;
 
-        ImguiNextColumnFirstItem();
-        const char* cpu_text;
-        if (HUDElements.params->cpu_text.empty())
-            cpu_text = "CPU";
-        else
-            cpu_text = HUDElements.params->cpu_text.c_str();
+    ImguiNextColumnFirstItem();
 
-        HUDElements.TextColored(HUDElements.colors.cpu, "%s", cpu_text);
+    const char* cpu_text =
+        HUDElements.params->cpu_text.empty()
+            ? "CPU"
+            : HUDElements.params->cpu_text.c_str();
+
+    HUDElements.TextColored(HUDElements.colors.cpu, "%s", cpu_text);
+
+    ImguiNextColumnOrNewRow();
+    auto text_color = HUDElements.colors.text;
+
+    // ★ 여기서 한 번만 읽어온다
+    const auto& total = cpuStats.GetCPUDataTotal();
+    const int cpu_load_percent = (int)total.percent;
+
+    // ─ CPU Load ─
+    if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_load_change]){
+        struct LOAD_DATA cpu_data = {
+            HUDElements.colors.cpu_load_low,
+            HUDElements.colors.cpu_load_med,
+            HUDElements.colors.cpu_load_high,
+            HUDElements.params->cpu_load_value[0],
+            HUDElements.params->cpu_load_value[1]
+        };
+
+        auto load_color = change_on_load_temp(cpu_data, cpu_load_percent);
+        right_aligned_text(load_color, HUDElements.ralign_width, "%d", cpu_load_percent);
+        ImGui::SameLine(0, 1.0f);
+        HUDElements.TextColored(load_color, "%%");
+    } else {
+        right_aligned_text(text_color, HUDElements.ralign_width, "%d", cpu_load_percent);
+        ImGui::SameLine(0, 1.0f);
+        HUDElements.TextColored(HUDElements.colors.text, "%%");
+    }
+
+    // ─ CPU Temp ─
+    if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_temp]){
         ImguiNextColumnOrNewRow();
-        auto text_color = HUDElements.colors.text;
-        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_load_change]){
-            int cpu_load_percent = int(cpuStats.GetCPUDataTotal().percent);
-            struct LOAD_DATA cpu_data = {
-                HUDElements.colors.cpu_load_low,
-                HUDElements.colors.cpu_load_med,
-                HUDElements.colors.cpu_load_high,
-                HUDElements.params->cpu_load_value[0],
-                HUDElements.params->cpu_load_value[1]
-            };
 
-            auto load_color = change_on_load_temp(cpu_data, cpu_load_percent);
-            right_aligned_text(load_color, HUDElements.ralign_width, "%d", cpu_load_percent);
-            ImGui::SameLine(0, 1.0f);
-            HUDElements.TextColored(load_color, "%%");
-        }
-        else {
-            right_aligned_text(text_color, HUDElements.ralign_width, "%d", int(cpuStats.GetCPUDataTotal().percent));
-            ImGui::SameLine(0, 1.0f);
-            HUDElements.TextColored(HUDElements.colors.text, "%%");
-        }
+        int temp_val = total.temp;
+        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_temp_fahrenheit])
+            temp_val = HUDElements.convert_to_fahrenheit(temp_val);
 
-        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_temp]){
-            ImguiNextColumnOrNewRow();
+        right_aligned_text(HUDElements.colors.text,
+                           HUDElements.ralign_width,
+                           "%i", temp_val);
+
+        ImGui::SameLine(0, 1.0f);
+        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_hud_compact]) {
+            HUDElements.TextColored(HUDElements.colors.text, "°");
+        } else {
             if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_temp_fahrenheit])
-                right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%i", HUDElements.convert_to_fahrenheit(cpuStats.GetCPUDataTotal().temp));
+                HUDElements.TextColored(HUDElements.colors.text, "°F");
             else
-                right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%i", cpuStats.GetCPUDataTotal().temp);
-            ImGui::SameLine(0, 1.0f);
-            if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_hud_compact])
-                HUDElements.TextColored(HUDElements.colors.text, "°");
+                HUDElements.TextColored(HUDElements.colors.text, "°C");
+        }
+    }
+
+    // ─ CPU MHz ─
+    if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_mhz]){
+        ImguiNextColumnOrNewRow();
+        right_aligned_text(HUDElements.colors.text,
+                           HUDElements.ralign_width,
+                           "%i", total.cpu_mhz);
+        ImGui::SameLine(0, 1.0f);
+        ImGui::PushFont(HUDElements.sw_stats->font_small);
+        HUDElements.TextColored(HUDElements.colors.text, "MHz");
+        ImGui::PopFont();
+    }
+
+    // ─ CPU Power ─
+    if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_power]){
+        ImguiNextColumnOrNewRow();
+
+        const float power = total.power;
+        const char* fmt = (power >= 100.0f) ? "%.0f" : "%.1f";
+
+        right_aligned_text(HUDElements.colors.text,
+                           HUDElements.ralign_width,
+                           fmt, power);
+
+        ImGui::SameLine(0, 1.0f);
+        ImGui::PushFont(HUDElements.sw_stats->font_small);
+        HUDElements.TextColored(HUDElements.colors.text, "W");
+        ImGui::PopFont();
+    }
+
+    // ─ CPU Efficiency (F/J or J/F) ─
+    if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_efficiency]) {
+        ImguiNextColumnOrNewRow();
+
+        const float fps_val = HUDElements.sw_stats->fps;
+        const float power   = total.power;
+        const bool  flip    = HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_flip_efficiency];
+
+        float       efficiency      = 0.0f;
+        const char* efficiency_unit = flip ? "J/F" : "F/J";
+        bool        have_efficiency = true;
+
+        if (flip) {
+            // J/F = W / FPS
+            if (fps_val > 0.0f && std::isfinite(fps_val))
+                efficiency = power / fps_val;
             else
-                if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_temp_fahrenheit])
-                    HUDElements.TextColored(HUDElements.colors.text, "°F");
-                else
-                    HUDElements.TextColored(HUDElements.colors.text, "°C");
+                have_efficiency = false;
+        } else {
+            // F/J = FPS / W
+            if (power > 0.0f && std::isfinite(power))
+                efficiency = fps_val / power;
+            else
+                have_efficiency = false;
         }
 
-        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_mhz]){
-            ImguiNextColumnOrNewRow();
-            right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%i", cpuStats.GetCPUDataTotal().cpu_mhz);
-            ImGui::SameLine(0, 1.0f);
-            ImGui::PushFont(HUDElements.sw_stats->font_small);
-            HUDElements.TextColored(HUDElements.colors.text, "MHz");
-            ImGui::PopFont();
+        if (have_efficiency && std::isfinite(efficiency)) {
+            right_aligned_text(text_color,
+                               HUDElements.ralign_width,
+                               "%.2f", efficiency);
+        } else {
+            right_aligned_text(text_color,
+                               HUDElements.ralign_width,
+                               "%s", "--");
         }
 
-        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_power]){
-            ImguiNextColumnOrNewRow();
-            char str[16];
-            snprintf(str, sizeof(str), "%.1f", cpuStats.GetCPUDataTotal().power);
-            if (strlen(str) > 4)
-                right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%.0f", cpuStats.GetCPUDataTotal().power);
-            else
-                right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%.1f", cpuStats.GetCPUDataTotal().power);
-            ImGui::SameLine(0, 1.0f);
-            ImGui::PushFont(HUDElements.sw_stats->font_small);
-            HUDElements.TextColored(HUDElements.colors.text, "W");
-            ImGui::PopFont();
-        }
-
-        if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_cpu_efficiency]) {
-            ImguiNextColumnOrNewRow();
-        
-            const float fps_val = HUDElements.sw_stats->fps;
-            const float power   = cpuStats.GetCPUDataTotal().power;
-            const bool  flip    = HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_flip_efficiency];
-        
-            float efficiency    = 0.0f;
-            const char* efficiency_unit = flip ? "J/F" : "F/J";
-            bool have_efficiency = true;
-        
-            if (flip) {
-                // J/F = W / FPS
-                if (fps_val > 0.0f && std::isfinite(fps_val)) {
-                    efficiency = power / fps_val;
-                } else {
-                    have_efficiency = false;
-                }
-            } else {
-                // F/J = FPS / W
-                if (power > 0.0f && std::isfinite(power)) {
-                    efficiency = fps_val / power;
-                } else {
-                    have_efficiency = false;
-                }
-            }
-        
-            if (have_efficiency && std::isfinite(efficiency)) {
-                right_aligned_text(text_color,
-                                   HUDElements.ralign_width,
-                                   "%.2f", efficiency);
-            } else {
-                right_aligned_text(text_color,
-                                   HUDElements.ralign_width,
-                                   "%s", "--");
-            }
-        
-            ImGui::SameLine(0, 1.0f);
-            ImGui::PushFont(HUDElements.sw_stats->font_small);
-            HUDElements.TextColored(HUDElements.colors.text, "%s", efficiency_unit);
-            ImGui::PopFont();
-        }
+        ImGui::SameLine(0, 1.0f);
+        ImGui::PushFont(HUDElements.sw_stats->font_small);
+        HUDElements.TextColored(HUDElements.colors.text, "%s", efficiency_unit);
+        ImGui::PopFont();
     }
 }
 
+static float get_core_load_stat(void*, int);
 
-static float get_core_load_stat(void*,int);
 static float get_core_load_stat(void *data, int idx){
     auto* cores = static_cast<const std::vector<CPUData>*>(data);
-    return (*cores)[idx].percent;   // at() 대신 operator[]
+    return (*cores)[idx].percent;
 }
 
 void HudElements::core_load(){
     if (!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_core_load])
         return;
 
+    // 한 번만 꺼내서 모든 경로에서 공유
+    const auto& cores = cpuStats.GetCPUData();
+    const int core_count = (int)cores.size();
+
     if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_core_bars]){
         ImguiNextColumnFirstItem();
         ImGui::PushFont(HUDElements.sw_stats->font_small);
-        if (!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_horizontal] && !HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_hud_compact]){
+
+        if (!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_horizontal] &&
+            !HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_hud_compact]) {
+
             ImGui::Dummy(ImVec2(0.0f, real_font_size.y));
             HUDElements.TextColored(HUDElements.colors.cpu, "CPU Cores");
             ImGui::TableSetColumnIndex(ImGui::TableGetColumnCount() - 1);
             ImGui::Dummy(ImVec2(0.0f, real_font_size.y));
             ImguiNextColumnFirstItem();
         }
+
         char hash[40];
-        snprintf(hash, sizeof(hash), "##%s", overlay_param_names[OVERLAY_PARAM_ENABLED_core_bars]);
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
-        float width, height = 0;
+        snprintf(hash, sizeof(hash), "##%s",
+                 overlay_param_names[OVERLAY_PARAM_ENABLED_core_bars]);
+
+        ImGui::PushStyleColor(ImGuiCol_FrameBg,
+                              ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+
+        float width  = 0.0f;
+        float height = 0.0f;
+
         if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_horizontal]){
-            width = 150;
+            width  = 150.0f;
             height = HUDElements.params->font_size;
         } else {
-            width = (ImGui::GetWindowContentRegionMax().x - ImGui::GetWindowContentRegionMin().x);
-            height = 50;
+            width  = ImGui::GetWindowContentRegionMax().x
+                   - ImGui::GetWindowContentRegionMin().x;
+            height = 50.0f;
         }
 
-        if (ImGui::BeginChild("core_bars_window", ImVec2(width, height))) {
-            ImGui::PlotHistogram(hash, get_core_load_stat, &cpuStats,
-                                cpuStats.GetCPUData().size(), 0,
-                                NULL, 0.0, 100.0,
-                                ImVec2(width, height));
+        if (ImGui::BeginChild("core_bars_window",
+                              ImVec2(width, height))) {
+
+            if (core_count > 0) {
+                ImGui::PlotHistogram(hash,
+                                     get_core_load_stat,
+                                     &cores,               // ★ vector 포인터 넘김
+                                     core_count,
+                                     0,
+                                     NULL,
+                                     0.0f, 100.0f,
+                                     ImVec2(width, height));
+            }
         }
         ImGui::EndChild();
+
         ImGui::PopFont();
         ImGui::PopStyleColor();
     } else {
-        for (const CPUData &cpuData : cpuStats.GetCPUData())
+        for (const CPUData &cpuData : cores)
         {
             ImguiNextColumnFirstItem();
             HUDElements.TextColored(HUDElements.colors.cpu, "CPU");
@@ -658,15 +700,17 @@ void HudElements::core_load(){
             ImGui::PushFont(HUDElements.sw_stats->font_small);
 
             if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_core_type])
-                HUDElements.TextColored(HUDElements.colors.cpu, cpuData.label.c_str());
+                HUDElements.TextColored(HUDElements.colors.cpu, "%s", cpuData.label.c_str());
             else
                 HUDElements.TextColored(HUDElements.colors.cpu, "%i", cpuData.cpu_id);
 
             ImGui::PopFont();
             ImguiNextColumnOrNewRow();
+
             auto text_color = HUDElements.colors.text;
+
             if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_core_load_change]){
-                int cpu_load_percent = int(cpuData.percent);
+                int cpu_load_percent = (int)cpuData.percent;
                 struct LOAD_DATA cpu_data = {
                     HUDElements.colors.cpu_load_low,
                     HUDElements.colors.cpu_load_med,
@@ -681,12 +725,17 @@ void HudElements::core_load(){
                 ImguiNextColumnOrNewRow();
             }
             else {
-                right_aligned_text(text_color, HUDElements.ralign_width, "%i", int(cpuData.percent));
+                right_aligned_text(text_color,
+                                   HUDElements.ralign_width,
+                                   "%i", (int)cpuData.percent);
                 ImGui::SameLine(0, 1.0f);
                 HUDElements.TextColored(HUDElements.colors.text, "%%");
                 ImguiNextColumnOrNewRow();
             }
-            right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%i", cpuData.mhz);
+
+            right_aligned_text(HUDElements.colors.text,
+                               HUDElements.ralign_width,
+                               "%i", cpuData.mhz);
             ImGui::SameLine(0, 1.0f);
             ImGui::PushFont(HUDElements.sw_stats->font_small);
             HUDElements.TextColored(HUDElements.colors.text, "MHz");
@@ -1925,12 +1974,17 @@ void HudElements::_display_session() {
     HUDElements.TextColored(HUDElements.colors.engine, "%s", title);
     ImguiNextColumnOrNewRow();
 
-    static std::map<display_servers, std::string> servers {
-        {WAYLAND, {"WAYLAND"}},
-        {XWAYLAND, {"XWAYLAND"}},
-        {XORG, {"XORG"}}
-    };
-    right_aligned_text(HUDElements.colors.text, HUDElements.ralign_width, "%s", servers[HUDElements.display_server].c_str());
+    const char* name = "UNKNOWN";
+    switch (HUDElements.display_server) {
+        case WAYLAND:  name = "WAYLAND";  break;
+        case XWAYLAND: name = "XWAYLAND"; break;
+        case XORG:     name = "XORG";     break;
+        default:       name = "UNKNOWN";  break;
+    }
+
+    right_aligned_text(HUDElements.colors.text,
+                       HUDElements.ralign_width,
+                       "%s", name);
     ImGui::PopFont();
 }
 
