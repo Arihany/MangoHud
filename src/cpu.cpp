@@ -63,6 +63,22 @@ static bool g_logged_policy_mhz   = false;
 static bool g_logged_cpufreq_mhz  = false;
 static bool g_logged_mhz_missing  = false;
 
+static FILE* open_cached_readonly(const std::string& path)
+{
+    static std::unordered_map<std::string, FILE*> cache;
+
+    auto it = cache.find(path);
+    if (it != cache.end())
+        return it->second;
+
+    FILE* fp = fopen(path.c_str(), "r");
+    if (!fp)
+        return nullptr;
+
+    cache.emplace(path, fp);
+    return fp;
+}
+
 // ANDROID: sysfs 기반 CPU 코어 enum
 static bool android_enumerate_cpus(std::vector<CPUData>& out, CPUData& total)
 {
@@ -462,15 +478,21 @@ static std::chrono::steady_clock::time_point g_last_proc_ts;
 // /proc/self/stat에서 utime+stime을 초 단위로 읽어오기
 static bool android_read_self_cpu_time(double &out_sec)
 {
-    std::ifstream file("/proc/self/stat");
-    if (!file.is_open())
-        return false;
+    static std::ifstream file;
+
+    if (!file.is_open()) {
+        file.open("/proc/self/stat");
+        if (!file.is_open())
+            return false;
+    }
+
+    file.clear();                         // 이전 EOF/에러 플래그 클리어
+    file.seekg(0, std::ios::beg);
 
     std::string line;
     if (!std::getline(file, line))
         return false;
 
-    // comm 필드 괄호까지 건너뛰기
     auto rparen = line.rfind(')');
     if (rparen == std::string::npos || rparen + 2 >= line.size())
         return false;
@@ -485,7 +507,6 @@ static bool android_read_self_cpu_time(double &out_sec)
     unsigned long long cutime = 0;
     unsigned long long cstime = 0;
 
-    // state(0) ~ ... ~ utime(11) ~ stime(12) ~ cutime(13) ~ cstime(14)
     while (iss >> token) {
         if (idx == 11) {
             utime = std::strtoull(token.c_str(), nullptr, 10);
@@ -495,7 +516,7 @@ static bool android_read_self_cpu_time(double &out_sec)
             cutime = std::strtoull(token.c_str(), nullptr, 10);
         } else if (idx == 14) {
             cstime = std::strtoull(token.c_str(), nullptr, 10);
-            break; // 여기까지만 필요
+            break;
         }
         ++idx;
     }
@@ -756,39 +777,43 @@ bool CPUStats::UpdateCoreMhz() {
     for (auto& cpu : m_cpuData) {
         int mhz = 0;
         std::string path;
-
+    
         // 1) policy 기반 scaling_cur_freq 우선
         auto pit = g_cpu_policy_scaling_path.find(cpu.cpu_id);
         if (pit != g_cpu_policy_scaling_path.end()) {
-            path = pit->second;
-            if ((fp = fopen(path.c_str(), "r"))) {
+            const std::string& path = pit->second;
+            if (FILE* fp = open_cached_readonly(path)) {
+                rewind(fp);
                 int64_t temp = 0;
-                if (fscanf(fp, "%" PRId64, &temp) != 1)
+                if (fscanf(fp, "%" PRId64, &temp) != 1) {
+                    clearerr(fp);
                     temp = 0;
-                fclose(fp);
+                }
                 mhz = static_cast<int>(temp / 1000);
                 if (mhz > 0)
                     used_policy = true;
             }
         }
-
+    
         // 2) policy에서 못 읽었으면 per-cpu 경로 폴백
         if (mhz == 0) {
             path = "/sys/devices/system/cpu/cpu" +
                    std::to_string(cpu.cpu_id) +
                    "/cpufreq/scaling_cur_freq";
-
-            if ((fp = fopen(path.c_str(), "r"))) {
+    
+            if (FILE* fp = open_cached_readonly(path)) {
+                rewind(fp);
                 int64_t temp = 0;
-                if (fscanf(fp, "%" PRId64, &temp) != 1)
+                if (fscanf(fp, "%" PRId64, &temp) != 1) {
+                    clearerr(fp);
                     temp = 0;
-                fclose(fp);
+                }
                 mhz = static_cast<int>(temp / 1000);
                 if (mhz > 0)
                     used_cpufreq = true;
             }
         }
-
+    
         cpu.mhz = mhz;
         m_coreMhz.push_back(mhz);
     }
@@ -863,15 +888,14 @@ bool CPUStats::UpdateCoreMhz() {
 }
 
 bool CPUStats::ReadcpuTempFile(int& temp) {
-	if (!m_cpuTempFile)
-		return false;
+    if (!m_cpuTempFile)
+        return false;
 
-	rewind(m_cpuTempFile);
-	fflush(m_cpuTempFile);
-	bool ret = (fscanf(m_cpuTempFile, "%d", &temp) == 1);
-	temp = temp / 1000;
+    rewind(m_cpuTempFile);
+    bool ret = (fscanf(m_cpuTempFile, "%d", &temp) == 1);
+    temp = temp / 1000;
 
-	return ret;
+    return ret;
 }
 
 bool CPUStats::UpdateCpuTemp() {
