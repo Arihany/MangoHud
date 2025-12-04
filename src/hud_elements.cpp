@@ -626,17 +626,21 @@ void HudElements::cpu_stats(){
 }
 
 static float get_core_load_stat(void*, int);
+static float get_core_load_stat(void* data, int idx)
+{
+    auto* stats = static_cast<CPUStats*>(data);
+    const auto& cores = stats->GetCPUData();
 
-static float get_core_load_stat(void *data, int idx){
-    auto* cores = static_cast<const std::vector<CPUData>*>(data);
-    return (*cores)[idx].percent;
+    if (idx < 0 || idx >= (int)cores.size())
+        return 0.0f;
+
+    return cores[idx].percent;
 }
 
 void HudElements::core_load(){
     if (!HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_core_load])
         return;
 
-    // 한 번만 꺼내서 모든 경로에서 공유
     const auto& cores = cpuStats.GetCPUData();
     const int core_count = (int)cores.size();
 
@@ -677,22 +681,25 @@ void HudElements::core_load(){
                               ImVec2(width, height))) {
 
             if (core_count > 0) {
-                ImGui::PlotHistogram(hash,
-                                     get_core_load_stat,
-                                     &cores,               // ★ vector 포인터 넘김
-                                     core_count,
-                                     0,
-                                     NULL,
-                                     0.0f, 100.0f,
-                                     ImVec2(width, height));
+                ImGui::PlotHistogram(
+                    hash,
+                    get_core_load_stat,
+                    &cpuStats,
+                    core_count,
+                    0,
+                    nullptr,
+                    0.0f, 100.0f,
+                    ImVec2(width, height)
+                );
             }
         }
         ImGui::EndChild();
 
-        ImGui::PopFont();
         ImGui::PopStyleColor();
-    } else {
-        for (const CPUData &cpuData : cores)
+        ImGui::PopFont();
+    }
+    else {
+        for (const CPUData& cpuData : cores) {
         {
             ImguiNextColumnFirstItem();
             HUDElements.TextColored(HUDElements.colors.cpu, "CPU");
