@@ -1169,14 +1169,14 @@ void HudElements::frame_timing() {
 
                         if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_throttling_status_graph] &&
                             gpus && gpus->active_gpu() && gpus->active_gpu()->throttling()) {
-
-                            auto* thr = gpus->active_gpu()->throttling();
-
+                        
+                            auto thr = gpus->active_gpu()->throttling(); // shared_ptr<Throttling>
+                        
                             ImPlot::SetNextLineStyle(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), 1.5f);
                             ImPlot::PlotLine("power line",
                                              thr->power.data(),
                                              (int)thr->power.size());
-
+                        
                             ImPlot::SetNextLineStyle(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), 1.5f);
                             ImPlot::PlotLine("thermal line",
                                              thr->thermal.data(),
@@ -1216,7 +1216,6 @@ void HudElements::frame_timing() {
 
     ImGui::PopFont();
     ImGui::PopStyleColor();
-#endif
 }
 
 void HudElements::media_player(){
