@@ -56,8 +56,11 @@ static bool g_logged_fallback_switch = false;
 #endif
 
 static bool g_logged_corectl_summary = false;
-static bool g_logged_fallback_once   = false;
 static bool g_corectl_logged_summary = false;
+
+static bool g_logged_policy_mhz   = false;
+static bool g_logged_cpufreq_mhz  = false;
+static bool g_logged_mhz_missing  = false;
 
 // ANDROID: sysfs 기반 CPU 코어 enum
 static bool android_enumerate_cpus(std::vector<CPUData>& out, CPUData& total)
@@ -335,6 +338,119 @@ static bool read_core_ctl_global_state(std::unordered_map<int, CoreCtlEntry>& ou
 
     return true;
 }
+
+// ===== cpufreq policy → cpu 매핑 =====
+
+static bool g_cpufreq_policy_probed = false;
+static std::unordered_map<int, std::string> g_cpu_policy_scaling_path;
+
+// "0-3,5,7-8" 같은 cpulist 파싱
+static void parse_cpu_list(const std::string& s, std::vector<int>& out)
+{
+    out.clear();
+    size_t pos = 0;
+    const size_t n = s.size();
+
+    while (pos < n) {
+        // 구분자 스킵
+        while (pos < n &&
+               (s[pos] == ' ' || s[pos] == '\t' ||
+                s[pos] == ',' || s[pos] == '\n' ||
+                s[pos] == '\r')) {
+            ++pos;
+        }
+        if (pos >= n)
+            break;
+
+        size_t start = pos;
+        while (pos < n &&
+               s[pos] != ',' && s[pos] != ' ' &&
+               s[pos] != '\t' && s[pos] != '\n' &&
+               s[pos] != '\r') {
+            ++pos;
+        }
+
+        std::string token = s.substr(start, pos - start);
+        if (token.empty())
+            continue;
+
+        size_t dash = token.find('-');
+        if (dash != std::string::npos) {
+            std::string a_str = token.substr(0, dash);
+            std::string b_str = token.substr(dash + 1);
+            int a = -1, b = -1;
+            if (try_stoi(a, a_str) && try_stoi(b, b_str) &&
+                a >= 0 && b >= a && b <= 1024) {
+                for (int i = a; i <= b; ++i)
+                    out.push_back(i);
+            }
+        } else {
+            int id = -1;
+            if (try_stoi(id, token) && id >= 0 && id <= 1024)
+                out.push_back(id);
+        }
+    }
+}
+
+// policy*/scaling_cur_freq → 각 cpu_id 매핑
+static void android_probe_cpufreq_policies()
+{
+    if (g_cpufreq_policy_probed)
+        return;
+    g_cpufreq_policy_probed = true;
+
+    const char* base = "/sys/devices/system/cpu/cpufreq";
+    DIR* dir = opendir(base);
+    if (!dir) {
+        SPDLOG_DEBUG("cpufreq: failed to open {}", base);
+        return;
+    }
+
+    struct dirent* ent = nullptr;
+    int mapped = 0;
+
+    while ((ent = readdir(dir)) != nullptr) {
+        const char* name = ent->d_name;
+        if (strncmp(name, "policy", 6) != 0)
+            continue;
+
+        std::string policy_dir = std::string(base) + "/" + name;
+        std::string related_path = policy_dir + "/related_cpus";
+        std::ifstream rel(related_path);
+        if (!rel.is_open())
+            continue;
+
+        std::string line;
+        if (!std::getline(rel, line))
+            continue;
+
+        std::vector<int> cpus;
+        parse_cpu_list(line, cpus);
+        if (cpus.empty())
+            continue;
+
+        std::string scaling = policy_dir + "/scaling_cur_freq";
+        if (access(scaling.c_str(), R_OK) != 0)
+            continue;
+
+        for (int id : cpus) {
+            // 이미 매핑된 코어는 건드리지 않는다 (첫 policy 우선)
+            if (g_cpu_policy_scaling_path.find(id) == g_cpu_policy_scaling_path.end()) {
+                g_cpu_policy_scaling_path[id] = scaling;
+                mapped++;
+            }
+        }
+    }
+
+    closedir(dir);
+
+    if (mapped > 0) {
+        SPDLOG_DEBUG("cpufreq: mapped {} CPUs to policy scaling_cur_freq", mapped);
+    } else {
+        SPDLOG_DEBUG("cpufreq: no usable policy*/scaling_cur_freq found");
+    }
+}
+
 // ===== /proc/self/stat 기반 total CPU fallback =====
 
 static long g_clk_tck = 0;
@@ -630,22 +746,66 @@ bool CPUStats::UpdateCoreMhz() {
     }
     last_ts = now;
 
-    for (auto& cpu : m_cpuData) {
-        std::string path = "/sys/devices/system/cpu/cpu" +
-                           std::to_string(cpu.cpu_id) +
-                           "/cpufreq/scaling_cur_freq";
+    // policy*/scaling_cur_freq 매핑 1회 초기화
+    android_probe_cpufreq_policies();
 
+    bool used_policy   = false;
+    bool used_cpufreq  = false;
+
+    for (auto& cpu : m_cpuData) {
         int mhz = 0;
-        if ((fp = fopen(path.c_str(), "r"))) {
-            int64_t temp = 0;
-            if (fscanf(fp, "%" PRId64, &temp) != 1)
-                temp = 0;
-            fclose(fp);
-            mhz = static_cast<int>(temp / 1000);
+        std::string path;
+
+        // 1) policy 기반 scaling_cur_freq 우선
+        auto pit = g_cpu_policy_scaling_path.find(cpu.cpu_id);
+        if (pit != g_cpu_policy_scaling_path.end()) {
+            path = pit->second;
+            if ((fp = fopen(path.c_str(), "r"))) {
+                int64_t temp = 0;
+                if (fscanf(fp, "%" PRId64, &temp) != 1)
+                    temp = 0;
+                fclose(fp);
+                mhz = static_cast<int>(temp / 1000);
+                if (mhz > 0)
+                    used_policy = true;
+            }
+        }
+
+        // 2) policy에서 못 읽었으면 per-cpu 경로 폴백
+        if (mhz == 0) {
+            path = "/sys/devices/system/cpu/cpu" +
+                   std::to_string(cpu.cpu_id) +
+                   "/cpufreq/scaling_cur_freq";
+
+            if ((fp = fopen(path.c_str(), "r"))) {
+                int64_t temp = 0;
+                if (fscanf(fp, "%" PRId64, &temp) != 1)
+                    temp = 0;
+                fclose(fp);
+                mhz = static_cast<int>(temp / 1000);
+                if (mhz > 0)
+                    used_cpufreq = true;
+            }
         }
 
         cpu.mhz = mhz;
         m_coreMhz.push_back(mhz);
+    }
+
+    // ===== 한 방씩만 찍는 INFO 로그 =====
+    if (used_policy && !g_logged_policy_mhz) {
+        SPDLOG_INFO("Android CPU MHz: using cpufreq policy*/scaling_cur_freq as primary source");
+        g_logged_policy_mhz = true;
+    }
+
+    if (used_cpufreq && !g_logged_cpufreq_mhz) {
+        SPDLOG_INFO("Android CPU MHz: using cpu*/cpufreq/scaling_cur_freq as fallback source");
+        g_logged_cpufreq_mhz = true;
+    }
+
+    if (!used_policy && !used_cpufreq && !g_logged_mhz_missing) {
+        SPDLOG_INFO("Android CPU MHz: no readable cpufreq scaling_cur_freq, core MHz will remain 0");
+        g_logged_mhz_missing = true;
     }
 
 #else
