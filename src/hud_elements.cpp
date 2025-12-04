@@ -133,7 +133,7 @@ static ImPlotPoint frametime_implot_getter(int idx, void* user_data)
     const int samples = user_data ? *static_cast<int*>(user_data) : 0;
     auto* stats = HUDElements.sw_stats;
 
-    if (!stats || samples <= 0 || idx < 0 || idx >= samples)
+    if (!stats || samples <= 0)
         return ImPlotPoint(idx, 0.0);
 
     const int capacity = (int)ARRAY_SIZE(stats->frames_stats);
@@ -144,11 +144,19 @@ static ImPlotPoint frametime_implot_getter(int idx, void* user_data)
     if (total == 0)
         return ImPlotPoint(idx, 0.0);
 
+    // 아직 수집 안 된 영역이면 NaN 반환해서 라인 끊기
+    if (total < (uint64_t)capacity) {
+        if (idx >= (int)total)
+            return ImPlotPoint(idx, std::numeric_limits<double>::quiet_NaN());
+    }
+
     int ring_index = 0;
 
     if (total < (uint64_t)capacity) {
+        // 워밍업 구간: 0..total-1 그대로
         ring_index = idx;
     } else {
+        // 풀 링 버퍼 구간: oldest = total % capacity
         const int start = (int)(total % capacity);
         ring_index      = (start + idx) % capacity;
     }
@@ -1177,17 +1185,15 @@ void HudElements::frame_timing() {
                         ImPlot::SetupAxes(nullptr, nullptr, ax_flags_x, ax_flags_y);
                         ImPlot::SetupAxisScale(ImAxis_Y1, TransformForward_Custom, TransformInverse_Custom);
 
-                        if (samples <= 1) {
-                            ImPlot::SetupAxesLimits(0.0, 1.0,
-                                                    min_time, max_time,
-                                                    ImGuiCond_Always);
-                        } else {
-                            ImPlot::SetupAxesLimits(0.0, (double)(samples - 1),
-                                                    min_time, max_time,
-                                                    ImGuiCond_Always);
-                        }
-
-                        int plot_samples = samples;
+                        const int capacity = (int)ARRAY_SIZE(HUDElements.sw_stats->frames_stats);
+                        // ...
+                        double x_min = 0.0;
+                        double x_max = (capacity > 0) ? (double)(capacity - 1) : 1.0;
+                        
+                        ImPlot::SetupAxesLimits(x_min, x_max,
+                                                min_time, max_time,
+                                                ImGuiCond_Always);
+                                                int plot_samples = samples;
 
                         ImPlot::SetNextLineStyle(HUDElements.colors.frametime, 1.5f);
                         ImPlot::PlotLineG("frametime line",
