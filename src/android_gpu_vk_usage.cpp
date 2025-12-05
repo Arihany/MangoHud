@@ -9,6 +9,7 @@
 #include <spdlog/spdlog.h>
 
 // ====================== 내부 상태 ======================
+
 struct AndroidVkGpuContext {
     VkPhysicalDevice        phys_dev      = VK_NULL_HANDLE;
     VkDevice                device        = VK_NULL_HANDLE;
@@ -86,17 +87,17 @@ struct AndroidVkGpuContext {
     std::vector<VkCommandBufferSubmitInfo> scratch_cmd_infos; // 평면화된 pCommandBufferInfos
 };
 
+// [샘플링 전략] 짝수 프레임만 계측하여 오버헤드를 50%로 줄임
 static inline bool
 android_gpu_usage_should_sample(const AndroidVkGpuContext* ctx)
 {
     if (!ctx)
         return false;
-
-    // 짝수 프레임만 계측 (frame_index는 present 기준)
     return (ctx->frame_index & 1u) == 0u;
 }
 
 // ====================== 헬퍼: 타임스탬프 리소스 초기화 ======================
+
 static void
 android_gpu_usage_destroy_timestamp_resources(AndroidVkGpuContext* ctx)
 {
