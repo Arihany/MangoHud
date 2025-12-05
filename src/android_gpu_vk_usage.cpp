@@ -86,6 +86,16 @@ struct AndroidVkGpuContext {
     std::vector<VkCommandBufferSubmitInfo> scratch_cmd_infos; // 평면화된 pCommandBufferInfos
 };
 
+static inline bool
+android_gpu_usage_should_sample(const AndroidVkGpuContext* ctx)
+{
+    if (!ctx)
+        return false;
+
+    // 짝수 프레임만 계측 (frame_index는 present 기준)
+    return (ctx->frame_index & 1u) == 0u;
+}
+
 // ====================== 헬퍼: 타임스탬프 리소스 초기화 ======================
 static void
 android_gpu_usage_destroy_timestamp_resources(AndroidVkGpuContext* ctx)
@@ -552,6 +562,12 @@ android_gpu_usage_collect_frame_gpu_ms(AndroidVkGpuContext*            ctx,
         );
         return 0.0f;
     }
+
+    // 짝수 프레임만 계측하는 샘플링 보정:
+    // 계측 프레임이 전체의 절반이라고 가정하고 2배 스케일링
+    static constexpr double SAMPLE_SCALE = 2.0;
+    gpu_ms *= SAMPLE_SCALE;
+
     return static_cast<float>(gpu_ms);
 }
 
@@ -648,6 +664,12 @@ android_gpu_usage_queue_submit(AndroidVkGpuContext* ctx,
 
     // 타임스탬프 백엔드 비활성화 상태면 바로 패스스루
     if (!ctx->ts_supported) {
+        return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
+    }
+
+    // 짝수/홀수 프레임 샘플링:
+    // 이 프레임을 "비계측 프레임"으로 정했다면 완전 패스스루 (오버헤드 0)
+    if (!android_gpu_usage_should_sample(ctx)) {
         return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
     }
 
@@ -861,6 +883,12 @@ android_gpu_usage_queue_submit2(AndroidVkGpuContext* ctx,
 
     // 타임스탬프 미지원이면 그냥 패스스루
     if (!ctx->ts_supported) {
+        return fpSubmit2(queue, submitCount, pSubmits, fence);
+    }
+
+    // 짝수/홀수 프레임 샘플링:
+    // 이 프레임이 비계측 프레임이면 완전 패스스루
+    if (!android_gpu_usage_should_sample(ctx)) {
         return fpSubmit2(queue, submitCount, pSubmits, fence);
     }
 
