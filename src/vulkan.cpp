@@ -561,11 +561,35 @@ static uint32_t vk_memory_type(struct device_data *data,
                                uint32_t type_bits)
 {
     VkPhysicalDeviceMemoryProperties prop;
-    data->instance->vtable.GetPhysicalDeviceMemoryProperties(data->physical_device, &prop);
-    for (uint32_t i = 0; i < prop.memoryTypeCount; i++)
-        if ((prop.memoryTypes[i].propertyFlags & properties) == properties && type_bits & (1<<i))
+    data->instance->vtable.GetPhysicalDeviceMemoryProperties(
+        data->physical_device, &prop);
+
+    // 1) HOST_VISIBLE 요청이면, 먼저 HOST_CACHED 우선 탐색
+    if (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+        VkMemoryPropertyFlags preferred =
+            properties | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+        for (uint32_t i = 0; i < prop.memoryTypeCount; i++) {
+            if (!(type_bits & (1u << i)))
+                continue;
+
+            VkMemoryPropertyFlags flags = prop.memoryTypes[i].propertyFlags;
+            if ((flags & preferred) == preferred)
+                return i;
+        }
+    }
+
+    // 2) 기본 경로: 요청한 properties를 만족하는 아무 타입이나
+    for (uint32_t i = 0; i < prop.memoryTypeCount; i++) {
+        if (!(type_bits & (1u << i)))
+            continue;
+
+        VkMemoryPropertyFlags flags = prop.memoryTypes[i].propertyFlags;
+        if ((flags & properties) == properties)
             return i;
-    return 0xFFFFFFFF; // Unable to find memoryType
+    }
+
+    return 0xFFFFFFFF;
 }
 
 static void update_image_descriptor(struct swapchain_data *data, VkImageView image_view, VkDescriptorSet set)
