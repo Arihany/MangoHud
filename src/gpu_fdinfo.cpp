@@ -4,7 +4,11 @@
 #include "hud_elements.h"
 #endif
 
-#include <cstdlib> // std::getenv
+#include <cstdlib>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
 
 const std::vector<std::string> kIntelThrottlePower = {
     "reason_pl1",
@@ -739,7 +743,7 @@ void GPU_fdinfo::init_kgsl() {
     for (const auto& c : candidates) {
         for (const char* fname : c.names) {
             std::string p = sys_path + "/" + fname;
-
+    
             std::error_code ec;
             if (!fs::exists(p, ec) || ec) {
                 if (ec == std::errc::permission_denied) {
@@ -747,20 +751,28 @@ void GPU_fdinfo::init_kgsl() {
                 }
                 continue;
             }
-
+    
             SPDLOG_INFO("kgsl: using {} for {}", p, c.logical);
-
+    
             if (c.logical == std::string("clock")) {
-                gpu_clock_stream.open(p);
-                if (!gpu_clock_stream.good())
-                    SPDLOG_WARN("kgsl: failed to open {}", p);
+                // 경로만 저장, 나중에 필요하면 open/read
+                kgsl_clock_path = p;
             } else { // "busy"
-                auto& stream = kgsl_streams[c.logical];
-                stream.open(p);
-                if (!stream.good())
-                    SPDLOG_WARN("kgsl: failed to open {}", p);
+                kgsl_busy_path = p;
             }
-
+    
+            // 디버그용: 실제 low-level open이 되는지 한 번 체크
+            int fd = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
+            if (fd < 0) {
+                SPDLOG_WARN(
+                    "kgsl: low-level open({}) failed at init: errno={} ({})",
+                    p, errno, strerror(errno)
+                );
+            } else {
+                SPDLOG_DEBUG("kgsl: low-level open({}) succeeded at init", p);
+                ::close(fd);
+            }
+    
             break;
         }
     }
@@ -773,15 +785,33 @@ int GPU_fdinfo::get_kgsl_load() {
 }
 
 int GPU_fdinfo::get_kgsl_load_raw() {
-    auto it = kgsl_streams.find("busy");
-    if (it == kgsl_streams.end() || !it->second.is_open())
+    if (kgsl_busy_path.empty())
         return 0;
 
-    std::ifstream& s = it->second;
-    std::string line;
+    int fd = ::open(kgsl_busy_path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        SPDLOG_DEBUG(
+            "kgsl: open({}) failed in get_kgsl_load_raw: errno={} ({})",
+            kgsl_busy_path, errno, strerror(errno)
+        );
+        return 0;
+    }
 
-    s.seekg(0);
-    std::getline(s, line);
+    char buf[128];
+    ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
+    ::close(fd);
+
+    if (n <= 0)
+        return 0;
+
+    buf[n] = '\0';
+
+    std::string line(buf);
+
+    // 공백/개행 정리
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r' || line.back() == ' '))
+        line.pop_back();
+
     if (line.empty())
         return 0;
 
