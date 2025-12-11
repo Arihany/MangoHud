@@ -121,11 +121,7 @@ private:
     std::map<std::string, std::ifstream> kgsl_streams;
     void   init_kgsl();
     int    get_kgsl_load();
-    int    get_kgsl_temp();
     int    get_kgsl_load_raw();
-    double get_kgsl_freq_ratio();      // cur_freq / max_freq (0.0 ~ 1.0, fail: 0)
-    int    get_kgsl_load_effective();  // env
-    static int kgsl_freq_norm_mode;    // 0 = off, 1 = on
 
 public:
     GPU_fdinfo(
