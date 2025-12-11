@@ -61,11 +61,17 @@ apply_android_overlay_policy(struct overlay_params* params)
 
     params->enabled[OVERLAY_PARAM_ENABLED_gpu_power]          = 0;
     params->enabled[OVERLAY_PARAM_ENABLED_gpu_power_limit]    = 0;
+    params->enabled[OVERLAY_PARAM_ENABLED_cpu_power]          = 0;
+    params->enabled[OVERLAY_PARAM_ENABLED_gpu_voltage]        = 0;
+    params->enabled[OVERLAY_PARAM_ENABLED_cpu_efficiency]     = 0;
+    params->enabled[OVERLAY_PARAM_ENABLED_gpu_efficiency]     = 0;
+    params->enabled[OVERLAY_PARAM_ENABLED_flip_efficiency]    = 0;
 
     params->enabled[OVERLAY_PARAM_ENABLED_vram]               = 0;
     params->enabled[OVERLAY_PARAM_ENABLED_proc_vram]          = 0;
 
     params->enabled[OVERLAY_PARAM_ENABLED_gamemode]           = 0;
+    params->enabled[OVERLAY_PARAM_ENABLED_display_server]     = 0;
 }
 #endif
 
