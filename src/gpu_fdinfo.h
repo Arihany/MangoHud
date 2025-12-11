@@ -13,6 +13,7 @@
 #include <map>
 #include <set>
 #include <regex>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <mutex>
