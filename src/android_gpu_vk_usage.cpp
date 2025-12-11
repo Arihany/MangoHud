@@ -89,26 +89,32 @@ struct AndroidVkGpuContext {
 };
 
 // ====================== 환경 변수 플래그 ======================
+// MANGO_VKP 캐시: -1 = 미초기화, 0 = 비활성(기본: KGSL/fdinfo), 1 = Vulkan 백엔드 활성
 namespace {
-    // VKP_DISABLE 캐시: -1 = 미초기화, 0 = 사용, 1 = 비활성
-    bool android_gpu_usage_env_disabled()
+    bool android_gpu_usage_env_enabled()
     {
         static int cached = -1;
         if (cached != -1)
             return cached != 0;
 
-        const char* env = std::getenv("VKP_DISABLE");
+        const char* env = std::getenv("MANGO_VKP");
 
-        // unset / 빈 문자열 / "0" → 활성
+        // unset / 빈 문자열 / "0" → Vulkan 비활성 (KGSL + fdinfo가 기본)
         if (!env || !env[0] || env[0] == '0') {
             cached = 0;
-            SPDLOG_INFO("VKP_DISABLE not set or 0 -> Vulkan GPU usage backend enabled");
+            SPDLOG_INFO(
+                "MANGO_VKP not set or 0 -> Vulkan GPU usage backend disabled "
+                "(KGSL + fdinfo remains default)"
+            );
             return false;
         }
 
-        // 나머지 값은 전부 비활성 취급
+        // 그 외 값은 전부 활성 취급 (1, true, ... )
         cached = 1;
-        SPDLOG_INFO("VKP_DISABLE=\"{}\" -> Vulkan GPU usage backend disabled", env);
+        SPDLOG_INFO(
+            "MANGO_VKP=\"{}\" -> Vulkan GPU usage backend enabled (no KGSL fallback)",
+            env
+        );
         return true;
     }
 }
@@ -614,9 +620,12 @@ android_gpu_usage_create(VkPhysicalDevice            phys_dev,
     ctx->ts_period_ns  = (timestamp_period_ns > 0.0f) ? timestamp_period_ns : 0.0f;
     ctx->ts_valid_bits = timestamp_valid_bits;
 
-    if (android_gpu_usage_env_disabled()) {
-        ctx->ts_supported = false; // 어차피 기본값이긴 하지만 의미상 명시
-        SPDLOG_INFO("Android GPU usage: backend disabled via VKP_DISABLE, context will be no-op");
+    // MANGO_VKP unset/0 → Vulkan 경로 완전 비활성, KGSL/fdinfo만 사용
+    if (!android_gpu_usage_env_enabled()) {
+        ctx->ts_supported = false;
+        SPDLOG_INFO(
+            "Android GPU usage: backend disabled (MANGO_VKP unset/0), context will be no-op"
+        );
         return ctx;
     }
 
@@ -1142,7 +1151,7 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
     if (!ctx)
         return;
 
-    if (android_gpu_usage_env_disabled())
+    if (!android_gpu_usage_env_enabled())
         return;
     
     using clock = std::chrono::steady_clock;
@@ -1261,8 +1270,8 @@ android_gpu_usage_get_metrics(AndroidVkGpuContext* ctx,
     if (!ctx)
         return false;
 
-    // VKP_DISABLE=1
-    if (android_gpu_usage_env_disabled()) {
+    // MANGO_VKP=0/unset → Vulkan 경로 비활성
+    if (!android_gpu_usage_env_enabled()) {
         return false;  // out_* 건들지 않음
     }
 
