@@ -8,18 +8,6 @@ GPUS::GPUS() {
 
 #if defined(__ANDROID__)
 
-    // ANDROID:
-    // - /sys/class/drm, KGSL, hwmon 전부 무시.
-    // - Vulkan timestamp 백엔드에서 계산한 gpu_usage% / gpu_time_ms를
-    //   HUD에 뿌려주기 위한 "논리 GPU" 슬롯 1개만 등록한다.
-    //
-    //   실제 값 주입 경로:
-    //     vulkan.cpp::snapshot_swapchain_frame(...)
-    //       → android_gpu_usage_get_metrics(...)
-    //       → selected_gpus()[0]->metrics.load / gpu_time_ms 갱신.
-    //
-    //   여기서는 오직 "이름표"와 "슬롯"만 만든다.
-
     const std::string node_name = "android-vulkan";
     const std::string driver    = "vulkan_timestamp";
     const char*       pci_dev   = "";
@@ -40,7 +28,8 @@ GPUS::GPUS() {
     available_gpus.emplace_back(ptr);
 
     SPDLOG_INFO(
-        "Android: registered synthetic GPU node '{}' (driver={}) for Vulkan timestamp backend",
+        "Android: registered synthetic GPU node '{}' (driver={}), "
+        "metrics backend = Vulkan timestamps (VKP_DISABLE=0) or fdinfo/KGSL fallback (VKP_DISABLE!=0)",
         node_name,
         driver
     );
