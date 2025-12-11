@@ -7,6 +7,7 @@
 #include <limits>
 #include <cstdint>
 #include <spdlog/spdlog.h>
+#include <cstdlib>
 
 // ====================== 내부 상태 ======================
 
@@ -86,6 +87,31 @@ struct AndroidVkGpuContext {
     std::vector<VkSubmitInfo2>          scratch_wrapped2;     // 크기: submitCount
     std::vector<VkCommandBufferSubmitInfo> scratch_cmd_infos; // 평면화된 pCommandBufferInfos
 };
+
+// ====================== 환경 변수 플래그 ======================
+namespace {
+    // VKP_DISABLE 캐시: -1 = 미초기화, 0 = 사용, 1 = 비활성
+    bool android_gpu_usage_env_disabled()
+    {
+        static int cached = -1;
+        if (cached != -1)
+            return cached != 0;
+
+        const char* env = std::getenv("VKP_DISABLE");
+
+        // unset / 빈 문자열 / "0" → 활성
+        if (!env || !env[0] || env[0] == '0') {
+            cached = 0;
+            SPDLOG_INFO("VKP_DISABLE not set or 0 -> Vulkan GPU usage backend enabled");
+            return false;
+        }
+
+        // 나머지 값은 전부 비활성 취급
+        cached = 1;
+        SPDLOG_INFO("VKP_DISABLE=\"{}\" -> Vulkan GPU usage backend disabled", env);
+        return true;
+    }
+}
 
 // [샘플링 전략] 짝수 프레임만 계측하여 오버헤드를 50%로 줄임
 static inline bool
@@ -587,6 +613,12 @@ android_gpu_usage_create(VkPhysicalDevice            phys_dev,
     ctx->disp          = disp;
     ctx->ts_period_ns  = (timestamp_period_ns > 0.0f) ? timestamp_period_ns : 0.0f;
     ctx->ts_valid_bits = timestamp_valid_bits;
+
+    if (android_gpu_usage_env_disabled()) {
+        ctx->ts_supported = false; // 어차피 기본값이긴 하지만 의미상 명시
+        SPDLOG_INFO("Android GPU usage: backend disabled via VKP_DISABLE, context will be no-op");
+        return ctx;
+    }
 
     if (ctx->ts_valid_bits == 0 || ctx->ts_valid_bits >= 64) {
         ctx->ts_mask = ~0ULL;
@@ -1110,6 +1142,9 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
     if (!ctx)
         return;
 
+    if (android_gpu_usage_env_disabled())
+        return;
+    
     using clock = std::chrono::steady_clock;
     auto now = clock::now();
 
@@ -1225,6 +1260,14 @@ android_gpu_usage_get_metrics(AndroidVkGpuContext* ctx,
 {
     if (!ctx)
         return false;
+
+    if (android_gpu_usage_env_disabled()) {
+        if (out_gpu_ms)
+            *out_gpu_ms = 0.0f;
+        if (out_usage)
+            *out_usage  = 0.0f;
+        return true;
+    }
 
     std::lock_guard<std::mutex> g(ctx->lock);
 
