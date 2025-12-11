@@ -1173,25 +1173,25 @@ parse_overlay_config(struct overlay_params *params,
    if (!params->pci_dev.empty())
       params->pci_dev = verify_pci_dev(params->pci_dev);
 
-   {
-      std::lock_guard<std::mutex> lock(config_mtx);
-      config_ready = true;
-      config_cv.notify_one();
-   }
-   
-   auto snapshot = std::make_shared<overlay_params>(*params);
-   std::atomic_store_explicit(&g_params, std::move(snapshot), std::memory_order_release);
-   // add preset options
-   presets(current_preset, params);
-   // potentially override preset options with config options
-   parseConfigFile(*params);
+{
+   std::lock_guard<std::mutex> lock(config_mtx);
+   config_ready = true;
+   config_cv.notify_one();
+}
 
 #if defined(__ANDROID__)
    apply_android_overlay_policy(params);
 #endif
 
-   fps_limiter = std::make_unique<fpsLimiter>(params->fps_limit_method ? false : true);
+auto snapshot = std::make_shared<overlay_params>(*params);
+std::atomic_store_explicit(&g_params, std::move(snapshot), std::memory_order_release);
 
+// add preset options
+presets(current_preset, params);
+// potentially override preset options with config options
+parseConfigFile(*params);
+
+fps_limiter = std::make_unique<fpsLimiter>(params->fps_limit_method ? false : true);
 
    if (!gpus)
       gpus = std::make_unique<GPUS>();
