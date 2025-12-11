@@ -45,6 +45,30 @@
 #include "fps_metrics.h"
 #include "version.h"
 
+#if defined(__ANDROID__)
+static void
+apply_android_overlay_policy(struct overlay_params* params)
+{
+    if (!params)
+        return;
+
+    params->enabled[OVERLAY_PARAM_ENABLED_gpu_temp]           = 0;
+    params->enabled[OVERLAY_PARAM_ENABLED_gpu_junction_temp]  = 0;
+    params->enabled[OVERLAY_PARAM_ENABLED_gpu_mem_temp]       = 0;
+
+    params->enabled[OVERLAY_PARAM_ENABLED_fan]                = 0;
+    params->enabled[OVERLAY_PARAM_ENABLED_gpu_fan]            = 0;
+
+    params->enabled[OVERLAY_PARAM_ENABLED_gpu_power]          = 0;
+    params->enabled[OVERLAY_PARAM_ENABLED_gpu_power_limit]    = 0;
+
+    params->enabled[OVERLAY_PARAM_ENABLED_vram]               = 0;
+    params->enabled[OVERLAY_PARAM_ENABLED_proc_vram]          = 0;
+
+    params->enabled[OVERLAY_PARAM_ENABLED_gamemode]           = 0;
+}
+#endif
+
 std::unique_ptr<fpsMetrics> fpsmetrics;
 std::mutex config_mtx;
 std::condition_variable config_cv;
@@ -1162,7 +1186,12 @@ parse_overlay_config(struct overlay_params *params,
    // potentially override preset options with config options
    parseConfigFile(*params);
 
+#if defined(__ANDROID__)
+   apply_android_overlay_policy(params);
+#endif
+
    fps_limiter = std::make_unique<fpsLimiter>(params->fps_limit_method ? false : true);
+
 
    if (!gpus)
       gpus = std::make_unique<GPUS>();
