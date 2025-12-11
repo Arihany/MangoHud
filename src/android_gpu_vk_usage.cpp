@@ -1261,12 +1261,9 @@ android_gpu_usage_get_metrics(AndroidVkGpuContext* ctx,
     if (!ctx)
         return false;
 
+    // VKP_DISABLE=1
     if (android_gpu_usage_env_disabled()) {
-        if (out_gpu_ms)
-            *out_gpu_ms = 0.0f;
-        if (out_usage)
-            *out_usage  = 0.0f;
-        return true;
+        return false;  // out_* 건들지 않음
     }
 
     std::lock_guard<std::mutex> g(ctx->lock);
