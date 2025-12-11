@@ -4,7 +4,7 @@
 #include "hud_elements.h"
 #endif
 
-#include <cstdlib>
+#include <cstdlib> // std::getenv
 
 const std::vector<std::string> kIntelThrottlePower = {
     "reason_pl1",
@@ -27,7 +27,6 @@ namespace fs = ghc::filesystem;
 
 #if defined(__ANDROID__)
 namespace {
-    // VKP_DISABLE 캐시: -1 = 미초기화, 0 = Vulkan 사용, 1 = Vulkan 비활성
     bool fdinfo_vkp_disabled()
     {
         static int cached = -1;
@@ -36,16 +35,14 @@ namespace {
 
         const char* env = std::getenv("VKP_DISABLE");
 
-        // unset / 빈 문자열 / "0" → Vulkan backend 사용, fdinfo/kgsl는 보조
         if (!env || !env[0] || env[0] == '0') {
             cached = 0;
             SPDLOG_INFO(
-                "GPU_fdinfo: VKP_DISABLE not set or 0 -> prefer Vulkan timestamp backend (fdinfo/KGSL idle)"
+                "GPU_fdinfo: VKP_DISABLE not set or 0 -> prefer Vulkan backend (fdinfo/KGSL idle)"
             );
             return false;
         }
 
-        // 나머지는 전부 "Vulkan 끄고 fdinfo/KGSL 폴백 켜기"
         cached = 1;
         SPDLOG_INFO(
             "GPU_fdinfo: VKP_DISABLE=\"{}\" -> enabling fdinfo + KGSL fallback backend",
@@ -115,12 +112,18 @@ void GPU_fdinfo::find_fd()
             );
         }
 
+#if defined(__ANDROID__)
+        if (driver.empty() || client_id.empty() ||
+            client_ids.find(client_id) != client_ids.end())
+            continue;
+#else
         if (
             driver.empty() || client_id.empty() ||
             driver != module || pdev != pci_dev ||
             client_ids.find(client_id) != client_ids.end()
         )
             continue;
+#endif
 
         client_ids.insert(client_id);
         open_fdinfo_fd(fd_path);
@@ -809,14 +812,13 @@ int GPU_fdinfo::get_kgsl_load_raw() {
 
 void GPU_fdinfo::main_thread()
 {
-    // 최소 500ms 이상으로 강제
     constexpr int MIN_INTERVAL_MS = 500;
     const int interval_ms = std::max(METRICS_UPDATE_PERIOD_MS, MIN_INTERVAL_MS);
 
 #if defined(__ANDROID__)
-    const bool use_fdinfo_kgsl = fdinfo_vkp_disabled();
+    const bool use_fdinfo_kgsl = fdinfo_vkp_disabled(); // VKP_DISABLE 헬퍼 (아래 설명)
 
-    // Vulkan backend 활성 상태 → 예전처럼 Android는 idle 유지
+    // VKP_DISABLE=0 → Vulkan이 메인, 여기선 idle 유지
     if (!use_fdinfo_kgsl) {
         SPDLOG_INFO(
             "GPU_fdinfo main thread: Android idle (Vulkan timestamp backend active)"
@@ -835,18 +837,15 @@ void GPU_fdinfo::main_thread()
         return;
     }
 
-    // 여기로 왔다는 건 VKP_DISABLE=1 등 → Vulkan 백엔드 죽었고,
-    // fdinfo + KGSL가 GPU load의 메인 소스가 된다.
+    // VKP_DISABLE=1 → fdinfo + KGSL 폴백 활성
     SPDLOG_INFO(
         "GPU_fdinfo main thread: VKP_DISABLE set -> fdinfo + KGSL fallback path enabled"
     );
 
     bool kgsl_inited = false;
-    const bool is_android_freedreno = (module == "msm_drm" || module == "msm_dpu");
 
     while (!stop_thread) {
         {
-            // pause / resume 동기화
             std::unique_lock<std::mutex> lock(metrics_mutex);
             cond_var.wait(lock, [this]() { return !paused || stop_thread; });
             if (stop_thread)
@@ -854,14 +853,13 @@ void GPU_fdinfo::main_thread()
         }
 
 #ifndef TEST_ONLY
-        // gamescope가 있으면 대상 PID 교체 (기존 로직 그대로)
         if (HUDElements.g_gamescopePid > 0 && HUDElements.g_gamescopePid != pid) {
             pid = HUDElements.g_gamescopePid;
             find_fd();
         }
 #endif
 
-        // 10초마다 fdinfo 리스캔 → "기존 루팅 계열 1차 경로"
+        // 10초마다 fdinfo 리스캔 (루팅/특권 환경 1차 경로)
         {
             auto t = os_time_get_nano() / 1'000'000;
             if (t - fdinfo_last_update_ms >= 10'000) {
@@ -873,9 +871,8 @@ void GPU_fdinfo::main_thread()
         // fdinfo 파싱
         gather_fdinfo_data();
 
-        // ========= 1차: 기존 fdinfo 기반 GPU load =========
+        // ===== 1차: fdinfo 기반 load (루팅/특권 용) =====
         int load = 0;
-
         if (!fdinfo_data.empty()) {
             if (module == "xe")
                 load = get_xe_load();
@@ -883,35 +880,27 @@ void GPU_fdinfo::main_thread()
                 load = get_gpu_load();
         }
 
-        // ========= 2차: KGSL gpubusy 폴백 =========
-        // - Freedreno 계열(msm_drm/msm_dpu)이고
-        // - fdinfo 기반 load가 0이거나 이상하면 KGSL로 대체
-        if ((load <= 0 || load > 100) && is_android_freedreno) {
+        // ===== 2차: KGSL gpubusy 폴백 =====
+        if (load <= 0 || load > 100) {
             if (!kgsl_inited) {
                 init_kgsl();
                 kgsl_inited = true;
             }
 
-            int kgsl_load = get_kgsl_load();  // gpubusy or gpu_busy_percentage
+            int kgsl_load = get_kgsl_load();
             if (kgsl_load >= 0 && kgsl_load <= 100)
                 load = kgsl_load;
         }
 
         metrics.load           = load;
-        metrics.proc_vram_used = get_memory_used();   // fdinfo 기반, 안 나오면 0
+        metrics.proc_vram_used = get_memory_used();
+        metrics.CoreClock      = get_gpu_clock(); // KGSL clock 있으면 이걸 씀
 
-        // Power 쪽은 이미 Android에서 get_power_usage()가 0 리턴하게 막혀있음
-        metrics.powerUsage = get_power_usage();
+        // Android: 온도/전력은 사실상 무의미 → 0 또는 기존 값 유지
+        metrics.powerUsage = get_power_usage();   // 이미 Android에서 0 반환
         metrics.powerLimit =
             static_cast<float>(hwmon_sensors["power_limit"].val) / 1'000'000;
 
-        // GPU 클럭:
-        // - i915/xe면 기존 fdinfo 클럭
-        // - Freedreno면 init_kgsl()에서 clock 파일을 열었으니 get_gpu_clock()이 재사용
-        metrics.CoreClock = get_gpu_clock();
-        metrics.voltage   = hwmon_sensors["voltage"].val;
-
-        // Android msm_drm/msm_dpu는 현재 temp 읽을 방법이 없으니 0 고정
         if (module == "msm_drm" || module == "msm_dpu") {
             metrics.temp = 0.0f;
         } else {
@@ -919,9 +908,8 @@ void GPU_fdinfo::main_thread()
         }
 
         metrics.memory_temp = hwmon_sensors["vram_temp"].val / 1000.f;
-
-        metrics.fan_speed = hwmon_sensors["fan_speed"].val;
-        metrics.fan_rpm   = true; // hwmon 기준
+        metrics.fan_speed   = hwmon_sensors["fan_speed"].val;
+        metrics.fan_rpm     = true;
 
         int throttling = get_throttling_status();
         metrics.is_power_throttled   = throttling & GPU_throttle_status::POWER;
@@ -937,7 +925,6 @@ void GPU_fdinfo::main_thread()
         std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
     }
 #else
-    // ★ 여기 아래 비-안드로이드 루프는 기존 코드 그대로 유지 ★
     while (!stop_thread) {
         {
             std::unique_lock<std::mutex> lock(metrics_mutex);
