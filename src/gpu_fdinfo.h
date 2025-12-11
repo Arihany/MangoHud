@@ -119,6 +119,8 @@ private:
 
     // Android / KGSL backend
     std::map<std::string, std::ifstream> kgsl_streams;
+    std::string kgsl_busy_path;
+    std::string kgsl_clock_path;
     void   init_kgsl();
     int    get_kgsl_load();
     int    get_kgsl_load_raw();
