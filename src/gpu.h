@@ -16,6 +16,7 @@
 #include "nvidia.h"
 #include "gpu_metrics_util.h"
 #include "gpu_fdinfo.h"
+#include <cstdlib>
 
 class GPU {
     public:
@@ -30,24 +31,47 @@ class GPU {
         uint32_t device_id = 0;
         const std::string driver;
 
-        GPU(
-            std::string drm_node, uint32_t vendor_id, uint32_t device_id, const char* pci_dev,
-            std::string driver
-        )
-            : drm_node(drm_node), pci_dev(pci_dev), vendor_id(vendor_id), device_id(device_id),
-            driver(driver) {
-                if (vendor_id == 0x10de)
-                    nvidia = std::make_unique<NVIDIA>(pci_dev);
+GPU(
+    std::string drm_node, uint32_t vendor_id, uint32_t device_id, const char* pci_dev,
+    std::string driver
+)
+    : drm_node(drm_node), pci_dev(pci_dev), vendor_id(vendor_id), device_id(device_id),
+      driver(driver)
+{
+    if (vendor_id == 0x10de)
+        nvidia = std::make_unique<NVIDIA>(pci_dev);
 
-                if (vendor_id == 0x1002)
-                    amdgpu = std::make_unique<AMDGPU>(pci_dev, device_id, vendor_id);
+    if (vendor_id == 0x1002)
+        amdgpu = std::make_unique<AMDGPU>(pci_dev, device_id, vendor_id);
 
-                if (
-                    driver == "i915" || driver == "xe" || driver == "panfrost" ||
-                    driver == "msm_dpu" || driver == "msm_drm"
-                )
-                    fdinfo = std::make_unique<GPU_fdinfo>(driver, pci_dev, drm_node);
+#if defined(__ANDROID__)
+    // ANDROID:
+    // - GPUS::GPUS()에서 synthetic node:
+    //     drm_node = "android-vulkan"
+    //     driver   = "vulkan_timestamp"
+    //
+    // - VKP_DISABLE=0  : Vulkan timestamp backend 전용 (fdinfo/KGSL 사용 안 함)
+    // - VKP_DISABLE!=0 : Vulkan backend 비활성, fdinfo + KGSL fallback 활성
+    if (driver == "vulkan_timestamp") {
+        const char* env = std::getenv("VKP_DISABLE");
+        bool vkp_disabled =
+            env && env[0] != '\0' && env[0] != '0';
+
+        if (vkp_disabled) {
+            // GPU_fdinfo 쪽에는 "msm_drm" 모듈로 넘겨서:
+            // - find_fd(): Android 브랜치에서 module 무시하고 fdinfo 스캔
+            // - init_kgsl(): /sys/class/kgsl/kgsl-3d0 기반 gpubusy 폴백 활성
+            fdinfo = std::make_unique<GPU_fdinfo>("msm_drm", "", drm_node);
         }
+    } else
+#endif
+    if (
+        driver == "i915" || driver == "xe" || driver == "panfrost" ||
+        driver == "msm_dpu" || driver == "msm_drm"
+    ) {
+        fdinfo = std::make_unique<GPU_fdinfo>(driver, pci_dev, drm_node);
+    }
+}
 
         gpu_metrics get_metrics() {
             if (nvidia) {
