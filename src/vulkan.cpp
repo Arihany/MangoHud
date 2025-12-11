@@ -151,6 +151,10 @@ struct overlay_draw {
    VkBuffer index_buffer;
    VkDeviceMemory index_buffer_mem;
    VkDeviceSize index_buffer_size;
+
+   // 영구매핑 포인터
+   void* vertex_mapped = nullptr;
+   void* index_mapped  = nullptr;
 };
 
 /* Mapped from VkSwapchainKHR */
@@ -817,8 +821,17 @@ static void CreateOrResizeBuffer(struct device_data *data,
                                  VkBuffer *buffer,
                                  VkDeviceMemory *buffer_memory,
                                  VkDeviceSize *buffer_size,
-                                 size_t new_size, VkBufferUsageFlagBits usage)
+                                 size_t new_size,
+                                 VkBufferUsageFlagBits usage,
+                                 void** mapped_ptr)
 {
+    if (*buffer_memory) {
+        if (mapped_ptr && *mapped_ptr) {
+            data->vtable.UnmapMemory(data->device, *buffer_memory);
+            *mapped_ptr = nullptr;
+        }
+    }
+
     if (*buffer != VK_NULL_HANDLE)
         data->vtable.DestroyBuffer(data->device, *buffer, NULL);
     if (*buffer_memory)
@@ -848,7 +861,17 @@ static void CreateOrResizeBuffer(struct device_data *data,
 
     VK_CHECK(data->vtable.BindBufferMemory(data->device, *buffer, *buffer_memory, 0));
     *buffer_size = new_size;
+
+    if (mapped_ptr) {
+        VK_CHECK(data->vtable.MapMemory(data->device,
+                                        *buffer_memory,
+                                        0,
+                                        *buffer_size,
+                                        0,
+                                        mapped_ptr));
+    }
 }
+
 
 static struct overlay_draw *render_swapchain_display(struct swapchain_data *data,
                                                      struct queue_data *present_queue,
@@ -910,48 +933,58 @@ static struct overlay_draw *render_swapchain_display(struct swapchain_data *data
                                           VK_SUBPASS_CONTENTS_INLINE);
 
    /* Create/Resize vertex & index buffers */
-   size_t vertex_size = draw_data->TotalVtxCount * sizeof(ImDrawVert);
-   size_t index_size = draw_data->TotalIdxCount * sizeof(ImDrawIdx);
-   if (draw->vertex_buffer_size < vertex_size) {
-      CreateOrResizeBuffer(device_data,
-                           &draw->vertex_buffer,
-                           &draw->vertex_buffer_mem,
-                           &draw->vertex_buffer_size,
-                           vertex_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-   }
-   if (draw->index_buffer_size < index_size) {
-      CreateOrResizeBuffer(device_data,
-                           &draw->index_buffer,
-                           &draw->index_buffer_mem,
-                           &draw->index_buffer_size,
-                           index_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+size_t vertex_size = draw_data->TotalVtxCount * sizeof(ImDrawVert);
+size_t index_size  = draw_data->TotalIdxCount * sizeof(ImDrawIdx);
+
+if (draw->vertex_buffer_size < vertex_size) {
+   CreateOrResizeBuffer(device_data,
+                        &draw->vertex_buffer,
+                        &draw->vertex_buffer_mem,
+                        &draw->vertex_buffer_size,
+                        vertex_size,
+                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                        &draw->vertex_mapped);
+}
+
+if (draw->index_buffer_size < index_size) {
+   CreateOrResizeBuffer(device_data,
+                        &draw->index_buffer,
+                        &draw->index_buffer_mem,
+                        &draw->index_buffer_size,
+                        index_size,
+                        VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                        &draw->index_mapped);
+}
+
+/* Upload vertex & index data (persistent mapped) */
+ImDrawVert* vtx_dst = static_cast<ImDrawVert*>(draw->vertex_mapped);
+ImDrawIdx*  idx_dst = static_cast<ImDrawIdx*>(draw->index_mapped);
+
+// 맵핑 실패 상태라면 그냥 그 프레임 HUD 스킵해도 됨
+if (!vtx_dst || !idx_dst) {
+   SPDLOG_WARN("MangoHud: vertex/index buffer not mapped; skipping HUD draw");
+} else {
+   for (int n = 0; n < draw_data->CmdListsCount; n++)
+   {
+      const ImDrawList* cmd_list = draw_data->CmdLists[n];
+      memcpy(vtx_dst, cmd_list->VtxBuffer.Data,
+             cmd_list->VtxBuffer.Size * sizeof(ImDrawVert));
+      memcpy(idx_dst, cmd_list->IdxBuffer.Data,
+             cmd_list->IdxBuffer.Size * sizeof(ImDrawIdx));
+      vtx_dst += cmd_list->VtxBuffer.Size;
+      idx_dst += cmd_list->IdxBuffer.Size;
    }
 
-   /* Upload vertex & index data */
-   ImDrawVert* vtx_dst = NULL;
-   ImDrawIdx* idx_dst = NULL;
-   VK_CHECK(device_data->vtable.MapMemory(device_data->device, draw->vertex_buffer_mem,
-                                          0, draw->vertex_buffer_size, 0, (void**)(&vtx_dst)));
-   VK_CHECK(device_data->vtable.MapMemory(device_data->device, draw->index_buffer_mem,
-                                          0, draw->index_buffer_size, 0, (void**)(&idx_dst)));
-   for (int n = 0; n < draw_data->CmdListsCount; n++)
-      {
-         const ImDrawList* cmd_list = draw_data->CmdLists[n];
-         memcpy(vtx_dst, cmd_list->VtxBuffer.Data, cmd_list->VtxBuffer.Size * sizeof(ImDrawVert));
-         memcpy(idx_dst, cmd_list->IdxBuffer.Data, cmd_list->IdxBuffer.Size * sizeof(ImDrawIdx));
-         vtx_dst += cmd_list->VtxBuffer.Size;
-         idx_dst += cmd_list->IdxBuffer.Size;
-      }
    VkMappedMemoryRange range[2] = {};
-   range[0].sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+   range[0].sType  = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
    range[0].memory = draw->vertex_buffer_mem;
-   range[0].size = VK_WHOLE_SIZE;
-   range[1].sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+   range[0].size   = VK_WHOLE_SIZE;
+   range[1].sType  = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
    range[1].memory = draw->index_buffer_mem;
-   range[1].size = VK_WHOLE_SIZE;
+   range[1].size   = VK_WHOLE_SIZE;
    VK_CHECK(device_data->vtable.FlushMappedMemoryRanges(device_data->device, 2, range));
-   device_data->vtable.UnmapMemory(device_data->device, draw->vertex_buffer_mem);
-   device_data->vtable.UnmapMemory(device_data->device, draw->index_buffer_mem);
+   // Unmap은 절대 하지 않는다.
+}
 
    /* Bind pipeline and descriptor sets */
    device_data->vtable.CmdBindPipeline(draw->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, data->pipeline);
@@ -1515,12 +1548,24 @@ static void shutdown_swapchain_font(struct swapchain_data *data)
    device_data->vtable.FreeMemory(device_data->device, data->upload_font_buffer_mem, NULL);
 }
 
+
+
 static void shutdown_swapchain_data(struct swapchain_data *data)
 {
    struct device_data *device_data = data->device;
 
    for (auto draw : data->draws) {
       if (!draw) continue;
+   
+      // 영구 매핑 해제
+      if (draw->vertex_mapped) {
+         device_data->vtable.UnmapMemory(device_data->device, draw->vertex_buffer_mem);
+         draw->vertex_mapped = nullptr;
+      }
+      if (draw->index_mapped) {
+         device_data->vtable.UnmapMemory(device_data->device, draw->index_buffer_mem);
+         draw->index_mapped = nullptr;
+      }
       device_data->vtable.FreeCommandBuffers(device_data->device, data->command_pool, 1, &draw->command_buffer);
       device_data->vtable.DestroySemaphore(device_data->device, draw->cross_engine_semaphore, NULL);
       device_data->vtable.DestroySemaphore(device_data->device, draw->semaphore, NULL);
