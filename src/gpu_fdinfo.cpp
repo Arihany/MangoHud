@@ -31,25 +31,25 @@ namespace fs = ghc::filesystem;
 
 #if defined(__ANDROID__)
 namespace {
-    bool fdinfo_vkp_disabled()
+    bool mango_vkp_enabled()
     {
         static int cached = -1;
         if (cached != -1)
             return cached != 0;
 
-        const char* env = std::getenv("VKP_DISABLE");
+        const char* env = std::getenv("MANGO_VKP");
 
         if (!env || !env[0] || env[0] == '0') {
             cached = 0;
             SPDLOG_INFO(
-                "GPU_fdinfo: VKP_DISABLE not set or 0 -> prefer Vulkan backend (fdinfo/KGSL idle)"
+                "GPU_fdinfo: MANGO_VKP not set or 0 -> use KGSL + fdinfo backend as default"
             );
             return false;
         }
 
         cached = 1;
         SPDLOG_INFO(
-            "GPU_fdinfo: VKP_DISABLE=\"{}\" -> enabling fdinfo + KGSL fallback backend",
+            "GPU_fdinfo: MANGO_VKP=\"{}\" -> Vulkan timestamp backend active (no KGSL fallback)",
             env
         );
         return true;
@@ -846,12 +846,13 @@ void GPU_fdinfo::main_thread()
     const int interval_ms = std::max(METRICS_UPDATE_PERIOD_MS, MIN_INTERVAL_MS);
 
 #if defined(__ANDROID__)
-    const bool use_fdinfo_kgsl = fdinfo_vkp_disabled(); // VKP_DISABLE 헬퍼 (아래 설명)
+    const bool use_vkp_backend = mango_vkp_enabled(); // MANGO_VKP=1 → Vulkan backend
 
-    // VKP_DISABLE=0 → Vulkan이 메인, 여기선 idle 유지
-    if (!use_fdinfo_kgsl) {
+    // MANGO_VKP=1 → Vulkan timestamp 백엔드 전담, 여기선 idle 유지 (폴백 없음)
+    if (use_vkp_backend) {
         SPDLOG_INFO(
-            "GPU_fdinfo main thread: Android idle (Vulkan timestamp backend active)"
+            "GPU_fdinfo main thread: Android idle "
+            "(MANGO_VKP=1, Vulkan timestamp backend active, no KGSL fallback)"
         );
 
         while (!stop_thread) {
@@ -867,9 +868,9 @@ void GPU_fdinfo::main_thread()
         return;
     }
 
-    // VKP_DISABLE=1 → fdinfo + KGSL 폴백 활성
+    // 기본값: KGSL gpubusy → 안되면 fdinfo
     SPDLOG_INFO(
-        "GPU_fdinfo main thread: VKP_DISABLE set -> fdinfo + KGSL fallback path enabled"
+        "GPU_fdinfo main thread: Android KGSL + fdinfo backend active (default)"
     );
 
     bool kgsl_inited = false;
@@ -889,7 +890,7 @@ void GPU_fdinfo::main_thread()
         }
 #endif
 
-        // 10초마다 fdinfo 리스캔 (루팅/특권 환경 1차 경로)
+        // 10초마다 fdinfo 리스캔
         {
             auto t = os_time_get_nano() / 1'000'000;
             if (t - fdinfo_last_update_ms >= 10'000) {
@@ -898,36 +899,34 @@ void GPU_fdinfo::main_thread()
             }
         }
 
-        // fdinfo 파싱
+        // fdinfo 파싱 (VRAM, 일부 드라이버용 load에 필요)
         gather_fdinfo_data();
 
-        // ===== 1차: fdinfo 기반 load (루팅/특권 용) =====
+        // ===== 1차: KGSL gpubusy 기반 load =====
         int load = 0;
-        if (!fdinfo_data.empty()) {
+        if (!kgsl_inited) {
+            init_kgsl();
+            kgsl_inited = true;
+        }
+
+        int kgsl_load = get_kgsl_load();
+        if (kgsl_load >= 0 && kgsl_load <= 100)
+            load = kgsl_load;
+
+        // ===== 2차: fdinfo 기반 load (KGSL가 없거나 0/비정상이면) =====
+        if ((load <= 0 || load > 100) && !fdinfo_data.empty()) {
             if (module == "xe")
                 load = get_xe_load();
             else
                 load = get_gpu_load();
         }
 
-        // ===== 2차: KGSL gpubusy 폴백 =====
-        if (load <= 0 || load > 100) {
-            if (!kgsl_inited) {
-                init_kgsl();
-                kgsl_inited = true;
-            }
-
-            int kgsl_load = get_kgsl_load();
-            if (kgsl_load >= 0 && kgsl_load <= 100)
-                load = kgsl_load;
-        }
-
         metrics.load           = load;
         metrics.proc_vram_used = get_memory_used();
-        metrics.CoreClock      = get_gpu_clock(); // KGSL clock 있으면 이걸 씀
+        metrics.CoreClock      = get_gpu_clock(); // KGSL clock 있으면 내부에서 처리 가능
 
-        // Android: 온도/전력은 사실상 무의미 → 0 또는 기존 값 유지
-        metrics.powerUsage = get_power_usage();   // 이미 Android에서 0 반환
+        // Android: power는 get_power_usage()가 이미 0 리턴
+        metrics.powerUsage = get_power_usage();
         metrics.powerLimit =
             static_cast<float>(hwmon_sensors["power_limit"].val) / 1'000'000;
 
@@ -955,6 +954,7 @@ void GPU_fdinfo::main_thread()
         std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
     }
 #else
+    // 기존 non-Android 경로 그대로 유지
     while (!stop_thread) {
         {
             std::unique_lock<std::mutex> lock(metrics_mutex);
@@ -979,7 +979,6 @@ void GPU_fdinfo::main_thread()
         }
 
         gather_fdinfo_data();
-
         get_current_hwmon_readings();
 
         metrics.load           = get_gpu_load();
