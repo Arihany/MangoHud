@@ -90,7 +90,8 @@ struct FrameResources {
 };
 
 // ====================== 환경 변수 플래그 ======================
-// MANGO_VKP 캐시: -1 = 미초기화, 0 = 비활성(기본: KGSL/fdinfo), 1 = Vulkan 백엔드 활성
+// 정책: 기본 OFF(fdinfo + kgsl 사용). 오직 MANGOHUD_VKP=1 일 때만 Vulkan timestamp 백엔드 ON.
+// 캐시: -1 = 미초기화, 0 = 비활성, 1 = 활성
 namespace {
     bool android_gpu_usage_env_enabled()
     {
@@ -98,24 +99,21 @@ namespace {
         if (cached != -1)
             return cached != 0;
 
-        const char* env = std::getenv("MANGO_VKP");
+        const char* env = std::getenv("MANGOHUD_VKP");
 
-        // unset / 빈 문자열 / "0" → Vulkan 비활성 (KGSL + fdinfo가 기본)
-        if (!env || !env[0] || env[0] == '0') {
-            cached = 0;
+        // 오직 "1"만 활성. 그 외(unset/빈문자/"0"/"true"/"yes"/뭐든) 전부 비활성.
+        const bool enabled = (env && env[0] == '1' && env[1] == '\0');
+
+        cached = enabled ? 1 : 0;
+
+        if (!enabled) {
             SPDLOG_INFO(
-                "MANGO_VKP not set or 0 -> Vulkan GPU usage backend disabled "
-                "(KGSL + fdinfo remains default)"
+                "MANGOHUD_VKP!=1 -> Vulkan GPU usage backend disabled (fdinfo + kgsl remains default)"
             );
             return false;
         }
 
-        // 그 외 값은 전부 활성 취급 (1, true, ... )
-        cached = 1;
-        SPDLOG_INFO(
-            "MANGO_VKP=\"{}\" -> Vulkan GPU usage backend enabled (no KGSL fallback)",
-            env
-        );
+        SPDLOG_INFO("MANGOHUD_VKP=1 -> Vulkan GPU usage backend enabled");
         return true;
     }
 }
@@ -192,6 +190,13 @@ android_gpu_usage_init_timestamp_resources(AndroidVkGpuContext* ctx,
     if (vb == 0) {
         SPDLOG_WARN("Android GPU usage: queue family {} has timestampValidBits=0 -> disabling", queue_family_index);
         ctx->ts_supported.store(false, std::memory_order_relaxed);
+        return false;
+    }
+
+    // [ACCURACY GUARD] 게임/렌더링 계측 목적이면 그래픽 큐를 우선한다.
+    // 그래픽 비트 없는 큐를 첫 init 대상으로 잡아버리면 "프레임" 계측이 삐끗하기 쉽다.
+    if ((qf[queue_family_index].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0) {
+        SPDLOG_DEBUG("Android GPU usage: queue family {} is not GRAPHICS -> skip init", queue_family_index);
         return false;
     }
 
@@ -450,8 +455,10 @@ android_gpu_usage_query_range_gpu_ms(AndroidVkGpuContext* ctx,
         !ctx->disp.GetQueryPoolResults)
         return AndroidGpuReadStatus::Error;
 
+    // query_count는 (start,end) 페어라서 항상 2의 배수여야 한다.
+    // 깨졌다는 건 "아직 준비 안 됨"이 아니라 내부 상태 오염이므로 Error로 보내서 슬롯을 폐기하게 한다.
     if (query_count < 2 || (query_count & 1u))
-        return AndroidGpuReadStatus::NotReady;
+        return AndroidGpuReadStatus::Error;
 
     thread_local std::vector<uint64_t> scratch;
     const uint32_t needed_u64 = query_count * 2u;
@@ -599,11 +606,11 @@ android_gpu_usage_create(VkPhysicalDevice            phys_dev,
     ctx->ts_period_ns  = (timestamp_period_ns > 0.0f) ? timestamp_period_ns : 0.0f;
     ctx->ts_valid_bits = timestamp_valid_bits;
 
-    // MANGO_VKP unset/0 → Vulkan 경로 완전 비활성, KGSL/fdinfo만 사용
+    // 정책: 기본 OFF. MANGOHUD_VKP=1일 때만 Vulkan 경로 활성.
     if (!android_gpu_usage_env_enabled()) {
         ctx->ts_supported = false;
         SPDLOG_INFO(
-            "Android GPU usage: backend disabled (MANGO_VKP unset/0), context will be no-op"
+            "Android GPU usage: backend disabled (MANGOHUD_VKP!=1), context will be no-op"
         );
         return ctx;
     }
@@ -699,12 +706,21 @@ android_gpu_usage_queue_submit(AndroidVkGpuContext* ctx,
             ? ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence)
             : VK_ERROR_INITIALIZATION_FAILED;
 
+    if (!android_gpu_usage_env_enabled())
+        return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
+
     if (!ctx->ts_supported.load(std::memory_order_relaxed))
         return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
 
     // fast-path: 샘플링 안 하는 프레임이면 락을 아예 안 잡는다
     if (!android_gpu_usage_should_sample(ctx))
         return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
+
+    // [ROLLBACK GUARD] 예외로 빠져도 슬롯이 오염(제출 안 된 query)되지 않게 복구한다.
+    AndroidVkGpuContext::FrameResources* fr_ptr = nullptr;
+    uint64_t serial_snapshot = 0;
+    uint32_t saved_query_used = 0;
+    bool     saved_has_queries = false;
 
     try {
         std::lock_guard<std::mutex> g(ctx->lock);
@@ -728,16 +744,15 @@ android_gpu_usage_queue_submit(AndroidVkGpuContext* ctx,
         }
 
         const uint32_t curr_idx = (uint32_t)(frame_serial % AndroidVkGpuContext::MAX_FRAMES);
-        auto& fr = ctx->frames[curr_idx];
+        serial_snapshot = frame_serial;
+        fr_ptr = &ctx->frames[curr_idx];
+        auto& fr = *fr_ptr;
 
         if (!android_gpu_usage_begin_frame(ctx, curr_idx, frame_serial))
             return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
 
-        // [ROLLBACK SNAPSHOT]
-        // 아래에서 timestamp pair를 일부 커밋한 뒤 submit이 실패/예외로 빠지면
-        // "제출 안 된 쿼리"가 슬롯에 남아 NotReady가 길게 이어질 수 있다.
-        const uint32_t saved_query_used  = fr.query_used;
-        const bool     saved_has_queries = fr.has_queries;
+        saved_query_used  = fr.query_used;
+        saved_has_queries = fr.has_queries;
         
         auto& wrapped  = ctx->scratch_wrapped;
         auto& flat_cbs = ctx->scratch_cmds;
@@ -849,13 +864,25 @@ android_gpu_usage_queue_submit(AndroidVkGpuContext* ctx,
         return vr;
     } catch (const std::exception& e) {
         SPDLOG_WARN("Android GPU usage: queue_submit exception: {}", e.what());
-        // 예외로 빠질 때도 슬롯 오염 방지
-        std::lock_guard<std::mutex> g(ctx->lock);
-        // fr에 접근하려면 포인터로 잡아두는 방식이 깔끔하지만,
-        // 최소 변경을 원하면 위 스냅샷 구간부터 fr 포인터를 바깥 스코프로 빼라.
+        // [ROLLBACK GUARD] 예외로 빠졌으면, 계측 슬롯 상태를 가능한 한 원복한다.
+        if (ctx && fr_ptr) {
+            std::lock_guard<std::mutex> g(ctx->lock);
+            // 같은 serial 슬롯일 때만 되돌린다 (레이스/프레임 진행 중 오염 방지)
+            if (!ctx->destroying && fr_ptr->frame_serial == serial_snapshot) {
+                fr_ptr->query_used  = saved_query_used;
+                fr_ptr->has_queries = saved_has_queries;
+            }
+        }
         return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
     } catch (...) {
         SPDLOG_WARN("Android GPU usage: queue_submit unknown exception");
+        if (ctx && fr_ptr) {
+            std::lock_guard<std::mutex> g(ctx->lock);
+            if (!ctx->destroying && fr_ptr->frame_serial == serial_snapshot) {
+                fr_ptr->query_used  = saved_query_used;
+                fr_ptr->has_queries = saved_has_queries;
+            }
+        }
         return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
     }
 }
@@ -881,12 +908,21 @@ android_gpu_usage_queue_submit2(AndroidVkGpuContext* ctx,
         return fpSubmit2 ? fpSubmit2(queue, submitCount, pSubmits, fence)
                          : VK_ERROR_INITIALIZATION_FAILED;
 
+    if (!android_gpu_usage_env_enabled())
+        return fpSubmit2(queue, submitCount, pSubmits, fence);
+
     if (!ctx->ts_supported.load(std::memory_order_relaxed))
         return fpSubmit2(queue, submitCount, pSubmits, fence);
 
     // fast-path: 샘플링 안 하는 프레임이면 락을 아예 안 잡는다
     if (!android_gpu_usage_should_sample(ctx))
         return fpSubmit2(queue, submitCount, pSubmits, fence);
+
+    // [ROLLBACK GUARD] 예외/실패로 “제출 안 된 query”가 슬롯에 남지 않게 복구한다.
+    AndroidVkGpuContext::FrameResources* fr_ptr = nullptr;
+    uint64_t serial_snapshot = 0;
+    uint32_t saved_query_used = 0;
+    bool     saved_has_queries = false;
 
     try {
         std::lock_guard<std::mutex> g(ctx->lock);
@@ -908,16 +944,15 @@ android_gpu_usage_queue_submit2(AndroidVkGpuContext* ctx,
         }
 
         const uint32_t curr_idx = (uint32_t)(frame_serial % AndroidVkGpuContext::MAX_FRAMES);
-        auto& fr = ctx->frames[curr_idx];
+        serial_snapshot = frame_serial;
+        fr_ptr = &ctx->frames[curr_idx];
+        auto& fr = *fr_ptr;
 
         if (!android_gpu_usage_begin_frame(ctx, curr_idx, frame_serial))
             return fpSubmit2(queue, submitCount, pSubmits, fence);
 
-        // [ROLLBACK SNAPSHOT]
-        // 아래에서 timestamp pair를 일부 커밋한 뒤 submit이 실패/예외로 빠지면
-        // "제출 안 된 쿼리"가 슬롯에 남아 NotReady가 길게 이어질 수 있다.
-        const uint32_t saved_query_used  = fr.query_used;
-        const bool     saved_has_queries = fr.has_queries;
+        saved_query_used  = fr.query_used;
+        saved_has_queries = fr.has_queries;
         
         auto& wrapped2 = ctx->scratch_wrapped2;
         auto& infos    = ctx->scratch_cmd_infos;
@@ -1043,9 +1078,23 @@ android_gpu_usage_queue_submit2(AndroidVkGpuContext* ctx,
         return vr;
     } catch (const std::exception& e) {
         SPDLOG_WARN("Android GPU usage: queue_submit2 exception: {}", e.what());
+        if (ctx && fr_ptr) {
+            std::lock_guard<std::mutex> g(ctx->lock);
+            if (!ctx->destroying && fr_ptr->frame_serial == serial_snapshot) {
+                fr_ptr->query_used  = saved_query_used;
+                fr_ptr->has_queries = saved_has_queries;
+            }
+        }
         return fpSubmit2(queue, submitCount, pSubmits, fence);
     } catch (...) {
         SPDLOG_WARN("Android GPU usage: queue_submit2 unknown exception");
+        if (ctx && fr_ptr) {
+            std::lock_guard<std::mutex> g(ctx->lock);
+            if (!ctx->destroying && fr_ptr->frame_serial == serial_snapshot) {
+                fr_ptr->query_used  = saved_query_used;
+                fr_ptr->has_queries = saved_has_queries;
+            }
+        }
         return fpSubmit2(queue, submitCount, pSubmits, fence);
     }
 }
@@ -1299,9 +1348,9 @@ android_gpu_usage_get_metrics(AndroidVkGpuContext* ctx,
     if (!ctx)
         return false;
 
-    // MANGO_VKP=0/unset → Vulkan 경로 비활성
+    // MANGOHUD_VKP!=1 이면 Vulkan 경로 비활성 (out_* 건들지 않음)
     if (!android_gpu_usage_env_enabled()) {
-        return false;  // out_* 건들지 않음
+        return false;
     }
 
     std::lock_guard<std::mutex> g(ctx->lock);
