@@ -325,8 +325,11 @@ android_gpu_usage_begin_frame(AndroidVkGpuContext* ctx,
         // 다음 사용 시 각 pair에서 vkCmdResetQueryPool을 하기 때문에 재사용 안전성은 유지된다.
         SPDLOG_DEBUG("Android GPU usage: stale slot (serial={} age={}) -> drop slot to avoid stall",
                      fr.frame_serial, age);
+
+        // [PATCH] 슬롯을 폐기했으면 이번 호출에서 바로 재사용한다.
+        // query는 pair-local vkCmdResetQueryPool로 항상 초기화하므로 "오염" 없이 재측정 가능.
         android_gpu_usage_consume_slot(fr);
-        return false;
+        // fallthrough: 아래에서 fr.frame_serial = frame_serial로 재초기화 진행
     }
 
     fr.frame_serial = frame_serial;
@@ -771,9 +774,19 @@ android_gpu_usage_queue_submit(AndroidVkGpuContext* ctx,
         uint32_t tmp_used   = fr.query_used;
         bool any_inst = false;
 
+        // [PATCH] "프레임당 계측 상한"을 진짜로 지키기 위한 계산.
+        // 같은 frame_serial에서 queue_submit이 여러 번 호출될 수 있으므로
+        // fr.query_used(=이미 커밋된 pair 수)를 기준으로 "남은 예산"을 계산해야 한다.        
         constexpr uint32_t MAX_PAIRS_PER_SAMPLED_FRAME = 16;
-        const uint32_t pair_budget =
-            std::min<uint32_t>(MAX_PAIRS_PER_SAMPLED_FRAME, fr.query_capacity / 2u);
+
+        const uint32_t used_pairs = fr.query_used / 2u; // start/end 2개가 1 pair
+        const uint32_t hard_cap   = std::min<uint32_t>(
+            MAX_PAIRS_PER_SAMPLED_FRAME,
+            fr.query_capacity / 2u
+        );
+
+        const uint32_t remaining_budget =
+            (used_pairs < hard_cap) ? (hard_cap - used_pairs) : 0u;
 
         uint32_t planned_pairs = 0;
 
@@ -782,8 +795,9 @@ android_gpu_usage_queue_submit(AndroidVkGpuContext* ctx,
             const uint32_t base = src.commandBufferCount;
 
             const bool basic_ok = (base > 0) && src.pCommandBuffers && (fr.cmd_pool != VK_NULL_HANDLE);
-            const bool room_ok  = (planned_pairs < pair_budget) &&
-                                  (fr.query_used + (planned_pairs + 1u) * 2u <= fr.query_capacity);
+            const bool room_ok  =
+                (planned_pairs < remaining_budget) &&
+                (fr.query_used + (planned_pairs + 1u) * 2u <= fr.query_capacity);
 
             const bool can = basic_ok && room_ok;
 
@@ -971,10 +985,19 @@ android_gpu_usage_queue_submit2(AndroidVkGpuContext* ctx,
         uint32_t tmp_used    = fr.query_used;
         bool any_inst = false;
 
-        // 샘플 프레임당 계측 submit 상한 (오버헤드 방지)
-        constexpr uint32_t MAX_PAIRS_PER_SAMPLED_FRAME = 16; // 필요하면 32로
-        const uint32_t pair_budget =
-            std::min<uint32_t>(MAX_PAIRS_PER_SAMPLED_FRAME, fr.query_capacity / 2u);
+        // [PATCH] "프레임당 계측 상한"을 진짜로 지키기 위한 계산.
+        // 같은 frame_serial에서 queue_submit이 여러 번 호출될 수 있으므로
+        // fr.query_used(=이미 커밋된 pair 수)를 기준으로 "남은 예산"을 계산해야 한다.
+        constexpr uint32_t MAX_PAIRS_PER_SAMPLED_FRAME = 16;
+
+        const uint32_t used_pairs = fr.query_used / 2u; // start/end 2개가 1 pair
+        const uint32_t hard_cap   = std::min<uint32_t>(
+            MAX_PAIRS_PER_SAMPLED_FRAME,
+            fr.query_capacity / 2u
+        );
+
+        const uint32_t remaining_budget =
+            (used_pairs < hard_cap) ? (hard_cap - used_pairs) : 0u;
 
         uint32_t planned_pairs = 0;
 
@@ -983,8 +1006,9 @@ android_gpu_usage_queue_submit2(AndroidVkGpuContext* ctx,
             const uint32_t base = src.commandBufferInfoCount;
 
             const bool basic_ok = (base > 0) && src.pCommandBufferInfos && (fr.cmd_pool != VK_NULL_HANDLE);
-            const bool room_ok  = (planned_pairs < pair_budget) &&
-                                  (fr.query_used + (planned_pairs + 1u) * 2u <= fr.query_capacity);
+            const bool room_ok  =
+                (planned_pairs < remaining_budget) &&
+                (fr.query_used + (planned_pairs + 1u) * 2u <= fr.query_capacity);
 
             const bool can = basic_ok && room_ok;
 
