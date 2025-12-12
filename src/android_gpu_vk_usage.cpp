@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <spdlog/spdlog.h>
 #include <cstdlib>
+#include <atomic>
 
 // ====================== 내부 상태 ======================
 
@@ -19,7 +20,7 @@ struct AndroidVkGpuContext {
     float                   ts_period_ns  = 0.0f;   // ns per tick
     uint32_t                ts_valid_bits = 0;
     uint64_t                ts_mask       = ~0ULL;
-    bool                    ts_supported  = false;
+    std::atomic<bool>       ts_supported{false};
 
     VkQueryPool             query_pool    = VK_NULL_HANDLE;
     uint32_t                queue_family_index = VK_QUEUE_FAMILY_IGNORED;
@@ -30,44 +31,30 @@ struct AndroidVkGpuContext {
     static constexpr uint32_t FRAME_LAG             = 3;    // 몇 프레임 뒤에 슬롯을 읽고 해제할지
     static constexpr uint32_t WARMUP_TIMESTAMP_PAIRS= 8;    // 프레임당 미리 확보할 timestamp pair 수
 
-    struct FrameResources {
-        VkCommandPool   cmd_pool        = VK_NULL_HANDLE;
-        VkCommandBuffer reset_cmd       = VK_NULL_HANDLE;
-
-        uint32_t        query_start     = 0;   // 이 슬롯의 쿼리 시작 인덱스
-        uint32_t        query_capacity  = 0;   // MAX_QUERIES_PER_FRAME
-        uint32_t        query_used      = 0;   // 현재까지 사용한 쿼리 수 (짝수, 2개씩)
-
-        bool            reset_recorded  = false; // reset_cmd 안에 CmdResetQueryPool 녹화 여부
-        bool            reset_submitted = false; // 이번 프레임에 reset_cmd를 실제 submit에 포함했는지
-        bool            has_queries     = false; // 이 슬롯에 계측된 submit이 하나라도 있는지
-
-        // 이 슬롯이 마지막으로 사용된 frame serial
-        uint64_t        frame_serial    = std::numeric_limits<uint64_t>::max();
-
-        // 타임스탬프용 커맨드 버퍼 재사용용
-        // [2*i]   = begin CB
-        // [2*i+1] = end CB
-        std::vector<VkCommandBuffer> timestamp_cmds;
-    };
+struct FrameResources {
+    VkCommandPool   cmd_pool        = VK_NULL_HANDLE;
+    uint32_t        query_start     = 0;
+    uint32_t        query_capacity  = 0;
+    uint32_t        query_used      = 0;
+    bool            has_queries     = false;
+    uint64_t        frame_serial    = std::numeric_limits<uint64_t>::max();
+    std::vector<VkCommandBuffer> timestamp_cmds;
+};
 
     FrameResources          frames[MAX_FRAMES]{};
-
-    // present 기준 frame serial (QueueSubmit는 "현재 serial"을 사용)
-    uint64_t                frame_index   = 0;
-
-    // 쿼리 결과용 스크래치 버퍼 (value + availability 쌍)
-    // 최대: MAX_QUERIES_PER_FRAME * 2 * sizeof(uint64_t)
-    std::vector<uint64_t>   query_scratch;
+    std::atomic<uint64_t>   frame_index{0};
 
     // CPU/GPU 사용률 + smoothing용 상태
     std::mutex                                      lock;
     std::chrono::steady_clock::time_point           last_present{};   // 마지막 present 시각
 
     std::chrono::steady_clock::time_point           window_start{};   // smoothing 윈도우 시작 시각
-    double                                          acc_gpu_ms  = 0.0;
-    double                                          acc_cpu_ms  = 0.0;
-    uint32_t                                        acc_frames  = 0;
+    double                                          acc_cpu_ms_sampled = 0.0;
+    uint32_t                                        acc_frames_sampled = 0;
+    double                                          acc_gpu_ms     = 0.0;   // "회수 성공한" GPU ms만 누적
+    double                                          acc_cpu_ms     = 0.0;   // 모든 프레임의 CPU ms 누적
+    uint32_t                                        acc_frames     = 0;     // 모든 프레임 카운트
+    uint32_t                                        acc_gpu_samples= 0;     // GPU 측정 회수 성공 카운트
 
     float                                           smooth_gpu_ms = 0.0f;
     float                                           smooth_usage  = 0.0f;
@@ -86,6 +73,9 @@ struct AndroidVkGpuContext {
     // ===== queue_submit2용 scratch 버퍼 (vkQueueSubmit2) =====
     std::vector<VkSubmitInfo2>          scratch_wrapped2;     // 크기: submitCount
     std::vector<VkCommandBufferSubmitInfo> scratch_cmd_infos; // 평면화된 pCommandBufferInfos
+    struct CpuSample { uint64_t serial; float ms; };
+    static constexpr uint32_t CPU_RING = 64; // 16보다 크게 (NotReady 오래가도 안전)
+    CpuSample cpu_ring[CPU_RING]{};
 };
 
 // ====================== 환경 변수 플래그 ======================
@@ -125,7 +115,8 @@ android_gpu_usage_should_sample(const AndroidVkGpuContext* ctx)
 {
     if (!ctx)
         return false;
-    return (ctx->frame_index & 1u) == 0u;
+    const uint64_t fi = ctx->frame_index.load(std::memory_order_relaxed);
+    return (fi & 1u) == 0u;
 }
 
 // ====================== 헬퍼: 타임스탬프 리소스 초기화 ======================
@@ -136,22 +127,25 @@ android_gpu_usage_destroy_timestamp_resources(AndroidVkGpuContext* ctx)
     if (!ctx || ctx->device == VK_NULL_HANDLE)
         return;
 
-    if (ctx->disp.DestroyCommandPool) {
-        for (uint32_t i = 0; i < AndroidVkGpuContext::MAX_FRAMES; ++i) {
-            auto& fr = ctx->frames[i];
-            if (fr.cmd_pool != VK_NULL_HANDLE) {
-                ctx->disp.DestroyCommandPool(ctx->device, fr.cmd_pool, nullptr);
-                fr.cmd_pool   = VK_NULL_HANDLE;
-                fr.reset_cmd  = VK_NULL_HANDLE;
-                fr.timestamp_cmds.clear();
-            }
+if (ctx->disp.DestroyCommandPool) {
+    for (uint32_t i = 0; i < AndroidVkGpuContext::MAX_FRAMES; ++i) {
+        auto& fr = ctx->frames[i];
+        if (fr.cmd_pool != VK_NULL_HANDLE) {
+            ctx->disp.DestroyCommandPool(ctx->device, fr.cmd_pool, nullptr);
+            fr.cmd_pool = VK_NULL_HANDLE;
+            fr.timestamp_cmds.clear();
         }
+        fr.query_used   = 0;
+        fr.has_queries  = false;
+        fr.frame_serial = std::numeric_limits<uint64_t>::max();
     }
+}
 
     if (ctx->query_pool != VK_NULL_HANDLE && ctx->disp.DestroyQueryPool) {
         ctx->disp.DestroyQueryPool(ctx->device, ctx->query_pool, nullptr);
         ctx->query_pool = VK_NULL_HANDLE;
     }
+    ctx->queue_family_index = VK_QUEUE_FAMILY_IGNORED;
 }
 
 static bool
@@ -221,11 +215,8 @@ android_gpu_usage_init_timestamp_resources(AndroidVkGpuContext* ctx,
         fr.query_start    = i * AndroidVkGpuContext::MAX_QUERIES_PER_FRAME;
         fr.query_capacity = AndroidVkGpuContext::MAX_QUERIES_PER_FRAME;
         fr.query_used     = 0;
-        fr.reset_recorded = false;
-        fr.reset_submitted= false;
         fr.has_queries    = false;
         fr.frame_serial   = std::numeric_limits<uint64_t>::max();
-        fr.reset_cmd      = VK_NULL_HANDLE;
         fr.timestamp_cmds.clear();
 
         // Warm-up: 프레임당 소량의 timestamp CB pair 미리 확보
@@ -264,15 +255,9 @@ android_gpu_usage_init_timestamp_resources(AndroidVkGpuContext* ctx,
         AndroidVkGpuContext::MAX_QUERIES_PER_FRAME
     );
 
-    ctx->query_scratch.clear();
-    ctx->query_scratch.resize(
-        AndroidVkGpuContext::MAX_QUERIES_PER_FRAME * 2u
-    );
-
     return true;
 }
 
-// 슬롯 시작: 재사용 가능성 체크 + 초기화
 static bool
 android_gpu_usage_begin_frame(AndroidVkGpuContext* ctx,
                               uint32_t frame_idx,
@@ -280,92 +265,49 @@ android_gpu_usage_begin_frame(AndroidVkGpuContext* ctx,
 {
     auto& fr = ctx->frames[frame_idx];
 
-    // 이미 이 frame_serial에 대해 초기화된 슬롯이면 그대로 사용
+    // 같은 프레임 serial이면(한 프레임 내 다중 submit) 계속 사용
     if (fr.frame_serial == frame_serial)
         return true;
 
-    // 이전에 사용된 적 있고, 너무 "가까운" 프레임이면 재사용 금지
+    // 아직 결과를 회수 못한 슬롯이면 덮어쓰지 않는다(정확도 핵심)
+    // 단, 너무 오래(=링 한 바퀴 이상) 미회수면 계측이 영구 정지될 수 있으니 강제 드랍 안전장치.
+    if (fr.has_queries && fr.frame_serial != std::numeric_limits<uint64_t>::max()) {
+        uint64_t age = (frame_serial > fr.frame_serial)
+            ? (frame_serial - fr.frame_serial)
+            : std::numeric_limits<uint64_t>::max();
+
+        if (age < AndroidVkGpuContext::MAX_FRAMES) {
+            return false; // 이번 프레임은 계측 포기(패스스루)
+        }
+
+        // 강제 드랍(드문 케이스): 드라이버가 availability를 영원히 안 주는 식이면 여기로 온다.
+        SPDLOG_DEBUG("Android GPU usage: dropping stale pending slot (serial={} age={})",
+                     fr.frame_serial, age);
+        fr.has_queries  = false;
+        fr.query_used   = 0;
+        fr.frame_serial = std::numeric_limits<uint64_t>::max();
+    }
+
+    // 너무 가까운 프레임이면 재사용 금지(기존 정책 유지)
     if (fr.frame_serial != std::numeric_limits<uint64_t>::max()) {
         uint64_t age = (frame_serial > fr.frame_serial)
-                           ? (frame_serial - fr.frame_serial)
-                           : std::numeric_limits<uint64_t>::max();
+            ? (frame_serial - fr.frame_serial)
+            : std::numeric_limits<uint64_t>::max();
 
-        if (age < AndroidVkGpuContext::FRAME_LAG) {
-            // 아직 이 슬롯의 결과를 읽지 않았거나, GPU가 완전히 끝났는지 보장 불가
+        if (age < AndroidVkGpuContext::FRAME_LAG)
             return false;
-        }
     }
 
-    fr.frame_serial   = frame_serial;
-    fr.query_used     = 0;
-    fr.reset_recorded = false;
-    fr.reset_submitted= false;
-    fr.has_queries    = false;
+    fr.frame_serial = frame_serial;
+    fr.query_used   = 0;
+    fr.has_queries  = false;
 
-    bool has_any_cb =
-        fr.reset_cmd != VK_NULL_HANDLE ||
-        !fr.timestamp_cmds.empty();
-    
-    if (ctx->disp.ResetCommandPool && fr.cmd_pool != VK_NULL_HANDLE && has_any_cb) {
-        ctx->disp.ResetCommandPool(
-            ctx->device,
-            fr.cmd_pool,
-            0
-        );
+    // timestamp CB가 하나라도 있으면 커맨드풀 리셋
+    if (ctx->disp.ResetCommandPool && fr.cmd_pool != VK_NULL_HANDLE &&
+        !fr.timestamp_cmds.empty()) {
+        ctx->disp.ResetCommandPool(ctx->device, fr.cmd_pool, 0);
     }
 
-    return true;
-}
-
-// 이 슬롯에서 쿼리 리셋용 커맨드 버퍼 녹화 (핸들은 1회만 할당, 이후 재녹화)
-static bool
-android_gpu_usage_ensure_reset_cmd(AndroidVkGpuContext*            ctx,
-                                   AndroidVkGpuContext::FrameResources& fr)
-{
-    if (fr.reset_recorded)
-        return true;
-
-    if (!ctx->disp.AllocateCommandBuffers ||
-        !ctx->disp.BeginCommandBuffer ||
-        !ctx->disp.EndCommandBuffer ||
-        !ctx->disp.CmdResetQueryPool)
-        return false;
-
-    VkCommandBuffer cmd = fr.reset_cmd;
-
-    // 최초 한 번만 할당
-    if (cmd == VK_NULL_HANDLE) {
-        VkCommandBufferAllocateInfo ai{};
-        ai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        ai.commandPool        = fr.cmd_pool;
-        ai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        ai.commandBufferCount = 1;
-
-        if (ctx->disp.AllocateCommandBuffers(ctx->device, &ai, &cmd) != VK_SUCCESS)
-            return false;
-
-        fr.reset_cmd = cmd;
-    }
-
-    VkCommandBufferBeginInfo bi{};
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-    if (ctx->disp.BeginCommandBuffer(cmd, &bi) != VK_SUCCESS)
-        return false;
-
-    // 이 슬롯의 쿼리 범위 전체를 리셋
-    ctx->disp.CmdResetQueryPool(
-        cmd,
-        ctx->query_pool,
-        fr.query_start,
-        fr.query_capacity
-    );
-
-    if (ctx->disp.EndCommandBuffer(cmd) != VK_SUCCESS)
-        return false;
-
-    fr.reset_recorded = true;
     return true;
 }
 
@@ -377,12 +319,15 @@ android_gpu_usage_record_timestamp_pair(AndroidVkGpuContext*            ctx,
                                         VkCommandBuffer&                out_cmd_begin,
                                         VkCommandBuffer&                out_cmd_end)
 {
+    if (!ctx->query_pool)
+        return false;
+    
     if (!ctx->disp.AllocateCommandBuffers ||
         !ctx->disp.BeginCommandBuffer ||
         !ctx->disp.EndCommandBuffer ||
+        !ctx->disp.CmdResetQueryPool ||
         !ctx->disp.CmdWriteTimestamp)
         return false;
-
     // 쿼리 2개(start/end) 남았는지 확인
     if (fr.query_used + 2 > fr.query_capacity)
         return false;
@@ -423,17 +368,18 @@ android_gpu_usage_record_timestamp_pair(AndroidVkGpuContext*            ctx,
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
-    // begin CB: Start timestamp
+    // begin CB: (pair-local) reset + start timestamp
     if (ctx->disp.BeginCommandBuffer(out_cmd_begin, &bi) != VK_SUCCESS)
         return false;
-
-    ctx->disp.CmdWriteTimestamp(
-        out_cmd_begin,
+    
+    // 이 submit이 사용할 2개 쿼리만 reset (프레임 전체 reset_cmd 제거)
+    ctx->disp.CmdResetQueryPool(out_cmd_begin, ctx->query_pool, query_first, 2);
+    
+    ctx->disp.CmdWriteTimestamp(out_cmd_begin,
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
         ctx->query_pool,
-        query_first
-    );
-
+        query_first);
+    
     if (ctx->disp.EndCommandBuffer(out_cmd_begin) != VK_SUCCESS)
         return false;
 
@@ -459,149 +405,149 @@ android_gpu_usage_record_timestamp_pair(AndroidVkGpuContext*            ctx,
     return true;
 }
 
-// 특정 슬롯에 대해 GPU time(ms) 합산 + 슬롯 해제
+enum class AndroidGpuReadStatus : uint8_t {
+    Ready,
+    NotReady,
+    Error,
+    DeviceLost
+};
+
+static AndroidGpuReadStatus
+android_gpu_usage_query_range_gpu_ms(AndroidVkGpuContext* ctx,
+                                     uint32_t query_start,
+                                     uint32_t query_count,
+                                     float* out_gpu_ms)
+{
+    if (!ctx || !out_gpu_ms || !ctx->ts_supported || !ctx->query_pool || !ctx->disp.GetQueryPoolResults)
+        return AndroidGpuReadStatus::Error;
+
+    if (query_count < 2 || (query_count & 1u))
+        return AndroidGpuReadStatus::NotReady;
+
+    thread_local std::vector<uint64_t> scratch;
+    const uint32_t needed_u64 = query_count * 2u;
+    if (scratch.size() < needed_u64)
+        scratch.resize(needed_u64);
+
+    VkResult r = ctx->disp.GetQueryPoolResults(
+        ctx->device,
+        ctx->query_pool,
+        query_start,
+        query_count,
+        needed_u64 * sizeof(uint64_t),
+        scratch.data(),
+        sizeof(uint64_t) * 2,
+        VK_QUERY_RESULT_64_BIT |
+        VK_QUERY_RESULT_WITH_AVAILABILITY_BIT
+    );
+
+    if (r == VK_ERROR_DEVICE_LOST)
+        return AndroidGpuReadStatus::DeviceLost;
+    if (r < 0)
+        return AndroidGpuReadStatus::Error;
+
+    const uint32_t pair_count = query_count / 2u;
+
+    // 핵심: 하나라도 avail=0이면 NotReady. 부분 결과로 계산하지 않는다.
+    for (uint32_t i = 0; i < pair_count; ++i) {
+        const uint32_t qs = 2u * i;
+        const uint32_t qe = qs + 1u;
+        const uint64_t as = scratch[qs * 2u + 1u];
+        const uint64_t ae = scratch[qe * 2u + 1u];
+        if (!as || !ae)
+            return AndroidGpuReadStatus::NotReady;
+    }
+
+    uint64_t min_start_ts = std::numeric_limits<uint64_t>::max();
+    uint64_t max_end_ts   = 0;
+    double   sum_ms       = 0.0;
+
+    for (uint32_t i = 0; i < pair_count; ++i) {
+        const uint32_t qs = 2u * i;
+        const uint32_t qe = qs + 1u;
+
+        uint64_t start_ts = scratch[qs * 2u + 0u] & ctx->ts_mask;
+        uint64_t end_ts   = scratch[qe * 2u + 0u] & ctx->ts_mask;
+
+        if (ctx->ts_valid_bits > 0 && ctx->ts_valid_bits < 64 && end_ts < start_ts)
+            end_ts += (1ULL << ctx->ts_valid_bits);
+
+        if (end_ts <= start_ts)
+            continue;
+
+        if (start_ts < min_start_ts) min_start_ts = start_ts;
+        if (end_ts > max_end_ts)     max_end_ts   = end_ts;
+
+        const uint64_t delta = end_ts - start_ts;
+        const double ns = double(delta) * double(ctx->ts_period_ns);
+        const double ms = ns * 1e-6;
+        if (ms > 0.0 && std::isfinite(ms))
+            sum_ms += ms;
+    }
+
+    double range_ms = 0.0;
+    if (max_end_ts > min_start_ts && min_start_ts != std::numeric_limits<uint64_t>::max()) {
+        const uint64_t range_ticks = max_end_ts - min_start_ts;
+        range_ms = double(range_ticks) * double(ctx->ts_period_ns) * 1e-6;
+    }
+
+    // GPU usage(바쁨) 용도면 sum_ms가 더 정직하다.
+    double gpu_ms = 0.0;
+    if (sum_ms > 0.0 && std::isfinite(sum_ms)) gpu_ms = sum_ms;
+    else if (range_ms > 0.0 && std::isfinite(range_ms)) gpu_ms = range_ms;
+
+    if (!(gpu_ms > 0.0) || !std::isfinite(gpu_ms))
+        return AndroidGpuReadStatus::Error;
+
+    *out_gpu_ms = (float)gpu_ms;
+    return AndroidGpuReadStatus::Ready;
+}
+
+static inline void
+android_gpu_usage_consume_slot(AndroidVkGpuContext::FrameResources& fr)
+{
+    fr.has_queries  = false;
+    fr.query_used   = 0;
+    fr.frame_serial = std::numeric_limits<uint64_t>::max();
+}
+
 static float
-android_gpu_usage_collect_frame_gpu_ms(AndroidVkGpuContext*            ctx,
+android_gpu_usage_collect_frame_gpu_ms(AndroidVkGpuContext* ctx,
                                        AndroidVkGpuContext::FrameResources& fr)
 {
     if (!ctx || !ctx->ts_supported || !ctx->query_pool)
         return 0.0f;
 
-    if (!ctx->disp.GetQueryPoolResults)
-        return 0.0f;
-
     if (!fr.has_queries || fr.query_used < 2)
         return 0.0f;
 
-    const uint32_t query_count = fr.query_used;
-    const uint32_t pair_count  = query_count / 2;
-
-    // 방어적 체크: 설계상 여기 걸리면 버그다
-    if (query_count > AndroidVkGpuContext::MAX_QUERIES_PER_FRAME)
-        return 0.0f;
-
-    // 스크래치 버퍼 크기 보장
-    const uint32_t needed_u64 = query_count * 2u;
-    if (ctx->query_scratch.size() < needed_u64) {
-        ctx->query_scratch.resize(needed_u64);
-    }
-
-    uint64_t* data = ctx->query_scratch.data();
-
-    VkResult r = ctx->disp.GetQueryPoolResults(
-        ctx->device,
-        ctx->query_pool,
-        fr.query_start,
-        query_count,
-        needed_u64 * sizeof(uint64_t),
-        data,
-        sizeof(uint64_t) * 2,
-        VK_QUERY_RESULT_64_BIT |
-        VK_QUERY_RESULT_WITH_AVAILABILITY_BIT
-        // WAIT_BIT 제거: 결과 안 나왔으면 avail 플래그로 구분
+    float gpu_ms = 0.0f;
+    const auto st = android_gpu_usage_query_range_gpu_ms(
+        ctx, fr.query_start, fr.query_used, &gpu_ms
     );
 
-    if (r == VK_ERROR_DEVICE_LOST) {
+    if (st == AndroidGpuReadStatus::DeviceLost) {
         SPDLOG_WARN("Android GPU usage: DEVICE_LOST on GetQueryPoolResults, disabling timestamp backend");
         ctx->ts_supported = false;
-        fr.has_queries    = false;
-        fr.query_used     = 0;
-        fr.frame_serial   = std::numeric_limits<uint64_t>::max();
-    
+        android_gpu_usage_consume_slot(fr);
         android_gpu_usage_destroy_timestamp_resources(ctx);
-    
         return 0.0f;
     }
 
-    if (r < 0) {
-        SPDLOG_WARN("Android GPU usage: GetQueryPoolResults failed (r={})", (int)r);
-        fr.has_queries = false;
-        fr.query_used  = 0;
-        fr.frame_serial = std::numeric_limits<uint64_t>::max();
+    if (st == AndroidGpuReadStatus::Error) {
+        // 오류면 슬롯을 붙잡고 있으면 영구 정지될 수 있으니 소비하고 버린다.
+        android_gpu_usage_consume_slot(fr);
         return 0.0f;
     }
 
-    double   sum_ms       = 0.0;
-    uint64_t min_start_ts = std::numeric_limits<uint64_t>::max();
-    uint64_t max_end_ts   = 0;
-
-    for (uint32_t i = 0; i < pair_count; ++i) {
-        const uint32_t q_start = 2u * i;
-        const uint32_t q_end   = q_start + 1u;
-
-        const uint64_t start_raw = data[q_start * 2u + 0u];
-        const uint64_t avail_s   = data[q_start * 2u + 1u];
-        const uint64_t end_raw   = data[q_end   * 2u + 0u];
-        const uint64_t avail_e   = data[q_end   * 2u + 1u];
-
-        if (!avail_s || !avail_e)
-            continue;
-
-        uint64_t start_ts = start_raw & ctx->ts_mask;
-        uint64_t end_ts   = end_raw   & ctx->ts_mask;
-        
-        if (ctx->ts_valid_bits > 0 && ctx->ts_valid_bits < 64 && end_ts < start_ts) {
-            end_ts += (1ULL << ctx->ts_valid_bits);
-        }
-
-        if (end_ts <= start_ts)
-            continue;
-
-        // 1) 순수 합산 시간
-        const uint64_t delta_ticks = end_ts - start_ts;
-        const double   ns          = double(delta_ticks) * double(ctx->ts_period_ns);
-        const double   ms          = ns * 1e-6;
-        if (ms > 0.0 && std::isfinite(ms))
-            sum_ms += ms;
-
-        // 2) 활성 구간 추적
-        if (start_ts < min_start_ts)
-            min_start_ts = start_ts;
-        if (end_ts > max_end_ts)
-            max_end_ts = end_ts;
-    }
-
-    // 슬롯 상태 리셋
-    fr.has_queries = false;
-    fr.query_used  = 0;
-    fr.frame_serial= std::numeric_limits<uint64_t>::max();
-
-    // 활성 구간 기반 range_ms 계산
-    double range_ms = 0.0;
-    if (max_end_ts > min_start_ts &&
-        min_start_ts != std::numeric_limits<uint64_t>::max()) {
-
-        const uint64_t range_ticks = max_end_ts - min_start_ts;
-        const double   ns          = double(range_ticks) * double(ctx->ts_period_ns);
-        range_ms                   = ns * 1e-6;
-    }
-
-    double gpu_ms = 0.0;
-
-    // range_ms (DXVK HUD 모방)
-    if (range_ms > 0.0 && std::isfinite(range_ms)) {
-        gpu_ms = range_ms;
-    }
-    // fallback: sum_ms
-    else if (sum_ms > 0.0 && std::isfinite(sum_ms)) {
-        gpu_ms = sum_ms;
-    }
-
-    if (!std::isfinite(gpu_ms) || gpu_ms <= 0.0) {
-        // 그냥 디버그 정도로만 찍고, 샘플 무시
-        SPDLOG_DEBUG(
-            "Android GPU usage: ignoring invalid gpu_ms={} (range_ms={} sum_ms={})",
-            gpu_ms, range_ms, sum_ms
-        );
+    if (st == AndroidGpuReadStatus::NotReady) {
+        // 핵심: 미준비면 슬롯 유지
         return 0.0f;
     }
 
-    // 짝수 프레임만 계측하는 샘플링 보정:
-    // 계측 프레임이 전체의 절반이라고 가정하고 2배 스케일링
-    static constexpr double SAMPLE_SCALE = 2.0;
-    gpu_ms *= SAMPLE_SCALE;
-
-    return static_cast<float>(gpu_ms);
+    // Ready
+    android_gpu_usage_consume_slot(fr);
+    return gpu_ms;
 }
 
 // ====================== 외부 API ======================
@@ -671,7 +617,7 @@ android_gpu_usage_create(VkPhysicalDevice            phys_dev,
         ctx->ts_supported
     );
 
-    if (!ctx->ts_supported) {
+    if (!ctx->ts_supported.load(std::memory_order_relaxed)) {
         SPDLOG_WARN("Android GPU usage: Vulkan timestamps not supported, backend will be disabled");
     }
 
@@ -698,51 +644,44 @@ android_gpu_usage_queue_submit(AndroidVkGpuContext* ctx,
                                const VkSubmitInfo*  pSubmits,
                                VkFence              fence)
 {
-    if (!ctx || !ctx->disp.QueueSubmit || !pSubmits || submitCount == 0) {
+    if (!ctx || !ctx->disp.QueueSubmit || !pSubmits || submitCount == 0)
         return (ctx && ctx->disp.QueueSubmit)
             ? ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence)
             : VK_ERROR_INITIALIZATION_FAILED;
-    }
 
-    // 타임스탬프 백엔드 비활성화 상태면 바로 패스스루
-    if (!ctx->ts_supported) {
+    if (!ctx->ts_supported.load(std::memory_order_relaxed))
         return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
-    }
 
-    // 짝수/홀수 프레임 샘플링:
-    // 이 프레임을 "비계측 프레임"으로 정했다면 완전 패스스루 (오버헤드 0)
-    if (!android_gpu_usage_should_sample(ctx)) {
+    if (!android_gpu_usage_should_sample(ctx))
         return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
-    }
-
-    // v2와 동일한 패밀리 가드 추가
-    if (ctx->query_pool != VK_NULL_HANDLE &&
-        ctx->queue_family_index != VK_QUEUE_FAMILY_IGNORED &&
-        ctx->queue_family_index != queue_family_index) {
-        // 이 큐 패밀리는 그냥 계측 안 함
-        return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
-    }
 
     try {
         std::lock_guard<std::mutex> g(ctx->lock);
 
-        // 리소스 lazy init
-        if (!android_gpu_usage_init_timestamp_resources(ctx, queue_family_index)) {
+        // 락 잡은 뒤에도 다시 체크(경계 상황)
+        if (!ctx->ts_supported.load(std::memory_order_relaxed))
+            return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
+
+        if (!android_gpu_usage_should_sample(ctx))
+            return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
+
+        if (!android_gpu_usage_init_timestamp_resources(ctx, queue_family_index))
+            return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
+
+        // init 된 큐 패밀리랑 다르면 계측 안 함
+        if (ctx->query_pool != VK_NULL_HANDLE &&
+            ctx->queue_family_index != VK_QUEUE_FAMILY_IGNORED &&
+            ctx->queue_family_index != queue_family_index) {
             return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
         }
 
         const uint64_t frame_serial = ctx->frame_index;
-        const uint32_t curr_idx     = static_cast<uint32_t>(
-            frame_serial % AndroidVkGpuContext::MAX_FRAMES
-        );
+        const uint32_t curr_idx = (uint32_t)(frame_serial % AndroidVkGpuContext::MAX_FRAMES);
         auto& fr = ctx->frames[curr_idx];
 
-        // 슬롯 재사용 불가하면 이번 프레임은 계측 포기
-        if (!android_gpu_usage_begin_frame(ctx, curr_idx, frame_serial)) {
+        if (!android_gpu_usage_begin_frame(ctx, curr_idx, frame_serial))
             return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
-        }
 
-        // ===== 1-pass: 어떤 submit을 계측할지 + CB 개수 계산 =====
         auto& wrapped  = ctx->scratch_wrapped;
         auto& flat_cbs = ctx->scratch_cmds;
         auto& offsets  = ctx->scratch_cb_offsets;
@@ -758,137 +697,87 @@ android_gpu_usage_queue_submit(AndroidVkGpuContext* ctx,
 
         uint32_t total_cmds = 0;
         uint32_t tmp_used   = fr.query_used;
-        bool     any_inst   = false;
+        bool any_inst = false;
+        static constexpr uint32_t MAX_INSTRUMENTED_SUBMITS = 6;
+        uint32_t planned_pairs = 0;
 
         for (uint32_t i = 0; i < n; ++i) {
             const VkSubmitInfo& src = pSubmits[i];
+            const uint32_t base = src.commandBufferCount;
 
-            const uint32_t base_count = src.commandBufferCount;
+            bool can =
+                (base > 0) &&
+                src.pCommandBuffers &&
+                ctx->query_pool &&
+                fr.cmd_pool &&
+                (tmp_used + 2 <= fr.query_capacity) &&
+                (planned_pairs < MAX_INSTRUMENTED_SUBMITS);
 
-            bool can_instrument =
-                (base_count > 0) &&
-                (src.pCommandBuffers != nullptr) &&
-                (ctx->query_pool != VK_NULL_HANDLE) &&
-                (fr.cmd_pool   != VK_NULL_HANDLE) &&
-                (tmp_used + 2 <= fr.query_capacity);
-
-            if (!can_instrument) {
+            if (!can) {
                 inst[i]   = 0;
-                counts[i] = base_count;
+                counts[i] = base;
             } else {
                 inst[i]   = 1;
                 any_inst  = true;
                 tmp_used += 2;
-                counts[i] = base_count + 2; // begin + end
+                planned_pairs++;
+                counts[i] = base + 2; // begin + end
             }
-
             total_cmds += counts[i];
         }
 
-        // 이 프레임에 계측할 submit이 하나도 없으면 패스스루
-        if (!any_inst) {
+        if (!any_inst)
             return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
-        }
 
-        // reset_cmd 준비 (1회만)
-        if (!fr.reset_recorded) {
-            if (!android_gpu_usage_ensure_reset_cmd(ctx, fr)) {
-                // reset 안 되면 깔끔하게 계측 포기
-                return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
-            }
-        }
-
-        // reset_cmd를 첫 번째 계측 submit 앞에 한 번만 삽입
-        int32_t reset_target = -1;
-        if (fr.reset_cmd != VK_NULL_HANDLE && !fr.reset_submitted) {
-            for (uint32_t i = 0; i < n; ++i) {
-                if (inst[i]) {
-                    reset_target = static_cast<int32_t>(i);
-                    counts[i]   += 1;
-                    total_cmds  += 1;
-                    break;
-                }
-            }
-        }
-
-        // flat_cbs 크기 확보 (capacity 증가는 드물게만 일어남)
         if (flat_cbs.size() < total_cmds)
             flat_cbs.resize(total_cmds);
 
-        // offset 계산
         uint32_t cursor = 0;
         for (uint32_t i = 0; i < n; ++i) {
             offsets[i] = cursor;
-            cursor     += counts[i];
+            cursor += counts[i];
         }
 
-        // ===== 2-pass: scratch에 CB 채우고 VkSubmitInfo 구성 =====
         for (uint32_t i = 0; i < n; ++i) {
             const VkSubmitInfo& src = pSubmits[i];
-            VkSubmitInfo&       dst = wrapped[i];
 
-            const bool do_inst   = (inst[i] != 0);
-            const bool add_reset = (reset_target == static_cast<int32_t>(i));
-
-            // 계측도 없고 reset도 없으면 그냥 복사
-            if (!do_inst && !add_reset) {
-                dst = src;
+            if (!inst[i]) {
+                wrapped[i] = src;
                 continue;
             }
 
             VkCommandBuffer* dst_bufs = flat_cbs.data() + offsets[i];
-            uint32_t         idx_cb   = 0;
-
-            // reset_cmd를 이 submit 앞에 한 번만 삽입
-            if (add_reset && fr.reset_cmd != VK_NULL_HANDLE) {
-                dst_bufs[idx_cb++] = fr.reset_cmd;
-                fr.reset_submitted = true;
-            }
+            uint32_t idx_cb = 0;
 
             VkCommandBuffer cmd_begin = VK_NULL_HANDLE;
             VkCommandBuffer cmd_end   = VK_NULL_HANDLE;
+            uint32_t query_first = 0;
 
-            if (do_inst) {
-                uint32_t query_first = 0;
-                if (!android_gpu_usage_record_timestamp_pair(
-                        ctx, fr, query_first, cmd_begin, cmd_end)) {
-                    // 드문 실패 케이스: 이 submit만 계측 포기하고 그냥 원본 CB만 쓴다.
-                    for (uint32_t j = 0; j < src.commandBufferCount; ++j)
-                        dst_bufs[idx_cb++] = src.pCommandBuffers[j];
+            if (!android_gpu_usage_record_timestamp_pair(ctx, fr, query_first, cmd_begin, cmd_end)) {
+                // 실패: 이 submit은 계측 포기하고 원본만
+                for (uint32_t j = 0; j < src.commandBufferCount; ++j)
+                    dst_bufs[idx_cb++] = src.pCommandBuffers[j];
 
-                    dst = src;
-                    dst.commandBufferCount = idx_cb;
-                    dst.pCommandBuffers    = dst_bufs;
-                    inst[i] = 0;
-                    continue;
-                }
-
-                // begin timestamp CB
-                dst_bufs[idx_cb++] = cmd_begin;
+                VkSubmitInfo dst = src;
+                dst.commandBufferCount = idx_cb;
+                dst.pCommandBuffers    = dst_bufs;
+                wrapped[i] = dst;
+                inst[i] = 0;
+                continue;
             }
 
-            // 앱의 원래 커맨드 버퍼들
-            for (uint32_t j = 0; j < src.commandBufferCount; ++j) {
+            dst_bufs[idx_cb++] = cmd_begin;
+            for (uint32_t j = 0; j < src.commandBufferCount; ++j)
                 dst_bufs[idx_cb++] = src.pCommandBuffers[j];
-            }
+            dst_bufs[idx_cb++] = cmd_end;
 
-            // end timestamp CB
-            if (do_inst) {
-                dst_bufs[idx_cb++] = cmd_end;
-            }
-
-            dst = src;
+            VkSubmitInfo dst = src;
             dst.commandBufferCount = idx_cb;
             dst.pCommandBuffers    = dst_bufs;
+            wrapped[i] = dst;
         }
 
-        // 실제 QueueSubmit 호출
-        return ctx->disp.QueueSubmit(
-            queue,
-            submitCount,
-            wrapped.data(),
-            fence
-        );
+        return ctx->disp.QueueSubmit(queue, submitCount, wrapped.data(), fence);
     } catch (const std::exception& e) {
         SPDLOG_WARN("Android GPU usage: queue_submit exception: {}", e.what());
         return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
@@ -909,65 +798,47 @@ android_gpu_usage_queue_submit2(AndroidVkGpuContext* ctx,
                                 VkFence              fence)
 {
     PFN_vkQueueSubmit2 fpSubmit2 = nullptr;
-
     if (ctx) {
-        if (ctx->disp.QueueSubmit2)
-            fpSubmit2 = ctx->disp.QueueSubmit2;
-        else if (ctx->disp.QueueSubmit2KHR)
-            fpSubmit2 = ctx->disp.QueueSubmit2KHR;
+        fpSubmit2 = ctx->disp.QueueSubmit2 ? ctx->disp.QueueSubmit2
+                 : ctx->disp.QueueSubmit2KHR ? ctx->disp.QueueSubmit2KHR
+                 : nullptr;
     }
 
-    if (!ctx || !fpSubmit2 || !pSubmits || submitCount == 0) {
-        return fpSubmit2
-            ? fpSubmit2(queue, submitCount, pSubmits, fence)
-            : VK_ERROR_INITIALIZATION_FAILED;
-    }
+    if (!ctx || !fpSubmit2 || !pSubmits || submitCount == 0)
+        return fpSubmit2 ? fpSubmit2(queue, submitCount, pSubmits, fence)
+                         : VK_ERROR_INITIALIZATION_FAILED;
 
-    // 타임스탬프 미지원이면 그냥 패스스루
-    if (!ctx->ts_supported) {
+    if (!ctx->ts_supported.load(std::memory_order_relaxed))
         return fpSubmit2(queue, submitCount, pSubmits, fence);
-    }
 
-    // 짝수/홀수 프레임 샘플링:
-    // 이 프레임이 비계측 프레임이면 완전 패스스루
-    if (!android_gpu_usage_should_sample(ctx)) {
+    if (!android_gpu_usage_should_sample(ctx))
         return fpSubmit2(queue, submitCount, pSubmits, fence);
-    }
 
-    // v1과 동일한 패밀리 가드: 다른 패밀리 큐는 계측 안 함 (락 밖에서 빠른 탈출)
-    if (ctx->query_pool != VK_NULL_HANDLE &&
-        ctx->queue_family_index != VK_QUEUE_FAMILY_IGNORED &&
-        ctx->queue_family_index != queue_family_index) {
-        return fpSubmit2(queue, submitCount, pSubmits, fence);
-    }
-    
     try {
         std::lock_guard<std::mutex> g(ctx->lock);
 
-        // 레이스 방지용 최종 확인 (init 직후 등 경계 상황)
+        if (!ctx->ts_supported.load(std::memory_order_relaxed))
+            return fpSubmit2(queue, submitCount, pSubmits, fence);
+
+        if (!android_gpu_usage_should_sample(ctx))
+            return fpSubmit2(queue, submitCount, pSubmits, fence);
+
+        if (!android_gpu_usage_init_timestamp_resources(ctx, queue_family_index))
+            return fpSubmit2(queue, submitCount, pSubmits, fence);
+
         if (ctx->query_pool != VK_NULL_HANDLE &&
             ctx->queue_family_index != VK_QUEUE_FAMILY_IGNORED &&
             ctx->queue_family_index != queue_family_index) {
             return fpSubmit2(queue, submitCount, pSubmits, fence);
         }
 
-        // 리소스 lazy init
-        if (!android_gpu_usage_init_timestamp_resources(ctx, queue_family_index)) {
-            return fpSubmit2(queue, submitCount, pSubmits, fence);
-        }
-
         const uint64_t frame_serial = ctx->frame_index;
-        const uint32_t curr_idx     = static_cast<uint32_t>(
-            frame_serial % AndroidVkGpuContext::MAX_FRAMES
-        );
+        const uint32_t curr_idx = (uint32_t)(frame_serial % AndroidVkGpuContext::MAX_FRAMES);
         auto& fr = ctx->frames[curr_idx];
 
-        // 슬롯 재사용 불가하면 이번 프레임은 계측 포기
-        if (!android_gpu_usage_begin_frame(ctx, curr_idx, frame_serial)) {
+        if (!android_gpu_usage_begin_frame(ctx, curr_idx, frame_serial))
             return fpSubmit2(queue, submitCount, pSubmits, fence);
-        }
 
-        // ===== 1-pass: 어떤 submit을 계측할지 + CommandBufferInfo 개수 계산 =====
         auto& wrapped2 = ctx->scratch_wrapped2;
         auto& infos    = ctx->scratch_cmd_infos;
         auto& offsets  = ctx->scratch_cb_offsets;
@@ -983,83 +854,53 @@ android_gpu_usage_queue_submit2(AndroidVkGpuContext* ctx,
 
         uint32_t total_infos = 0;
         uint32_t tmp_used    = fr.query_used;
-        bool     any_inst    = false;
+        bool any_inst = false;
 
         for (uint32_t i = 0; i < n; ++i) {
             const VkSubmitInfo2& src = pSubmits[i];
+            const uint32_t base = src.commandBufferInfoCount;
 
-            const uint32_t base_count = src.commandBufferInfoCount;
-
-            bool can_instrument =
-                (base_count > 0) &&
-                (src.pCommandBufferInfos != nullptr) &&
-                (ctx->query_pool != VK_NULL_HANDLE) &&
-                (fr.cmd_pool   != VK_NULL_HANDLE) &&
+            bool can =
+                (base > 0) &&
+                src.pCommandBufferInfos &&
+                ctx->query_pool &&
+                fr.cmd_pool &&
                 (tmp_used + 2 <= fr.query_capacity);
 
-            if (!can_instrument) {
+            if (!can) {
                 inst[i]   = 0;
-                counts[i] = base_count;
+                counts[i] = base;
             } else {
                 inst[i]   = 1;
                 any_inst  = true;
                 tmp_used += 2;
-                counts[i] = base_count + 2; // begin + end
+                counts[i] = base + 2;
             }
-
             total_infos += counts[i];
         }
 
-        // 이 프레임에 계측할 submit이 하나도 없으면 패스스루
-        if (!any_inst) {
+        if (!any_inst)
             return fpSubmit2(queue, submitCount, pSubmits, fence);
-        }
-
-        // reset_cmd 준비 (1회만)
-        if (!fr.reset_recorded) {
-            if (!android_gpu_usage_ensure_reset_cmd(ctx, fr)) {
-                return fpSubmit2(queue, submitCount, pSubmits, fence);
-            }
-        }
-
-        // reset_cmd를 첫 번째 계측 submit 앞에 한 번만 삽입
-        int32_t reset_target = -1;
-        if (fr.reset_cmd != VK_NULL_HANDLE && !fr.reset_submitted) {
-            for (uint32_t i = 0; i < n; ++i) {
-                if (inst[i]) {
-                    reset_target = static_cast<int32_t>(i);
-                    counts[i]   += 1;
-                    total_infos  += 1;
-                    break;
-                }
-            }
-        }
 
         if (infos.size() < total_infos)
             infos.resize(total_infos);
 
-        // offset 계산
         uint32_t cursor = 0;
         for (uint32_t i = 0; i < n; ++i) {
             offsets[i] = cursor;
-            cursor     += counts[i];
+            cursor += counts[i];
         }
 
-        // ===== 2-pass: scratch에 CommandBufferSubmitInfo 채우고 VkSubmitInfo2 구성 =====
         for (uint32_t i = 0; i < n; ++i) {
             const VkSubmitInfo2& src = pSubmits[i];
-            VkSubmitInfo2&       dst = wrapped2[i];
 
-            const bool do_inst   = (inst[i] != 0);
-            const bool add_reset = (reset_target == static_cast<int32_t>(i));
-
-            if (!do_inst && !add_reset) {
-                dst = src;
+            if (!inst[i]) {
+                wrapped2[i] = src;
                 continue;
             }
 
             VkCommandBufferSubmitInfo* dst_infos = infos.data() + offsets[i];
-            uint32_t                   idx_cb    = 0;
+            uint32_t idx_cb = 0;
 
             const VkCommandBufferSubmitInfo* template_info =
                 (src.commandBufferInfoCount > 0 && src.pCommandBufferInfos)
@@ -1068,62 +909,41 @@ android_gpu_usage_queue_submit2(AndroidVkGpuContext* ctx,
 
             auto make_cb_info = [&](VkCommandBuffer buf) {
                 VkCommandBufferSubmitInfo info{};
-                info.sType        = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
-                info.pNext        = nullptr;
-                info.commandBuffer= buf;
-                info.deviceMask   = template_info ? template_info->deviceMask : 0x1u;
+                info.sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+                info.pNext         = nullptr;
+                info.commandBuffer = buf;
+                info.deviceMask    = template_info ? template_info->deviceMask : 0x1u;
                 return info;
             };
 
-            // reset_cmd를 이 submit 앞에 한 번만 삽입
-            if (add_reset && fr.reset_cmd != VK_NULL_HANDLE) {
-                dst_infos[idx_cb++] = make_cb_info(fr.reset_cmd);
-                fr.reset_submitted  = true;
-            }
-
             VkCommandBuffer cmd_begin = VK_NULL_HANDLE;
             VkCommandBuffer cmd_end   = VK_NULL_HANDLE;
+            uint32_t query_first = 0;
 
-            if (do_inst) {
-                uint32_t query_first = 0;
-                if (!android_gpu_usage_record_timestamp_pair(
-                        ctx, fr, query_first, cmd_begin, cmd_end)) {
+            if (!android_gpu_usage_record_timestamp_pair(ctx, fr, query_first, cmd_begin, cmd_end)) {
+                for (uint32_t j = 0; j < src.commandBufferInfoCount; ++j)
+                    dst_infos[idx_cb++] = src.pCommandBufferInfos[j];
 
-                    // 계측 실패: reset이 이미 들어갔다면 그대로 두고, 나머지는 원본 CB만 복사
-                    for (uint32_t j = 0; j < src.commandBufferInfoCount; ++j)
-                        dst_infos[idx_cb++] = src.pCommandBufferInfos[j];
-
-                    dst = src;
-                    dst.commandBufferInfoCount = idx_cb;
-                    dst.pCommandBufferInfos    = dst_infos;
-                    inst[i] = 0;
-                    continue;
-                }
-
-                dst_infos[idx_cb++] = make_cb_info(cmd_begin);
+                VkSubmitInfo2 dst = src;
+                dst.commandBufferInfoCount = idx_cb;
+                dst.pCommandBufferInfos    = dst_infos;
+                wrapped2[i] = dst;
+                inst[i] = 0;
+                continue;
             }
 
-            // 앱의 원래 커맨드 버퍼들
-            for (uint32_t j = 0; j < src.commandBufferInfoCount; ++j) {
+            dst_infos[idx_cb++] = make_cb_info(cmd_begin);
+            for (uint32_t j = 0; j < src.commandBufferInfoCount; ++j)
                 dst_infos[idx_cb++] = src.pCommandBufferInfos[j];
-            }
+            dst_infos[idx_cb++] = make_cb_info(cmd_end);
 
-            // end timestamp CB
-            if (do_inst) {
-                dst_infos[idx_cb++] = make_cb_info(cmd_end);
-            }
-
-            dst = src;
+            VkSubmitInfo2 dst = src;
             dst.commandBufferInfoCount = idx_cb;
             dst.pCommandBufferInfos    = dst_infos;
+            wrapped2[i] = dst;
         }
 
-        return fpSubmit2(
-            queue,
-            submitCount,
-            wrapped2.data(),
-            fence
-        );
+        return fpSubmit2(queue, submitCount, wrapped2.data(), fence);
     } catch (const std::exception& e) {
         SPDLOG_WARN("Android GPU usage: queue_submit2 exception: {}", e.what());
         return fpSubmit2(queue, submitCount, pSubmits, fence);
@@ -1143,7 +963,6 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
                              uint32_t                image_index)
 {
     (void)queue;
-    (void)queue_family_index;
     (void)present_info;
     (void)swapchain_index;
     (void)image_index;
@@ -1153,108 +972,180 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
 
     if (!android_gpu_usage_env_enabled())
         return;
-    
+
     using clock = std::chrono::steady_clock;
-    auto now = clock::now();
+    const auto now = clock::now();
+
+    struct PendingRead {
+        bool     have       = false;
+        uint32_t slot_idx   = 0;
+        uint64_t serial     = 0;
+        uint32_t q_start    = 0;
+        uint32_t q_count    = 0;
+        float    cpu_ms     = 0.0f;
+    } read{};
+
+    float frame_cpu_ms = 16.0f;
 
     try {
-        std::lock_guard<std::mutex> g(ctx->lock);
+        // --------- (A) 짧은 락: CPU dt 갱신 + 후보 슬롯 선택 + init ---------
+        {
+            std::lock_guard<std::mutex> g(ctx->lock);
 
-        // 1. 레이스 방지용 패밀리 가드
-        // (QueueSubmit이 아니므로 패스스루 할 필요 없음, 그냥 측정 스킵하고 리턴)
-        if (ctx->query_pool != VK_NULL_HANDLE &&
-            ctx->queue_family_index != VK_QUEUE_FAMILY_IGNORED &&
-            ctx->queue_family_index != queue_family_index) {
-            return; 
-        }
+            // 패밀리 가드
+            if (ctx->query_pool != VK_NULL_HANDLE &&
+                ctx->queue_family_index != VK_QUEUE_FAMILY_IGNORED &&
+                ctx->queue_family_index != queue_family_index) {
+                return;
+            }
 
-        // 2. 리소스 lazy init (혹시 submit 없이 present만 불리는 특이 케이스 방어)
-        if (!android_gpu_usage_init_timestamp_resources(ctx, queue_family_index)) {
-            return;
-        }
-        
-        // CPU 기준 프레임 시간
-        float frame_cpu_ms = 16.0f;
-        if (ctx->last_present.time_since_epoch().count() != 0) {
-            auto dt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             now - ctx->last_present)
-                             .count();
-            if (dt_ms <= 0)
-                dt_ms = 1;
-            frame_cpu_ms = static_cast<float>(dt_ms);
-        }
-        ctx->last_present = now;
+            // submit 없이 present만 불리는 특이 케이스 방어(기존 유지)
+            if (!android_gpu_usage_init_timestamp_resources(ctx, queue_family_index)) {
+                // init 실패라도 CPU 시간 누적/프레임 인덱스는 진행(기존 동작과 유사)
+                // 단, GPU는 당연히 0으로 남음
+            }
 
-        // GPU 기준 프레임 시간 (FRAME_LAG 프레임 뒤 슬롯에서 읽기)
-        float frame_gpu_ms = 0.0f;
+            // CPU 기준 프레임 시간
+            if (ctx->last_present.time_since_epoch().count() != 0) {
+                auto dt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 now - ctx->last_present).count();
+                if (dt_ms <= 0) dt_ms = 1;
+                frame_cpu_ms = static_cast<float>(dt_ms);
+            }
+            ctx->last_present = now;
 
-        if (ctx->ts_supported && ctx->query_pool != VK_NULL_HANDLE) {
-            if (ctx->frame_index >= AndroidVkGpuContext::FRAME_LAG) {
-                const uint64_t read_serial = ctx->frame_index - AndroidVkGpuContext::FRAME_LAG;
-                const uint32_t read_idx    = static_cast<uint32_t>(
-                    read_serial % AndroidVkGpuContext::MAX_FRAMES
-                );
+            // [PATCH] CPU dt를 "현재 serial" 슬롯에 저장해서, 나중에 GPU serial이랑 매칭한다.
+            const uint64_t cur_serial = ctx->frame_index.load(std::memory_order_relaxed);
+            const uint32_t cur_idx = static_cast<uint32_t>(cur_serial % AndroidVkGpuContext::MAX_FRAMES);
+            auto& cs = ctx->cpu_ring[cur_serial & (AndroidVkGpuContext::CPU_RING - 1u)];
+            cs.serial = cur_serial;
+            cs.ms     = frame_cpu_ms;
 
-                auto& fr = ctx->frames[read_idx];
-                if (fr.frame_serial == read_serial) {
-                    frame_gpu_ms = android_gpu_usage_collect_frame_gpu_ms(ctx, fr);
+            // GPU 후보 슬롯 선택: FRAME_LAG부터 시작해서 더 오래된 pending도 몇 개까지 훑는다
+            if (ctx->ts_supported && ctx->query_pool != VK_NULL_HANDLE) {
+                for (uint32_t k = 0; k < (AndroidVkGpuContext::MAX_FRAMES - AndroidVkGpuContext::FRAME_LAG); ++k) {
+                    if (ctx->frame_index < (AndroidVkGpuContext::FRAME_LAG + k))
+                        break;
+
+                    const uint64_t serial = ctx->frame_index - AndroidVkGpuContext::FRAME_LAG - k;
+                    const uint32_t idx = static_cast<uint32_t>(serial % AndroidVkGpuContext::MAX_FRAMES);
+                    auto& fr = ctx->frames[idx];
+
+                    if (fr.frame_serial == serial && fr.has_queries && fr.query_used >= 2) {
+                        read.have     = true;
+                        read.slot_idx = idx;
+                        read.serial   = serial;
+                        read.q_start  = fr.query_start;
+                        read.q_count  = fr.query_used;
+                    
+                        // [PATCH] CPU dt도 같은 serial일 때만 매칭
+                        const auto& cs = ctx->cpu_ring[serial & (AndroidVkGpuContext::CPU_RING - 1u)];
+                        read.cpu_ms = (cs.serial == serial) ? cs.ms : 0.0f;
+                        break;
+                    }
                 }
             }
         }
 
-        // 500ms 윈도우 누적 + smoothing
-        if (ctx->window_start.time_since_epoch().count() == 0) {
-            ctx->window_start = now;
+        // --------- (B) 락 밖: QueryResults + 계산(비용 큰 부분) ---------
+        float frame_gpu_ms = 0.0f;
+        AndroidGpuReadStatus st = AndroidGpuReadStatus::NotReady;
+
+        if (read.have) {
+            st = android_gpu_usage_query_range_gpu_ms(ctx, read.q_start, read.q_count, &frame_gpu_ms);
         }
 
-        ctx->acc_cpu_ms += frame_cpu_ms;
-        ctx->acc_gpu_ms += frame_gpu_ms;
-        ctx->acc_frames += 1;
+        // --------- (C) 짧은 락: 슬롯 소비(Ready일 때만) + smoothing 누적 ---------
+        {
+            std::lock_guard<std::mutex> g(ctx->lock);
 
-        constexpr auto WINDOW = std::chrono::milliseconds(500);
-        auto elapsed = now - ctx->window_start;
-
-        if (elapsed >= WINDOW && ctx->acc_cpu_ms > 0.0 && ctx->acc_frames > 0) {
-            const double avg_cpu_ms = ctx->acc_cpu_ms / static_cast<double>(ctx->acc_frames);
-            const double avg_gpu_ms = ctx->acc_gpu_ms / static_cast<double>(ctx->acc_frames);
-
-            float usage = 0.0f;
-            if (avg_cpu_ms > 0.0) {
-                usage = static_cast<float>((avg_gpu_ms / avg_cpu_ms) * 100.0);
-            }
-
-            if (!std::isfinite(usage))
-                usage = 0.0f;
-            if (usage < 0.0f)
-                usage = 0.0f;
-            if (usage > 150.0f)
-                usage = 150.0f;
-
-            const float alpha = 0.5f;
-
-            if (!ctx->have_metrics) {
-                ctx->smooth_usage  = usage;
-                ctx->smooth_gpu_ms = static_cast<float>(avg_gpu_ms);
+            if (st == AndroidGpuReadStatus::DeviceLost) {
+                SPDLOG_WARN("Android GPU usage: DEVICE_LOST on GetQueryPoolResults, disabling timestamp backend");
+                ctx->ts_supported = false;
+                android_gpu_usage_destroy_timestamp_resources(ctx);
+                frame_gpu_ms = 0.0f;
+            } else if (st == AndroidGpuReadStatus::Ready && frame_gpu_ms > 0.0f) {
+                // 레이스 방지: 아직도 동일 슬롯/serial/카운트인지 확인 후 소비
+                auto& fr = ctx->frames[read.slot_idx];
+                if (fr.frame_serial == read.serial && fr.has_queries && fr.query_used == read.q_count) {
+                    android_gpu_usage_consume_slot(fr);
+                } else {
+                    // 경계 상황: 소비하지 않고 측정만 버림
+                    frame_gpu_ms = 0.0f;
+                    st = AndroidGpuReadStatus::NotReady;
+                }
             } else {
-                ctx->smooth_usage  =
-                    ctx->smooth_usage * (1.0f - alpha) + usage * alpha;
-                ctx->smooth_gpu_ms =
-                    ctx->smooth_gpu_ms * (1.0f - alpha) +
-                    static_cast<float>(avg_gpu_ms) * alpha;
+                // NotReady/Error: 슬롯 유지(정확도 핵심)
+                frame_gpu_ms = 0.0f;
             }
 
-            ctx->last_usage   = ctx->smooth_usage;
-            ctx->last_gpu_ms  = ctx->smooth_gpu_ms;
-            ctx->have_metrics = true;
+            // 500ms 윈도우 누적
+            if (ctx->window_start.time_since_epoch().count() == 0) {
+                ctx->window_start = now;
+            }
 
-            ctx->acc_cpu_ms   = 0.0;
-            ctx->acc_gpu_ms   = 0.0;
-            ctx->acc_frames   = 0;
-            ctx->window_start = now;
+            if (st == AndroidGpuReadStatus::Ready && frame_gpu_ms > 0.0f && read.cpu_ms > 0.0f) {
+                ctx->acc_cpu_ms_sampled += read.cpu_ms;
+                ctx->acc_frames_sampled += 1;
+            
+                ctx->acc_gpu_ms         += frame_gpu_ms;
+                ctx->acc_gpu_samples    += 1;
+            } else {
+                // NotReady/Error면 아무것도 누적 안 함 (CPU만 쌓아두면 bias 생김)
+            }
+
+            constexpr auto WINDOW = std::chrono::milliseconds(500);
+            const auto elapsed = now - ctx->window_start;
+            
+            if (elapsed >= WINDOW) {
+            
+                // GPU 샘플이 한 번도 없으면 이번 윈도우는 "업데이트 스킵"
+                // (0으로 덮어써서 튀는 것보다 이전 값 유지가 실전에서 덜 빡침)
+                if (ctx->acc_gpu_samples > 0 && ctx->acc_frames_sampled > 0 && ctx->acc_cpu_ms_sampled > 0.0) {
+            
+                    const double avg_cpu_ms =
+                        ctx->acc_cpu_ms_sampled / static_cast<double>(ctx->acc_frames_sampled);
+            
+                    const double avg_gpu_ms =
+                        ctx->acc_gpu_ms / static_cast<double>(ctx->acc_gpu_samples);
+            
+                    float usage = 0.0f;
+                    if (avg_cpu_ms > 0.0 && avg_gpu_ms > 0.0)
+                        usage = static_cast<float>((avg_gpu_ms / avg_cpu_ms) * 100.0);
+            
+                    if (!std::isfinite(usage)) usage = 0.0f;
+                    if (usage < 0.0f) usage = 0.0f;
+                    if (usage > 150.0f) usage = 150.0f;
+            
+                    const float alpha = 0.5f;
+            
+                    if (!ctx->have_metrics) {
+                        ctx->smooth_usage  = usage;
+                        ctx->smooth_gpu_ms = static_cast<float>(avg_gpu_ms);
+                    } else {
+                        ctx->smooth_usage  = ctx->smooth_usage * (1.0f - alpha) + usage * alpha;
+                        ctx->smooth_gpu_ms = ctx->smooth_gpu_ms * (1.0f - alpha) +
+                                             static_cast<float>(avg_gpu_ms) * alpha;
+                    }
+            
+                    ctx->last_usage   = ctx->smooth_usage;
+                    ctx->last_gpu_ms  = ctx->smooth_gpu_ms;
+                    ctx->have_metrics = true;
+                }
+            
+                // 윈도우 리셋 (업데이트를 했든 말든 시간 창은 굴러야 함)
+                ctx->acc_cpu_ms_sampled = 0.0;
+                ctx->acc_frames_sampled = 0;
+            
+                ctx->acc_gpu_ms      = 0.0;
+                ctx->acc_gpu_samples = 0;
+            
+                ctx->window_start = now;
+            }
+
+            // 다음 프레임 serial
+            ctx->frame_index++;
         }
-
-        // 다음 프레임 serial
-        ctx->frame_index++;
     } catch (const std::exception& e) {
         SPDLOG_WARN("Android GPU usage: on_present exception: {}", e.what());
     } catch (...) {
