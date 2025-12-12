@@ -98,27 +98,44 @@ struct FrameResources {
 namespace {
     bool android_gpu_usage_env_enabled()
     {
-        static int cached = -1;
-        if (cached != -1)
-            return cached != 0;
+        // -1 = unknown, 0 = disabled, 1 = enabled
+        static std::atomic<int> cached{-1};
+
+        int v = cached.load(std::memory_order_acquire);
+        if (v != -1)
+            return v != 0;
 
         const char* env = std::getenv("MANGOHUD_VKP");
-
-        // 오직 "1"만 활성. 그 외(unset/빈문자/"0"/"true"/"yes"/뭐든) 전부 비활성.
         const bool enabled = (env && env[0] == '1' && env[1] == '\0');
+        const int  newv    = enabled ? 1 : 0;
 
-        cached = enabled ? 1 : 0;
-
-        if (!enabled) {
-            SPDLOG_INFO(
-                "MANGOHUD_VKP!=1 -> Vulkan GPU usage backend disabled (fdinfo + kgsl remains default)"
-            );
-            return false;
+        int expected = -1;
+        if (cached.compare_exchange_strong(expected, newv,
+                                           std::memory_order_release,
+                                           std::memory_order_relaxed))
+        {
+            // 최초 결정한 스레드만 로그 1회
+            if (!enabled) {
+                SPDLOG_INFO("MANGOHUD_VKP!=1 -> Vulkan GPU usage backend disabled (fdinfo + kgsl remains default)");
+            } else {
+                SPDLOG_INFO("MANGOHUD_VKP=1 -> Vulkan GPU usage backend enabled");
+            }
+            return enabled;
         }
 
-        SPDLOG_INFO("MANGOHUD_VKP=1 -> Vulkan GPU usage backend enabled");
-        return true;
+        // 누군가 먼저 결정했으면 그 결과를 따른다
+        return cached.load(std::memory_order_acquire) != 0;
     }
+}
+
+static inline bool
+android_gpu_usage_should_sample(const AndroidVkGpuContext* ctx) noexcept
+{
+    // ultra-cheap fast-path: no locks, no allocations
+    // 샘플링 정책: 짝수 serial(=frame_index)만 샘플
+    return ctx &&
+           ctx->ts_supported.load(std::memory_order_relaxed) &&
+           ((ctx->frame_index.load(std::memory_order_relaxed) & 1u) == 0u);
 }
 
 // ====================== 헬퍼: 타임스탬프 리소스 초기화 ======================
@@ -167,7 +184,6 @@ android_gpu_usage_init_timestamp_resources(AndroidVkGpuContext* ctx,
 
     ctx->queue_family_index = queue_family_index;
 
-    // queue family의 timestampValidBits가 0이면 timestamps 미지원 :contentReference[oaicite:4]{index=4}
     uint32_t qf_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(ctx->phys_dev, &qf_count, nullptr);
     if (queue_family_index >= qf_count) {
@@ -671,7 +687,7 @@ android_gpu_usage_queue_submit(AndroidVkGpuContext* ctx,
 
     // fast-path: 샘플링 안 하는 프레임이면 락을 아예 안 잡는다
     // [PATCH] 함수 호출 제거: 단순 비트 체크
-    if (ctx->frame_index.load(std::memory_order_relaxed) & 1u)
+    if (!android_gpu_usage_should_sample(ctx))
         return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
 
     // [ROLLBACK GUARD] 예외로 빠져도 슬롯이 오염(제출 안 된 query)되지 않게 복구한다.
