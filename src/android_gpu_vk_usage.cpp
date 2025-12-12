@@ -9,6 +9,7 @@
 #include <spdlog/spdlog.h>
 #include <cstdlib>
 #include <atomic>
+#include <condition_variable>
 
 // ====================== 내부 상태 ======================
 
@@ -47,6 +48,12 @@ struct FrameResources {
 
     // CPU/GPU 사용률 + smoothing용 상태
     std::mutex                                      lock;
+    // [LIFETIME GUARD]
+    // on_present()가 락 밖에서 GetQueryPoolResults를 호출하는 동안 destroy()가 리소스를 파괴하면 UAF 위험.
+    // 그래서 "in_flight" 카운트가 0이 될 때까지 destroy()가 기다리도록 만든다.
+    std::condition_variable                         cv;
+    bool                                            destroying = false;
+    uint32_t                                        in_flight  = 0;
     std::chrono::steady_clock::time_point           last_present{};   // 마지막 present 시각
 
     std::chrono::steady_clock::time_point           window_start{};   // smoothing 윈도우 시작 시각
@@ -77,6 +84,9 @@ struct FrameResources {
     struct CpuSample { uint64_t serial; float ms; };
     static constexpr uint32_t CPU_RING = 64; // 16보다 크게 (NotReady 오래가도 안전)
     CpuSample cpu_ring[CPU_RING]{};
+
+    // CPU_RING은 bitmask 인덱싱을 쓰므로 반드시 2의 거듭제곱이어야 한다.
+    static_assert((CPU_RING & (CPU_RING - 1u)) == 0u, "CPU_RING must be power-of-two");
 };
 
 // ====================== 환경 변수 플래그 ======================
@@ -662,8 +672,12 @@ android_gpu_usage_destroy(AndroidVkGpuContext* ctx)
     if (!ctx)
         return;
 
-   {   // [ADD] 동시 접근 방지
-       std::lock_guard<std::mutex> g(ctx->lock);
+   {
+       // on_present()가 락 밖에서 Vulkan 호출 중일 수 있으니, 그게 끝날 때까지 기다린다.
+       std::unique_lock<std::mutex> lk(ctx->lock);
+       ctx->destroying = true;
+       ctx->cv.wait(lk, [&] { return ctx->in_flight == 0; });
+
        android_gpu_usage_destroy_timestamp_resources(ctx);
        ctx->have_metrics = false;
    }
@@ -719,6 +733,12 @@ android_gpu_usage_queue_submit(AndroidVkGpuContext* ctx,
         if (!android_gpu_usage_begin_frame(ctx, curr_idx, frame_serial))
             return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
 
+        // [ROLLBACK SNAPSHOT]
+        // 아래에서 timestamp pair를 일부 커밋한 뒤 submit이 실패/예외로 빠지면
+        // "제출 안 된 쿼리"가 슬롯에 남아 NotReady가 길게 이어질 수 있다.
+        const uint32_t saved_query_used  = fr.query_used;
+        const bool     saved_has_queries = fr.has_queries;
+        
         auto& wrapped  = ctx->scratch_wrapped;
         auto& flat_cbs = ctx->scratch_cmds;
         auto& offsets  = ctx->scratch_cb_offsets;
@@ -815,9 +835,24 @@ android_gpu_usage_queue_submit(AndroidVkGpuContext* ctx,
             wrapped[i] = dst;
         }
 
-        return ctx->disp.QueueSubmit(queue, submitCount, wrapped.data(), fence);
+        VkResult vr = ctx->disp.QueueSubmit(queue, submitCount, wrapped.data(), fence);
+        if (vr != VK_SUCCESS) {
+            // submit 실패면 이번에 커밋한 query 사용분은 무효 처리 (측정 오염 방지)
+            fr.query_used  = saved_query_used;
+            fr.has_queries = saved_has_queries;
+
+            if (vr == VK_ERROR_DEVICE_LOST) {
+                ctx->ts_supported.store(false, std::memory_order_relaxed);
+                android_gpu_usage_destroy_timestamp_resources(ctx);
+            }
+        }
+        return vr;
     } catch (const std::exception& e) {
         SPDLOG_WARN("Android GPU usage: queue_submit exception: {}", e.what());
+        // 예외로 빠질 때도 슬롯 오염 방지
+        std::lock_guard<std::mutex> g(ctx->lock);
+        // fr에 접근하려면 포인터로 잡아두는 방식이 깔끔하지만,
+        // 최소 변경을 원하면 위 스냅샷 구간부터 fr 포인터를 바깥 스코프로 빼라.
         return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
     } catch (...) {
         SPDLOG_WARN("Android GPU usage: queue_submit unknown exception");
@@ -878,6 +913,12 @@ android_gpu_usage_queue_submit2(AndroidVkGpuContext* ctx,
         if (!android_gpu_usage_begin_frame(ctx, curr_idx, frame_serial))
             return fpSubmit2(queue, submitCount, pSubmits, fence);
 
+        // [ROLLBACK SNAPSHOT]
+        // 아래에서 timestamp pair를 일부 커밋한 뒤 submit이 실패/예외로 빠지면
+        // "제출 안 된 쿼리"가 슬롯에 남아 NotReady가 길게 이어질 수 있다.
+        const uint32_t saved_query_used  = fr.query_used;
+        const bool     saved_has_queries = fr.has_queries;
+        
         auto& wrapped2 = ctx->scratch_wrapped2;
         auto& infos    = ctx->scratch_cmd_infos;
         auto& offsets  = ctx->scratch_cb_offsets;
@@ -988,7 +1029,18 @@ android_gpu_usage_queue_submit2(AndroidVkGpuContext* ctx,
             wrapped2[i] = dst;
         }
 
-        return fpSubmit2(queue, submitCount, wrapped2.data(), fence);
+        VkResult vr = fpSubmit2(queue, submitCount, wrapped2.data(), fence);
+        if (vr != VK_SUCCESS) {
+            // submit 실패면 이번에 커밋한 query 사용분은 무효 처리 (측정 오염 방지)
+            fr.query_used  = saved_query_used;
+            fr.has_queries = saved_has_queries;
+
+            if (vr == VK_ERROR_DEVICE_LOST) {
+                ctx->ts_supported.store(false, std::memory_order_relaxed);
+                android_gpu_usage_destroy_timestamp_resources(ctx);
+            }
+        }
+        return vr;
     } catch (const std::exception& e) {
         SPDLOG_WARN("Android GPU usage: queue_submit2 exception: {}", e.what());
         return fpSubmit2(queue, submitCount, pSubmits, fence);
@@ -1031,11 +1083,13 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
     } read{};
 
     float frame_cpu_ms = 16.0f;
+    bool in_flight_armed = false; // read.have 케이스에서만 true
 
     try {
         // --------- (A) 짧은 락: CPU dt 갱신 + 후보 슬롯 선택 + init ---------
         {
             std::lock_guard<std::mutex> g(ctx->lock);
+            if (ctx->destroying) return; // destroy 진행 중이면 더 건드리지 마
 
             // CPU 기준 프레임 시간
             if (ctx->last_present.time_since_epoch().count() != 0) {
@@ -1088,6 +1142,11 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
                     }
                 }
             }
+            // [LIFETIME GUARD] 락 밖에서 GetQueryPoolResults 호출 예정이면 destroy()가 기다리게 만든다.
+            if (read.have) {
+                ctx->in_flight++;
+                in_flight_armed = true;
+            }
         }
 
         // --------- (B) 락 밖: QueryResults + 계산(비용 큰 부분) ---------
@@ -1110,6 +1169,12 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
         {
             std::lock_guard<std::mutex> g(ctx->lock);
 
+            // [LIFETIME GUARD] 여기 들어왔다는 건 (B)가 끝났다는 뜻. 이제 destroy()를 진행 가능하게 풀어준다.
+            if (in_flight_armed) {
+                in_flight_armed = false;
+                if (--ctx->in_flight == 0 && ctx->destroying)
+                    ctx->cv.notify_all();
+            }
             if (st == AndroidGpuReadStatus::DeviceLost) {
                 SPDLOG_WARN("Android GPU usage: DEVICE_LOST on GetQueryPoolResults, disabling timestamp backend");
                 ctx->ts_supported = false;
@@ -1207,8 +1272,21 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
             ctx->frame_index++;
         }
     } catch (const std::exception& e) {
+        // (B)에서 예외 터지면 in_flight가 누수될 수 있음 -> 여기서 회수
+        if (in_flight_armed) {
+            std::lock_guard<std::mutex> g(ctx->lock);
+            in_flight_armed = false;
+            if (--ctx->in_flight == 0 && ctx->destroying)
+                ctx->cv.notify_all();
+        }
         SPDLOG_WARN("Android GPU usage: on_present exception: {}", e.what());
     } catch (...) {
+        if (in_flight_armed) {
+            std::lock_guard<std::mutex> g(ctx->lock);
+            in_flight_armed = false;
+            if (--ctx->in_flight == 0 && ctx->destroying)
+                ctx->cv.notify_all();
+        }
         SPDLOG_WARN("Android GPU usage: on_present unknown exception");
     }
 }
