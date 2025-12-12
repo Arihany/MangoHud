@@ -259,7 +259,9 @@ static inline uint64_t android_vk_now_ns()
 // default OFF (kgsl이 기본이라며, 그럼 이건 켜기 전까지 존재감 0이 맞음)
 static inline bool android_vk_read_enabled()
 {
-   const char* s = getenv("MANGOHUD_ANDROID_VK_GPU_USAGE");
+   // Vulkan timestamp GPU usage는 "진짜 최후의 보루"라서
+   // MANGOHUD_VKP=1일 때만 켠다.
+   const char* s = getenv("MANGOHUD_VKP");
    if (!s || !*s) return false;
    return (strtol(s, nullptr, 10) != 0);
 }
@@ -2137,14 +2139,15 @@ static VkResult overlay_CreateDevice(
 #if defined(__ANDROID__)
 {
     // 0) 정책: 기본 OFF (kgsl 기본이면 Vulkan 계측은 진짜 fallback)
-    device_data->android_vk_gpu_usage_enabled = android_vk_read_enabled();
-    device_data->android_vk_interval_ns       = android_vk_read_interval_ns();
-
-    if (!device_data->android_vk_gpu_usage_enabled) {
-        // 완전 비활성: 훅은 남아도 ctx가 null이라 비용 0
-        device_data->android_gpu_ctx = nullptr;
-    } else {
-        AndroidVkGpuDispatch disp{};
+   device_data->android_vk_gpu_usage_enabled = android_vk_read_enabled();
+   
+   if (!device_data->android_vk_gpu_usage_enabled) {
+       device_data->android_vk_interval_ns = 100000000ull; // 100ms (의미없지만 기본값)
+       device_data->android_gpu_ctx = nullptr;
+   } else {
+       device_data->android_vk_interval_ns = android_vk_read_interval_ns();
+   
+       AndroidVkGpuDispatch disp{};
 
         disp.QueueSubmit            = device_data->vtable.QueueSubmit;
         disp.QueueSubmit2           = device_data->real_QueueSubmit2;
