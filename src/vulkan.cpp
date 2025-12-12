@@ -63,6 +63,7 @@
 #include "fps_limiter.h"
 
 #if defined(__ANDROID__)
+#include <atomic>
 #include "android_gpu_vk_usage.h"
 #include "gpu.h"
 #endif
@@ -111,6 +112,14 @@ struct device_data {
 
 #if defined(__ANDROID__)
    AndroidVkGpuContext* android_gpu_ctx = nullptr;
+
+   // Vulkan timestamp GPU usage: "최후의 보루" 모드
+   bool                 android_vk_gpu_usage_enabled = false;
+   uint64_t             android_vk_interval_ns = 100000000ull; // default 100ms
+
+   // 샘플링 타이밍 (멀티스레드 QueueSubmit 고려)
+   std::atomic<uint64_t> android_vk_next_submit_sample_ns{0};
+   std::atomic<uint64_t> android_vk_next_metrics_poll_ns{0};
 #endif
 
    PFN_vkQueueSubmit2    real_QueueSubmit2    = nullptr;
@@ -239,6 +248,60 @@ static void unmap_object(uint64_t obj)
    } while (0)
 
 /**/
+
+#if defined(__ANDROID__)
+static inline uint64_t android_vk_now_ns()
+{
+   using namespace std::chrono;
+   return (uint64_t)duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+// default OFF (kgsl이 기본이라며, 그럼 이건 켜기 전까지 존재감 0이 맞음)
+static inline bool android_vk_read_enabled()
+{
+   const char* s = getenv("MANGOHUD_ANDROID_VK_GPU_USAGE");
+   if (!s || !*s) return false;
+   return (strtol(s, nullptr, 10) != 0);
+}
+
+// 샘플링 간격(ms) env로 조절
+static inline uint64_t android_vk_read_interval_ns()
+{
+   const char* s = getenv("MANGOHUD_ANDROID_VK_GPU_USAGE_INTERVAL_MS");
+   if (!s || !*s) return 100000000ull; // 100ms
+   long ms = strtol(s, nullptr, 10);
+
+   // 너무 미친 값 방지 (16ms 미만이면 사실상 매프레임 계측이라 다시 병신됨)
+   if (ms < 16) ms = 16;
+   if (ms > 1000) ms = 1000;
+   return (uint64_t)ms * 1000000ull;
+}
+
+// "지금 시간에 이 작업을 해도 되는가?" 원자적으로 한 스레드만 통과
+static inline bool android_vk_try_tick(std::atomic<uint64_t>& next_ns,
+                                       uint64_t interval_ns,
+                                       uint64_t now_ns)
+{
+   uint64_t due = next_ns.load(std::memory_order_relaxed);
+   if (now_ns < due) return false;
+   return next_ns.compare_exchange_strong(due, now_ns + interval_ns,
+                                         std::memory_order_relaxed);
+}
+
+static inline bool has_cmd_buffers(const VkSubmitInfo* submits, uint32_t submitCount)
+{
+   for (uint32_t i = 0; i < submitCount; ++i)
+      if (submits[i].commandBufferCount) return true;
+   return false;
+}
+
+static inline bool has_cmd_buffers2(const VkSubmitInfo2* submits, uint32_t submitCount)
+{
+   for (uint32_t i = 0; i < submitCount; ++i)
+      if (submits[i].commandBufferInfoCount) return true;
+   return false;
+}
+#endif
 
 static void shutdown_swapchain_font(struct swapchain_data*);
 
@@ -490,6 +553,15 @@ static void snapshot_swapchain_frame(struct swapchain_data *data)
 
 #if defined(__ANDROID__)
    if (device_data->android_gpu_ctx && gpus) {
+
+      // (추가) 매 프레임 get_metrics 하지 말고 interval마다 1회만
+      const uint64_t now = android_vk_now_ns();
+      if (!android_vk_try_tick(device_data->android_vk_next_metrics_poll_ns,
+                               device_data->android_vk_interval_ns,
+                               now)) {
+         return; // snapshot_swapchain_frame() 내부라면 그냥 스킵
+      }
+
       float gpu_ms    = 0.f;
       float gpu_usage = 0.f;
 
@@ -1924,20 +1996,25 @@ static VkResult overlay_QueueSubmit(
    struct device_data *device_data = queue_data->device;
 
 #if defined(__ANDROID__)
-   // 안드로이드 GPU 계측:
-   //  - 컨텍스트가 있고
-   //  - 실제 커맨드가 존재하며
-   //  - 그래픽 큐인 경우에만 래핑
    if (device_data->android_gpu_ctx &&
        submitCount > 0 &&
-       (queue_data->flags & VK_QUEUE_GRAPHICS_BIT)) {
-      return android_gpu_usage_queue_submit(
-          device_data->android_gpu_ctx,
-          queue,
-          queue_data->family_index,
-          submitCount,
-          pSubmits,
-          fence);
+       (queue_data->flags & VK_QUEUE_GRAPHICS_BIT) &&
+       has_cmd_buffers(pSubmits, submitCount)) {
+
+      const uint64_t now = android_vk_now_ns();
+
+      // interval 당 "한 번만" 계측. 나머지는 패스스루.
+      if (android_vk_try_tick(device_data->android_vk_next_submit_sample_ns,
+                              device_data->android_vk_interval_ns,
+                              now)) {
+         return android_gpu_usage_queue_submit(
+             device_data->android_gpu_ctx,
+             queue,
+             queue_data->family_index,
+             submitCount,
+             pSubmits,
+             fence);
+      }
    }
 #endif
 
@@ -1954,17 +2031,24 @@ static VkResult overlay_QueueSubmit2(
    struct device_data *device_data = queue_data->device;
 
 #if defined(__ANDROID__)
-   // DXVK 2.x / vkd3d 등이 QueueSubmit2*만 쓰는 경우까지 계측
    if (device_data->android_gpu_ctx &&
        submitCount > 0 &&
-       (queue_data->flags & VK_QUEUE_GRAPHICS_BIT)) {
-      return android_gpu_usage_queue_submit2(
-          device_data->android_gpu_ctx,
-          queue,
-          queue_data->family_index,
-          submitCount,
-          pSubmits,
-          fence);
+       (queue_data->flags & VK_QUEUE_GRAPHICS_BIT) &&
+       has_cmd_buffers2(pSubmits, submitCount)) {
+
+      const uint64_t now = android_vk_now_ns();
+
+      if (android_vk_try_tick(device_data->android_vk_next_submit_sample_ns,
+                              device_data->android_vk_interval_ns,
+                              now)) {
+         return android_gpu_usage_queue_submit2(
+             device_data->android_gpu_ctx,
+             queue,
+             queue_data->family_index,
+             submitCount,
+             pSubmits,
+             fence);
+      }
    }
 #endif
 
@@ -2052,74 +2136,79 @@ static VkResult overlay_CreateDevice(
 
 #if defined(__ANDROID__)
 {
-    AndroidVkGpuDispatch disp{};
+    // 0) 정책: 기본 OFF (kgsl 기본이면 Vulkan 계측은 진짜 fallback)
+    device_data->android_vk_gpu_usage_enabled = android_vk_read_enabled();
+    device_data->android_vk_interval_ns       = android_vk_read_interval_ns();
 
-    // 1.x path는 기존 vtable 그대로
-    disp.QueueSubmit            = device_data->vtable.QueueSubmit;
+    if (!device_data->android_vk_gpu_usage_enabled) {
+        // 완전 비활성: 훅은 남아도 ctx가 null이라 비용 0
+        device_data->android_gpu_ctx = nullptr;
+    } else {
+        AndroidVkGpuDispatch disp{};
 
-    // sync2 계열은 항상 GetDeviceProcAddr로 동적 로드
-    disp.QueueSubmit2           = device_data->real_QueueSubmit2;
-    disp.QueueSubmit2KHR        = device_data->real_QueueSubmit2KHR;
+        disp.QueueSubmit            = device_data->vtable.QueueSubmit;
+        disp.QueueSubmit2           = device_data->real_QueueSubmit2;
+        disp.QueueSubmit2KHR        = device_data->real_QueueSubmit2KHR;
 
-    disp.CreateQueryPool        = device_data->vtable.CreateQueryPool;
-    disp.DestroyQueryPool       = device_data->vtable.DestroyQueryPool;
-    disp.GetQueryPoolResults    = device_data->vtable.GetQueryPoolResults;
+        disp.CreateQueryPool        = device_data->vtable.CreateQueryPool;
+        disp.DestroyQueryPool       = device_data->vtable.DestroyQueryPool;
+        disp.GetQueryPoolResults    = device_data->vtable.GetQueryPoolResults;
 
-    disp.CreateCommandPool      = device_data->vtable.CreateCommandPool;
-    disp.DestroyCommandPool     = device_data->vtable.DestroyCommandPool;
-    disp.ResetCommandPool       = device_data->vtable.ResetCommandPool;
-    disp.AllocateCommandBuffers = device_data->vtable.AllocateCommandBuffers;
-    disp.FreeCommandBuffers     = device_data->vtable.FreeCommandBuffers;
-    disp.BeginCommandBuffer     = device_data->vtable.BeginCommandBuffer;
-    disp.EndCommandBuffer       = device_data->vtable.EndCommandBuffer;
+        disp.CreateCommandPool      = device_data->vtable.CreateCommandPool;
+        disp.DestroyCommandPool     = device_data->vtable.DestroyCommandPool;
+        disp.ResetCommandPool       = device_data->vtable.ResetCommandPool;
+        disp.AllocateCommandBuffers = device_data->vtable.AllocateCommandBuffers;
+        disp.FreeCommandBuffers     = device_data->vtable.FreeCommandBuffers;
+        disp.BeginCommandBuffer     = device_data->vtable.BeginCommandBuffer;
+        disp.EndCommandBuffer       = device_data->vtable.EndCommandBuffer;
 
-    disp.CmdWriteTimestamp      = device_data->vtable.CmdWriteTimestamp;
-    disp.CmdResetQueryPool      = device_data->vtable.CmdResetQueryPool;
-    disp.CmdPipelineBarrier     = device_data->vtable.CmdPipelineBarrier;
+        disp.CmdWriteTimestamp      = device_data->vtable.CmdWriteTimestamp;
+        disp.CmdResetQueryPool      = device_data->vtable.CmdResetQueryPool;
+        disp.CmdPipelineBarrier     = device_data->vtable.CmdPipelineBarrier;
 
-    float ts_ns = device_data->properties.limits.timestampPeriod;
+        float ts_ns = device_data->properties.limits.timestampPeriod;
 
-    uint32_t ts_valid_bits = 0;
-    uint32_t qf_count = 0;
-    instance_data->vtable.GetPhysicalDeviceQueueFamilyProperties(
-        device_data->physical_device, &qf_count, nullptr);
-
-    if (qf_count > 0) {
-        std::vector<VkQueueFamilyProperties> qf(qf_count);
+        uint32_t ts_valid_bits = 0;
+        uint32_t qf_count = 0;
         instance_data->vtable.GetPhysicalDeviceQueueFamilyProperties(
-            device_data->physical_device, &qf_count, qf.data());
+            device_data->physical_device, &qf_count, nullptr);
 
-        // 1차: graphics 큐 우선
-        for (uint32_t i = 0; i < qf_count; ++i) {
-            if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-                ts_valid_bits = qf[i].timestampValidBits;
-                if (ts_valid_bits)
-                    break;
-            }
-        }
+        if (qf_count > 0) {
+            std::vector<VkQueueFamilyProperties> qf(qf_count);
+            instance_data->vtable.GetPhysicalDeviceQueueFamilyProperties(
+                device_data->physical_device, &qf_count, qf.data());
 
-        if (!ts_valid_bits) {
+            // graphics 큐 우선
             for (uint32_t i = 0; i < qf_count; ++i) {
-                if (qf[i].timestampValidBits) {
+                if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
                     ts_valid_bits = qf[i].timestampValidBits;
-                    break;
+                    if (ts_valid_bits) break;
+                }
+            }
+            if (!ts_valid_bits) {
+                for (uint32_t i = 0; i < qf_count; ++i) {
+                    if (qf[i].timestampValidBits) {
+                        ts_valid_bits = qf[i].timestampValidBits;
+                        break;
+                    }
                 }
             }
         }
-    }
 
-    if (ts_ns <= 0.0f || !ts_valid_bits) {
-        SPDLOG_WARN(
-            "Android GPU usage: disabling Vulkan timestamp backend "
-            "(timestampPeriod={}, validBits={})",
-            ts_ns, ts_valid_bits);
-    } else {
-        device_data->android_gpu_ctx =
-            android_gpu_usage_create(device_data->physical_device,
-                                     device_data->device,
-                                     ts_ns,
-                                     ts_valid_bits,
-                                     disp);
+        if (ts_ns <= 0.0f || !ts_valid_bits) {
+            SPDLOG_WARN(
+                "Android GPU usage: Vulkan timestamp backend requested but unsupported "
+                "(timestampPeriod={}, validBits={})",
+                ts_ns, ts_valid_bits);
+            device_data->android_gpu_ctx = nullptr;
+        } else {
+            device_data->android_gpu_ctx =
+                android_gpu_usage_create(device_data->physical_device,
+                                         device_data->device,
+                                         ts_ns,
+                                         ts_valid_bits,
+                                         disp);
+        }
     }
 }
 #endif
