@@ -1,57 +1,87 @@
 #pragma once
 #include <vulkan/vulkan.h>
 
-#ifndef PFN_vkQueueSubmit2
+/*
+ * Vulkan header 호환 레이어:
+ * - 코어(1.3) submit2가 있으면 그대로 사용
+ * - KHR만 있으면 "코어 이름"을 KHR로 alias
+ * - 둘 다 없으면(아주 구형 헤더) 최소 정의를 제공
+ *
+ * NOTE: sType 숫자는 Vulkan spec 값(100031400x)을 반드시 사용한다.
+ */
 
-// VkFlags 기반
+// ------------------------------
+// 1) PFN alias: KHR만 있는 경우
+// ------------------------------
+#if !defined(PFN_vkQueueSubmit2) && defined(PFN_vkQueueSubmit2KHR)
+typedef PFN_vkQueueSubmit2KHR PFN_vkQueueSubmit2;
+#endif
+
+// ------------------------------
+// 2) 코어 타입이 없고, KHR 타입/매크로가 있는 경우 alias
+//    (헤더가 VK_KHR_synchronization2만 제공하는 흔한 케이스)
+// ------------------------------
+#if !defined(VK_STRUCTURE_TYPE_SUBMIT_INFO_2) && defined(VK_STRUCTURE_TYPE_SUBMIT_INFO_2_KHR)
+  #define VK_STRUCTURE_TYPE_SUBMIT_INFO_2 VK_STRUCTURE_TYPE_SUBMIT_INFO_2_KHR
+#endif
+#if !defined(VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO) && defined(VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO_KHR)
+  #define VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO_KHR
+#endif
+#if !defined(VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO) && defined(VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO_KHR)
+  #define VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO_KHR
+#endif
+
+// ------------------------------
+// 3) submit2 자체가 헤더에 아예 없는 경우(구형): 최소 정의
+//    - 우리 코드가 실제로 사용하는 건 VkSubmitInfo2 / VkCommandBufferSubmitInfo / PFN_vkQueueSubmit2 뿐
+// ------------------------------
+#if !defined(PFN_vkQueueSubmit2) && !defined(PFN_vkQueueSubmit2KHR)
+
 typedef VkFlags VkSubmitFlags;
 
-// forward decl
+// forward decl (우린 이 타입을 "참조"만 한다)
 typedef struct VkSemaphoreSubmitInfo VkSemaphoreSubmitInfo;
 
-// 스펙 그대로 레이아웃 맞춤
+#ifndef VK_STRUCTURE_TYPE_SUBMIT_INFO_2
+#define VK_STRUCTURE_TYPE_SUBMIT_INFO_2 ((VkStructureType)1000314004)
+#endif
+#ifndef VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO
+#define VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO ((VkStructureType)1000314005)
+#endif
+#ifndef VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO
+#define VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO ((VkStructureType)1000314006)
+#endif
+
 typedef struct VkCommandBufferSubmitInfo {
-    VkStructureType sType;
-    const void*     pNext;
-    VkCommandBuffer commandBuffer;
-    uint32_t        deviceMask;
+  VkStructureType sType;
+  const void*     pNext;
+  VkCommandBuffer commandBuffer;
+  uint32_t        deviceMask;
 } VkCommandBufferSubmitInfo;
 
 typedef struct VkSubmitInfo2 {
-    VkStructureType                   sType;
-    const void*                       pNext;
-    VkSubmitFlags                     flags;
-    uint32_t                          waitSemaphoreInfoCount;
-    const VkSemaphoreSubmitInfo*      pWaitSemaphoreInfos;
-    uint32_t                          commandBufferInfoCount;
-    const VkCommandBufferSubmitInfo*  pCommandBufferInfos;
-    uint32_t                          signalSemaphoreInfoCount;
-    const VkSemaphoreSubmitInfo*      pSignalSemaphoreInfos;
+  VkStructureType                   sType;
+  const void*                       pNext;
+  VkSubmitFlags                     flags;
+  uint32_t                          waitSemaphoreInfoCount;
+  const VkSemaphoreSubmitInfo*      pWaitSemaphoreInfos;
+  uint32_t                          commandBufferInfoCount;
+  const VkCommandBufferSubmitInfo*  pCommandBufferInfos;
+  uint32_t                          signalSemaphoreInfoCount;
+  const VkSemaphoreSubmitInfo*      pSignalSemaphoreInfos;
 } VkSubmitInfo2;
 
-// 함수 포인터 프로토타입 (vkQueueSubmit2 / vkQueueSubmit2KHR)
 typedef VkResult (VKAPI_PTR *PFN_vkQueueSubmit2)(
-    VkQueue            queue,
-    uint32_t           submitCount,
-    const VkSubmitInfo2* pSubmits,
-    VkFence            fence);
+  VkQueue             queue,
+  uint32_t            submitCount,
+  const VkSubmitInfo2* pSubmits,
+  VkFence             fence
+);
 
+// KHR 이름도 같이 제공(훅 코드에서 둘 다 쓰는 경우 대비)
 typedef PFN_vkQueueSubmit2 PFN_vkQueueSubmit2KHR;
 
-// 스펙 값과 맞춰둔 sType 상수들
-#ifndef VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO
-#define VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO (VkStructureType)1000267000
-#endif
-
-#ifndef VK_STRUCTURE_TYPE_SUBMIT_INFO_2
-#define VK_STRUCTURE_TYPE_SUBMIT_INFO_2 (VkStructureType)1000267007
-#endif
-
-#ifndef VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO
-#define VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO (VkStructureType)1000267008
-#endif
-
-#endif // PFN_vkQueueSubmit2
+#endif // submit2 없는 구형 헤더
 
 struct AndroidVkGpuDispatch {
     // 큐/쿼리 관련
@@ -67,14 +97,12 @@ struct AndroidVkGpuDispatch {
     PFN_vkDestroyCommandPool      DestroyCommandPool;
     PFN_vkResetCommandPool        ResetCommandPool;
     PFN_vkAllocateCommandBuffers  AllocateCommandBuffers;
-    PFN_vkFreeCommandBuffers      FreeCommandBuffers;
     PFN_vkBeginCommandBuffer      BeginCommandBuffer;
     PFN_vkEndCommandBuffer        EndCommandBuffer;
 
-    // 타임스탬프 / 쿼리 / 배리어
+    // 타임스탬프 / 쿼리
     PFN_vkCmdWriteTimestamp       CmdWriteTimestamp;
     PFN_vkCmdResetQueryPool       CmdResetQueryPool;
-    PFN_vkCmdPipelineBarrier      CmdPipelineBarrier;
 };
 
 struct AndroidVkGpuContext;
