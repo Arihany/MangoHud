@@ -6,10 +6,15 @@
 #include <vector>
 #include <limits>
 #include <cstdint>
-#include <spdlog/spdlog.h>
 #include <cstdlib>
 #include <atomic>
 #include <condition_variable>
+
+// [PATCH] 암묵 의존 제거
+#include <algorithm>   // std::min
+#include <exception>   // std::exception
+
+#include <spdlog/spdlog.h>
 
 // ====================== 내부 상태 ======================
 
@@ -60,8 +65,6 @@ struct FrameResources {
     double                                          acc_cpu_ms_sampled = 0.0;
     uint32_t                                        acc_frames_sampled = 0;
     double                                          acc_gpu_ms     = 0.0;   // "회수 성공한" GPU ms만 누적
-    double                                          acc_cpu_ms     = 0.0;   // 모든 프레임의 CPU ms 누적
-    uint32_t                                        acc_frames     = 0;     // 모든 프레임 카운트
     uint32_t                                        acc_gpu_samples= 0;     // GPU 측정 회수 성공 카운트
 
     float                                           smooth_gpu_ms = 0.0f;
@@ -116,16 +119,6 @@ namespace {
         SPDLOG_INFO("MANGOHUD_VKP=1 -> Vulkan GPU usage backend enabled");
         return true;
     }
-}
-
-// [샘플링 전략] 짝수 프레임만 계측하여 오버헤드를 50%로 줄임
-static inline bool
-android_gpu_usage_should_sample(const AndroidVkGpuContext* ctx)
-{
-    if (!ctx)
-        return false;
-    const uint64_t fi = ctx->frame_index.load(std::memory_order_relaxed);
-    return (fi & 1u) == 0u;
 }
 
 // ====================== 헬퍼: 타임스탬프 리소스 초기화 ======================
@@ -552,47 +545,6 @@ android_gpu_usage_consume_slot(AndroidVkGpuContext::FrameResources& fr)
     fr.frame_serial = std::numeric_limits<uint64_t>::max();
 }
 
-static float
-android_gpu_usage_collect_frame_gpu_ms(AndroidVkGpuContext* ctx,
-                                       AndroidVkGpuContext::FrameResources& fr)
-{
-    if (!ctx ||
-        !ctx->ts_supported.load(std::memory_order_relaxed) ||
-        ctx->query_pool == VK_NULL_HANDLE)
-        return 0.0f;
-
-    if (!fr.has_queries || fr.query_used < 2)
-        return 0.0f;
-
-    float gpu_ms = 0.0f;
-    const auto st = android_gpu_usage_query_range_gpu_ms(
-        ctx, fr.query_start, fr.query_used, &gpu_ms
-    );
-
-    if (st == AndroidGpuReadStatus::DeviceLost) {
-        SPDLOG_WARN("Android GPU usage: DEVICE_LOST on GetQueryPoolResults, disabling timestamp backend");
-        ctx->ts_supported = false;
-        android_gpu_usage_consume_slot(fr);
-        android_gpu_usage_destroy_timestamp_resources(ctx);
-        return 0.0f;
-    }
-
-    if (st == AndroidGpuReadStatus::Error) {
-        // 오류면 슬롯을 붙잡고 있으면 영구 정지될 수 있으니 소비하고 버린다.
-        android_gpu_usage_consume_slot(fr);
-        return 0.0f;
-    }
-
-    if (st == AndroidGpuReadStatus::NotReady) {
-        // 핵심: 미준비면 슬롯 유지
-        return 0.0f;
-    }
-
-    // Ready
-    android_gpu_usage_consume_slot(fr);
-    return gpu_ms;
-}
-
 // ====================== 외부 API ======================
 
 AndroidVkGpuContext*
@@ -608,6 +560,11 @@ android_gpu_usage_create(VkPhysicalDevice            phys_dev,
     ctx->disp          = disp;
     ctx->ts_period_ns  = (timestamp_period_ns > 0.0f) ? timestamp_period_ns : 0.0f;
     ctx->ts_valid_bits = timestamp_valid_bits;
+
+    // [PATCH] submit2 함수 포인터 정규화: 런타임 분기 제거
+    // - KHR만 있는 환경에서도 QueueSubmit2 하나로 호출 가능하게 만든다.
+    if (!ctx->disp.QueueSubmit2 && ctx->disp.QueueSubmit2KHR)
+        ctx->disp.QueueSubmit2 = ctx->disp.QueueSubmit2KHR;
 
     // 정책: 기본 OFF. MANGOHUD_VKP=1일 때만 Vulkan 경로 활성.
     if (!android_gpu_usage_env_enabled()) {
@@ -709,14 +666,12 @@ android_gpu_usage_queue_submit(AndroidVkGpuContext* ctx,
             ? ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence)
             : VK_ERROR_INITIALIZATION_FAILED;
 
-    if (!android_gpu_usage_env_enabled())
-        return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
-
     if (!ctx->ts_supported.load(std::memory_order_relaxed))
         return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
 
     // fast-path: 샘플링 안 하는 프레임이면 락을 아예 안 잡는다
-    if (!android_gpu_usage_should_sample(ctx))
+    // [PATCH] 함수 호출 제거: 단순 비트 체크
+    if (ctx->frame_index.load(std::memory_order_relaxed) & 1u)
         return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
 
     // [ROLLBACK GUARD] 예외로 빠져도 슬롯이 오염(제출 안 된 query)되지 않게 복구한다.
@@ -771,7 +726,6 @@ android_gpu_usage_queue_submit(AndroidVkGpuContext* ctx,
         inst.resize(n);
 
         uint32_t total_cmds = 0;
-        uint32_t tmp_used   = fr.query_used;
         bool any_inst = false;
 
         // [PATCH] "프레임당 계측 상한"을 진짜로 지키기 위한 계산.
@@ -922,9 +876,6 @@ android_gpu_usage_queue_submit2(AndroidVkGpuContext* ctx,
         return fpSubmit2 ? fpSubmit2(queue, submitCount, pSubmits, fence)
                          : VK_ERROR_INITIALIZATION_FAILED;
 
-    if (!android_gpu_usage_env_enabled())
-        return fpSubmit2(queue, submitCount, pSubmits, fence);
-
     if (!ctx->ts_supported.load(std::memory_order_relaxed))
         return fpSubmit2(queue, submitCount, pSubmits, fence);
 
@@ -982,7 +933,6 @@ android_gpu_usage_queue_submit2(AndroidVkGpuContext* ctx,
         inst.resize(n);
 
         uint32_t total_infos = 0;
-        uint32_t tmp_used    = fr.query_used;
         bool any_inst = false;
 
         // [PATCH] "프레임당 계측 상한"을 진짜로 지키기 위한 계산.
@@ -1175,7 +1125,6 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
 
             // [PATCH] CPU dt를 "현재 serial" 슬롯에 저장해서, 나중에 GPU serial이랑 매칭한다.
             const uint64_t cur_serial = ctx->frame_index.load(std::memory_order_relaxed);
-            const uint32_t cur_idx = static_cast<uint32_t>(cur_serial % AndroidVkGpuContext::MAX_FRAMES);
             auto& cs = ctx->cpu_ring[cur_serial & (AndroidVkGpuContext::CPU_RING - 1u)];
             cs.serial = cur_serial;
             cs.ms     = frame_cpu_ms;
