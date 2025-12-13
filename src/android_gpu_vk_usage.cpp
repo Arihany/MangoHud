@@ -94,8 +94,6 @@ template <typename SubmitT>
 static inline bool
 plan_instrumentation(const SubmitT* submits,
                      uint32_t n,
-                     uint32_t query_used,
-                     uint32_t query_capacity,
                      uint32_t pairs_left,
                      std::vector<uint8_t>& inst,
                      std::vector<uint32_t>& counts,
@@ -112,8 +110,7 @@ plan_instrumentation(const SubmitT* submits,
         const uint32_t base = SubmitTraits<SubmitT>::base_count(submits[i]);
         const bool can =
             SubmitTraits<SubmitT>::has_cmds(submits[i]) &&
-            (planned < pairs_left) &&
-            (query_used + (planned + 1u) * 2u <= query_capacity);
+            (planned < pairs_left);
 
         if (can) {
             inst[i] = 1;
@@ -278,6 +275,17 @@ disarm_in_submit_locked(AndroidVkGpuContext* ctx, bool& armed, uint32_t slot_idx
 }
 
 static inline void
+rollback_slot_if_safe_locked(AndroidVkGpuContext* ctx,
+                             AndroidVkGpuContext::FrameResources& fr,
+                             uint64_t serial_snapshot,
+                             uint32_t saved_query_used,
+                             bool saved_has_queries,
+                             uint32_t reserved_delta_queries) noexcept
+{
+    // BUGFIX: 이 함수는 bool을 리턴해야 호출부와 의미가 맞는다.
+}
+
+static inline bool
 rollback_slot_if_safe_locked(AndroidVkGpuContext* ctx,
                              AndroidVkGpuContext::FrameResources& fr,
                              uint64_t serial_snapshot,
@@ -843,7 +851,7 @@ android_gpu_usage_init_timestamp_resources(AndroidVkGpuContext* ctx,
         SPDLOG_WARN(
             "Android GPU usage: Create/ResetCommandPool not available → disabling timestamp backend"
         );
-        ctx->ts_supported = false;
+        ctx->ts_supported.store(false, std::memory_order_relaxed);
         return false;
     }
 
@@ -863,7 +871,7 @@ android_gpu_usage_init_timestamp_resources(AndroidVkGpuContext* ctx,
             qp.queryCount
         );
         ctx->query_pool   = VK_NULL_HANDLE;
-        ctx->ts_supported = false;
+        ctx->ts_supported.store(false, std::memory_order_relaxed);
         return false;
     }
 
@@ -882,7 +890,7 @@ android_gpu_usage_init_timestamp_resources(AndroidVkGpuContext* ctx,
                 i
             );
             android_gpu_usage_destroy_timestamp_resources(ctx);
-            ctx->ts_supported = false;
+            ctx->ts_supported.store(false, std::memory_order_relaxed);
             return false;
         }
 
@@ -901,7 +909,7 @@ android_gpu_usage_init_timestamp_resources(AndroidVkGpuContext* ctx,
         if (!ctx->disp.AllocateCommandBuffers) {
             SPDLOG_WARN("Android GPU usage: AllocateCommandBuffers missing -> disable backend");
             android_gpu_usage_destroy_timestamp_resources(ctx);
-            ctx->ts_supported = false;
+            ctx->ts_supported.store(false, std::memory_order_relaxed);
             return false;
         }
 
@@ -915,7 +923,7 @@ android_gpu_usage_init_timestamp_resources(AndroidVkGpuContext* ctx,
         if (ctx->disp.AllocateCommandBuffers(ctx->device, &ai, tmp.data()) != VK_SUCCESS) {
             SPDLOG_WARN("Android GPU usage: prealloc AllocateCommandBuffers failed at slot {} -> disable", i);
             android_gpu_usage_destroy_timestamp_resources(ctx);
-            ctx->ts_supported = false;
+            ctx->ts_supported.store(false, std::memory_order_relaxed);
             return false;
         }
 
@@ -1222,7 +1230,7 @@ android_gpu_usage_create(VkPhysicalDevice            phys_dev,
     
     // 정책: 기본 OFF. MANGOHUD_VKP=1일 때만 Vulkan 경로 활성.
     if (!android_gpu_usage_env_enabled()) {
-        ctx->ts_supported = false;
+        ctx->ts_supported.store(false, std::memory_order_relaxed);
         SPDLOG_INFO(
             "Android GPU usage: backend disabled (MANGOHUD_VKP!=1), context will be no-op"
         );
@@ -1305,6 +1313,20 @@ android_gpu_usage_destroy(AndroidVkGpuContext* ctx)
     delete ctx;
 }
 
+template <typename SubmitT>
+static inline bool
+android_gpu_usage_can_wrap_submit(AndroidVkGpuContext* ctx,
+                                  uint32_t submitCount,
+                                  const SubmitT* pSubmits) noexcept
+{
+    if (!ctx || !pSubmits || submitCount == 0) return false;
+    if (ctx->destroying.load(std::memory_order_acquire)) return false;
+    if (!ctx->ts_supported.load(std::memory_order_relaxed)) return false;
+    if (!android_gpu_usage_should_sample(ctx)) return false;
+    if (submitCount > kSubmitCountHardCap) return false;
+    return true;
+}
+
 // ====================== QueueSubmit(v1) 래핑 ======================
 
 VkResult
@@ -1323,16 +1345,7 @@ android_gpu_usage_queue_submit(AndroidVkGpuContext* ctx,
              ? ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence)
              : VK_ERROR_INITIALIZATION_FAILED;
 
-    if (ctx->destroying.load(std::memory_order_acquire))
-        return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
-
-    if (!ctx->ts_supported.load(std::memory_order_relaxed))
-        return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
-
-    if (!android_gpu_usage_should_sample(ctx))
-        return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
-
-    if (submitCount > kSubmitCountHardCap)
+    if (!android_gpu_usage_can_wrap_submit(ctx, submitCount, pSubmits))
         return ctx->disp.QueueSubmit(queue, submitCount, pSubmits, fence);
 
     auto submit_fn = [&](uint32_t n, const VkSubmitInfo* s, VkFence f) -> VkResult {
@@ -1367,16 +1380,7 @@ android_gpu_usage_queue_submit2(AndroidVkGpuContext* ctx,
         return fpSubmit2 ? fpSubmit2(queue, submitCount, pSubmits, fence)
                          : VK_ERROR_INITIALIZATION_FAILED;
 
-    if (ctx->destroying.load(std::memory_order_acquire))
-        return fpSubmit2(queue, submitCount, pSubmits, fence);
-
-    if (!ctx->ts_supported.load(std::memory_order_relaxed))
-        return fpSubmit2(queue, submitCount, pSubmits, fence);
-
-    if (!android_gpu_usage_should_sample(ctx))
-        return fpSubmit2(queue, submitCount, pSubmits, fence);
-
-    if (submitCount > kSubmitCountHardCap)
+    if (!android_gpu_usage_can_wrap_submit(ctx, submitCount, pSubmits))
         return fpSubmit2(queue, submitCount, pSubmits, fence);
 
     auto submit_fn = [&](uint32_t n, const VkSubmitInfo2* s, VkFence f) -> VkResult {
@@ -1458,7 +1462,7 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
             
             if (mode == BackendMode::Disabled) {
                 // 완전 종료 상태: 프레임 인덱스만 굴리고 끝
-                ctx->frame_index++;
+                ctx->frame_index.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
             
@@ -1555,7 +1559,7 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
 
             // 읽기를 시도하지도 않았는데 NotReady를 쌓아올리면, 언젠가 이유 없이 suspend 된다.
             if (!attempted_read) {
-                ctx->frame_index++;
+                ctx->frame_index.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
             if (st == AndroidGpuReadStatus::DeviceLost) {
@@ -1615,7 +1619,7 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
                 }
                 frame_gpu_ms = 0.0f;
             }
-            ctx->frame_index++;
+            ctx->frame_index.fetch_add(1, std::memory_order_relaxed);
         }
 
         // --------- (D) metrics lock: smoothing/last metrics (submit과 분리) ---------
