@@ -1,7 +1,6 @@
 #include <vulkan/vulkan.h>
 #include "android_gpu_vk_usage.h"
 
-#include <array>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -132,7 +131,6 @@ plan_instrumentation(const SubmitT* submits,
     return any;
 }
 
-template <typename SubmitFn, typename SubmitT>
 struct SubmitAttempt {
     VkResult vr;
     bool     instrumented_executed; // 계측 삽입 submit이 실제로 성공 실행됐는가
@@ -169,12 +167,6 @@ struct AndroidVkGpuContext {
     uint64_t                ts_mask       = ~0ULL;
     std::atomic<bool>       ts_supported{false};
 
-    // Optional host-side query reset (prevents stale query values before cmd-reset executes).
-    // - Vulkan 1.2+ core: vkResetQueryPool
-    // - Vulkan 1.0/1.1: VK_EXT_host_query_reset: vkResetQueryPoolEXT (if enabled)
-    PFN_vkResetQueryPool     fpResetQueryPool    = nullptr;
-    PFN_vkResetQueryPoolEXT  fpResetQueryPoolEXT = nullptr;
-
     VkQueryPool             query_pool    = VK_NULL_HANDLE;
     uint32_t                queue_family_index = VK_QUEUE_FAMILY_IGNORED;
 
@@ -182,7 +174,6 @@ struct AndroidVkGpuContext {
     static constexpr uint32_t MAX_FRAMES            = 16;   // 슬롯 개수
     static constexpr uint32_t MAX_QUERIES_PER_FRAME = 128;  // 슬롯당 쿼리 개수 (start/end 2개씩 → submit 최대 64개)
     static constexpr uint32_t FRAME_LAG             = 3;    // 몇 프레임 뒤에 슬롯을 읽고 해제할지
-    static constexpr uint32_t WARMUP_TIMESTAMP_PAIRS= 0; // (deprecated) 이제 prealloc로 고정
 
     std::atomic<BackendMode> mode{BackendMode::Active};
 
@@ -282,7 +273,7 @@ android_gpu_usage_record_timestamp_pair(AndroidVkGpuContext* ctx,
                                         uint32_t& out_query_first,
                                         VkCommandBuffer& out_cmd_begin,
                                         VkCommandBuffer& out_cmd_end);
-
+// (삭제) 위 선언은 더 이상 사용되지 않는다. reserve+record_unlocked로 완전 전환됨.
 // ====================== submit commit/rollback helpers ======================
 namespace {
 static inline void
@@ -301,12 +292,13 @@ rollback_slot_if_safe_locked(AndroidVkGpuContext* ctx,
                              bool saved_has_queries,
                              uint32_t reserved_delta_queries) noexcept
 {
-    if (!ctx) return;
-    if (ctx->destroying.load(std::memory_order_relaxed)) return;
-    if (fr.frame_serial != serial_snapshot) return;
-    if (fr.query_used != saved_query_used + reserved_delta_queries) return;
+    if (!ctx) return false;
+    if (ctx->destroying.load(std::memory_order_relaxed)) return false;
+    if (fr.frame_serial != serial_snapshot) return false;
+    if (fr.query_used != saved_query_used + reserved_delta_queries) return false;
     fr.query_used  = saved_query_used;
     fr.has_queries = saved_has_queries;
+    return true;
 }
 
 static inline void
@@ -326,7 +318,7 @@ finalize_submit_locked(AndroidVkGpuContext* ctx,
         return;
     }
 
-    rollback_slot_if_safe_locked(ctx, fr, serial_snapshot,
+    (void)rollback_slot_if_safe_locked(ctx, fr, serial_snapshot,
                                  saved_query_used, saved_has_queries,
                                  reserved_delta_queries);
 
@@ -632,18 +624,18 @@ android_gpu_usage_queue_submit_impl(AndroidVkGpuContext* ctx,
             auto& fr3 = ctx->frames[armed_slot_idx];
             disarm_in_submit_locked(ctx, armed_slot, armed_slot_idx);
             const bool had_pending_before = saved_has_queries || (fr3.valid_pairs_mask != 0);
-            if (!had_pending_before) {
-                // 이 슬롯에 제출된 timestamp CB가 없을 때만 안전하게 되돌리고 리셋 가능
+            const bool rolled =
                 rollback_slot_if_safe_locked(ctx, fr3, serial_snapshot,
                                              saved_query_used, saved_has_queries,
                                              reserved_delta_queries);
-                if (ctx->disp.ResetCommandPool && fr3.cmd_pool != VK_NULL_HANDLE) {
+
+            // pending이 있으면 ResetCommandPool만 금지. rollback은 "safe 조건"일 때만 실행되므로 OK.
+            if (!had_pending_before) {
+                if (rolled && ctx->disp.ResetCommandPool && fr3.cmd_pool != VK_NULL_HANDLE) {
                     ctx->disp.ResetCommandPool(ctx->device, fr3.cmd_pool, 0);
                 }
             } else {
-                // pending이 있을 수 있으니 reset/rollback 금지: 이번 예약분은 "버림"
-                // (query_used는 유지, valid_mask에는 커밋 안 됐으므로 읽기에서 자동 무시됨)
-                fr3.has_queries = true; // 기존 pending 유지 의미 (보수적으로)
+                fr3.has_queries = (fr3.valid_pairs_mask != 0) || saved_has_queries;
             }
             android_gpu_usage_suspend_locked(ctx, "record timestamp CB failed", kCooldownRecordFail);
             return submit_fn(submitCount, pSubmits, fence);
@@ -661,16 +653,17 @@ android_gpu_usage_queue_submit_impl(AndroidVkGpuContext* ctx,
             disarm_in_submit_locked(ctx, armed_slot, armed_slot_idx);
             if (!res.instrumented_executed) {
                 const bool had_pending_before = saved_has_queries || (fr2.valid_pairs_mask != 0);
-                if (!had_pending_before) {
+                const bool rolled =
                     rollback_slot_if_safe_locked(ctx, fr2, serial_snapshot,
                                                  saved_query_used, saved_has_queries,
                                                  reserved_delta_queries);
-                    if (ctx->disp.ResetCommandPool && fr2.cmd_pool != VK_NULL_HANDLE) {
+
+                if (!had_pending_before) {
+                    if (rolled && ctx->disp.ResetCommandPool && fr2.cmd_pool != VK_NULL_HANDLE) {
                         ctx->disp.ResetCommandPool(ctx->device, fr2.cmd_pool, 0);
                     }
                 } else {
-                    // 기존 pending 보호: rollback/reset 금지, 이번 예약분은 버림
-                    fr2.has_queries = true;
+                    fr2.has_queries = (fr2.valid_pairs_mask != 0) || saved_has_queries;
                 }
                 android_gpu_usage_suspend_locked(ctx,
                     "instrumented submit failed, fallback used",
@@ -1135,9 +1128,8 @@ android_gpu_usage_query_range_gpu_ms(AndroidVkGpuContext* ctx,
         const uint64_t span = wrap - max_gap; // unwrap 후 데이터가 차지하는 길이
         // span이 wrap에 너무 가까우면(데이터가 원형 전체에 퍼짐) 경계 선택이 의미 없다.
         // 이 경우는 어차피 신뢰도 박살 환경이므로, pivot 고정을 통해 폭발만 막는다.
-        if (span > (wrap * 3ULL) / 4ULL) {
-            pivot = starts[0];
-        }
+        const uint64_t thr = wrap - (wrap >> 2); // wrap*3/4 (overflow-free)
+        if (span > thr) pivot = starts[0];
 
         for (const auto& seg : segs) {
             const uint64_t delta = (seg.s_m - pivot) & mask;
@@ -1231,13 +1223,6 @@ android_gpu_usage_create(VkPhysicalDevice            phys_dev,
     // - KHR만 있는 환경에서도 QueueSubmit2 하나로 호출 가능하게 만든다.
     if (!ctx->disp.QueueSubmit2 && ctx->disp.QueueSubmit2KHR)
         ctx->disp.QueueSubmit2 = ctx->disp.QueueSubmit2KHR;
-
-    // Optional: host query reset (only if supported/enabled).
-    // Safe for dxvk 1.10.x / low Vulkan: if unsupported, pointers stay null.
-    ctx->fpResetQueryPool =
-        reinterpret_cast<PFN_vkResetQueryPool>(vkGetDeviceProcAddr(device, "vkResetQueryPool"));
-    ctx->fpResetQueryPoolEXT =
-        reinterpret_cast<PFN_vkResetQueryPoolEXT>(vkGetDeviceProcAddr(device, "vkResetQueryPoolEXT"));
     
     // 정책: 기본 OFF. MANGOHUD_VKP=1일 때만 Vulkan 경로 활성.
     if (!android_gpu_usage_env_enabled()) {
@@ -1565,6 +1550,7 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
 
         float frame_gpu_ms = 0.0f;
         AndroidGpuReadStatus st = AndroidGpuReadStatus::NotReady;
+        const bool attempted_read = read.have;
 
         if (read.have) {
             st = android_gpu_usage_query_range_gpu_ms(ctx, read.q_start, read.q_count, read.valid_mask, &frame_gpu_ms);
@@ -1574,6 +1560,11 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
         {
             std::lock_guard<std::mutex> g(ctx->lock);
 
+            // 읽기를 시도하지도 않았는데 NotReady를 쌓아올리면, 언젠가 이유 없이 suspend 된다.
+            if (!attempted_read) {
+                ctx->frame_index++;
+                return;
+            }
             if (st == AndroidGpuReadStatus::DeviceLost) {
                 ctx->ts_supported.store(false, std::memory_order_relaxed);
                 ctx->mode.store(BackendMode::Disabled, std::memory_order_relaxed);
