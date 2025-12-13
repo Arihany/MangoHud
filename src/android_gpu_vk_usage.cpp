@@ -656,6 +656,10 @@ android_gpu_usage_queue_submit_impl(AndroidVkGpuContext* ctx,
                 rollback_slot_if_safe_locked(ctx, fr2, serial_snapshot,
                                              saved_query_used, saved_has_queries,
                                              reserved_delta_queries);
+               // 녹화된 CB들이 남아있을 수 있으니 안전빵으로 리셋
+               if (ctx->disp.ResetCommandPool && fr2.cmd_pool != VK_NULL_HANDLE) {
+                   ctx->disp.ResetCommandPool(ctx->device, fr2.cmd_pool, 0);
+               }
                 android_gpu_usage_suspend_locked(ctx,
                     "instrumented submit failed, fallback used",
                     kCooldownSubmitFail);
@@ -1034,17 +1038,22 @@ android_gpu_usage_query_range_gpu_ms(AndroidVkGpuContext* ctx,
             return AndroidGpuReadStatus::NotReady;
     }
 
-    // ------------------ busy_ms = union of [start,end] intervals ------------------
-    struct Interval {
-        uint64_t s;
-        uint64_t e;
-    };
-    thread_local std::vector<Interval> iv;
-    iv.clear();
-    iv.reserve(pair_count);
+    // ------------------ busy_ms = union of [start,end] intervals (wrap-safe) ------------------
+    // timestampValidBits < 64 인 경우 값은 "원형(mod wrap)"이므로,
+    // 프레임 단위로 unwrap(한 축으로 펴기) 하지 않으면 interval 정렬/union이 깨질 수 있다.
+    const bool has_wrap =
+        (ctx->ts_valid_bits > 0 && ctx->ts_valid_bits < 64);
+    const uint64_t wrap =
+        has_wrap ? (1ULL << ctx->ts_valid_bits) : 0ULL;
+    const uint64_t mask = ctx->ts_mask;
 
-    uint64_t min_start_ts = std::numeric_limits<uint64_t>::max();
-    uint64_t max_end_ts   = 0;
+    struct Seg {
+        uint64_t s_m;   // masked start
+        uint64_t dur;   // duration in ticks (mod wrap diff)
+    };
+    thread_local std::vector<Seg> segs;
+    segs.clear();
+    segs.reserve(pair_count);
 
     for (uint32_t i = 0; i < pair_count; ++i) {
         if (((valid_pairs_mask >> i) & 1ULL) == 0ULL)
@@ -1052,18 +1061,81 @@ android_gpu_usage_query_range_gpu_ms(AndroidVkGpuContext* ctx,
         const uint32_t qs = 2u * i;
         const uint32_t qe = qs + 1u;
 
-        uint64_t start_ts = scratch[qs * 2u + 0u] & ctx->ts_mask;
-        uint64_t end_ts   = scratch[qe * 2u + 0u] & ctx->ts_mask;
+        const uint64_t s_m = scratch[qs * 2u + 0u] & mask;
+        const uint64_t e_m = scratch[qe * 2u + 0u] & mask;
 
-        if (ctx->ts_valid_bits > 0 && ctx->ts_valid_bits < 64 && end_ts < start_ts)
-            end_ts += (1ULL << ctx->ts_valid_bits);
+        uint64_t dur = 0;
+        if (!has_wrap) {
+            if (e_m <= s_m) continue;
+            dur = e_m - s_m;
+        } else {
+            // 모듈러 차이: 같은 프레임에서 1회 wrap 정도는 커버 가능
+            dur = (e_m - s_m) & mask;
+            if (dur == 0) continue;
+        }
+        segs.push_back({ s_m, dur });
+    }
 
-        if (end_ts <= start_ts) continue;
+    if (segs.empty()) {
+        *out_gpu_ms = 0.0f;
+        return AndroidGpuReadStatus::Ready;
+    }
 
-        if (start_ts < min_start_ts) min_start_ts = start_ts;
-        if (end_ts > max_end_ts)     max_end_ts   = end_ts;
+    struct Interval { uint64_t s; uint64_t e; };
+    thread_local std::vector<Interval> iv;
+    iv.clear();
+    iv.reserve(segs.size());
 
-        iv.push_back({ start_ts, end_ts });
+    uint64_t min_start_u = std::numeric_limits<uint64_t>::max();
+    uint64_t max_end_u   = 0;
+
+    if (!has_wrap || segs.size() == 1) {
+        // wrap이 없거나 interval이 1개면 기존처럼 단순 처리
+        for (const auto& seg : segs) {
+            const uint64_t s_u = seg.s_m;
+            const uint64_t e_u = s_u + seg.dur;
+            if (e_u <= s_u) continue;
+            if (s_u < min_start_u) min_start_u = s_u;
+            if (e_u > max_end_u)   max_end_u   = e_u;
+            iv.push_back({ s_u, e_u });
+        }
+    } else {
+        // (핵심) start들을 원형에서 한 축으로 unwrap
+        // - start를 정렬하고, 가장 큰 gap을 wrap 경계로 선택
+        // - 그 경계 다음 값을 pivot으로 잡고, delta = (s - pivot) & mask 로 한 줄에 펼친다.
+        thread_local std::vector<uint64_t> starts;
+        starts.clear();
+        starts.reserve(segs.size());
+        for (const auto& seg : segs) starts.push_back(seg.s_m);
+        std::sort(starts.begin(), starts.end());
+
+        uint64_t max_gap = 0;
+        size_t   max_i   = 0;
+        for (size_t i = 0; i + 1 < starts.size(); ++i) {
+            const uint64_t gap = starts[i + 1] - starts[i];
+            if (gap > max_gap) { max_gap = gap; max_i = i; }
+        }
+        // 마지막->처음 wrap gap
+        const uint64_t last_gap = (starts[0] + wrap) - starts.back();
+        if (last_gap > max_gap) { max_gap = last_gap; max_i = starts.size() - 1; }
+
+        uint64_t pivot = starts[(max_i + 1) % starts.size()];
+        const uint64_t span = wrap - max_gap; // unwrap 후 데이터가 차지하는 길이
+        // span이 wrap에 너무 가까우면(데이터가 원형 전체에 퍼짐) 경계 선택이 의미 없다.
+        // 이 경우는 어차피 신뢰도 박살 환경이므로, pivot 고정을 통해 폭발만 막는다.
+        if (span > (wrap * 3ULL) / 4ULL) {
+            pivot = starts[0];
+        }
+
+        for (const auto& seg : segs) {
+            const uint64_t delta = (seg.s_m - pivot) & mask;
+            const uint64_t s_u   = pivot + delta;
+            const uint64_t e_u   = s_u + seg.dur;
+            if (e_u <= s_u) continue;
+            if (s_u < min_start_u) min_start_u = s_u;
+            if (e_u > max_end_u)   max_end_u   = e_u;
+            iv.push_back({ s_u, e_u });
+        }
     }
 
     if (iv.empty()) {
@@ -1101,9 +1173,9 @@ android_gpu_usage_query_range_gpu_ms(AndroidVkGpuContext* ctx,
     // (옵션) 완전 망한 값 방어용 fallback: union 결과가 0이면 range로만 1회 구제.
     if (!(busy_ms > 0.0) || !std::isfinite(busy_ms)) {
         double range_ms = 0.0;
-        if (max_end_ts > min_start_ts &&
-            min_start_ts != std::numeric_limits<uint64_t>::max()) {
-            const uint64_t range_ticks = max_end_ts - min_start_ts;
+        if (max_end_u > min_start_u &&
+            min_start_u != std::numeric_limits<uint64_t>::max()) {
+            const uint64_t range_ticks = max_end_u - min_start_u;
             range_ms = double(range_ticks) * double(ctx->ts_period_ns) * 1e-6;
         }
         if (range_ms > 0.0 && std::isfinite(range_ms)) {
