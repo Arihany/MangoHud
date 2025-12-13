@@ -1015,9 +1015,16 @@ android_gpu_usage_query_range_gpu_ms(AndroidVkGpuContext* ctx,
             return AndroidGpuReadStatus::NotReady;
     }
 
+    // ------------------ busy_ms = union of [start,end] intervals ------------------
+    struct Interval {
+        uint64_t s;
+        uint64_t e;
+    };
+    std::vector<Interval> iv;
+    iv.reserve(pair_count);
+
     uint64_t min_start_ts = std::numeric_limits<uint64_t>::max();
     uint64_t max_end_ts   = 0;
-    double   sum_ms       = 0.0;
 
     for (uint32_t i = 0; i < pair_count; ++i) {
         if (((valid_pairs_mask >> i) & 1ULL) == 0ULL)
@@ -1031,34 +1038,61 @@ android_gpu_usage_query_range_gpu_ms(AndroidVkGpuContext* ctx,
         if (ctx->ts_valid_bits > 0 && ctx->ts_valid_bits < 64 && end_ts < start_ts)
             end_ts += (1ULL << ctx->ts_valid_bits);
 
-        if (end_ts <= start_ts)
-            continue;
+        if (end_ts <= start_ts) continue;
 
         if (start_ts < min_start_ts) min_start_ts = start_ts;
         if (end_ts > max_end_ts)     max_end_ts   = end_ts;
 
-        const uint64_t delta = end_ts - start_ts;
-        const double ns = double(delta) * double(ctx->ts_period_ns);
-        const double ms = ns * 1e-6;
-        if (ms > 0.0 && std::isfinite(ms))
-            sum_ms += ms;
+        iv.push_back({ start_ts, end_ts });
     }
 
-    double range_ms = 0.0;
-    if (max_end_ts > min_start_ts && min_start_ts != std::numeric_limits<uint64_t>::max()) {
-        const uint64_t range_ticks = max_end_ts - min_start_ts;
-        range_ms = double(range_ticks) * double(ctx->ts_period_ns) * 1e-6;
-    }
-
-    // GPU usage(바쁨) 용도면 sum_ms가 더 정직하다.
-    double gpu_ms = 0.0;
-    if (sum_ms > 0.0 && std::isfinite(sum_ms)) gpu_ms = sum_ms;
-    else if (range_ms > 0.0 && std::isfinite(range_ms)) gpu_ms = range_ms;
-
-    if (!(gpu_ms > 0.0) || !std::isfinite(gpu_ms))
+    if (iv.empty())
         return AndroidGpuReadStatus::Error;
 
-    *out_gpu_ms = (float)gpu_ms;
+    std::sort(iv.begin(), iv.end(),
+              [](const Interval& a, const Interval& b) {
+                  if (a.s != b.s) return a.s < b.s;
+                  return a.e < b.e;
+              });
+
+    uint64_t busy_ticks = 0;
+    uint64_t cur_s = iv[0].s;
+    uint64_t cur_e = iv[0].e;
+    for (size_t k = 1; k < iv.size(); ++k) {
+        const uint64_t s = iv[k].s;
+        const uint64_t e = iv[k].e;
+        if (s <= cur_e) {
+            if (e > cur_e) cur_e = e;
+        } else {
+            busy_ticks += (cur_e - cur_s);
+            cur_s = s;
+            cur_e = e;
+        }
+    }
+    busy_ticks += (cur_e - cur_s);
+
+    double busy_ms = 0.0;
+    if (busy_ticks > 0) {
+        busy_ms = double(busy_ticks) * double(ctx->ts_period_ns) * 1e-6;
+    }
+
+    // (옵션) 완전 망한 값 방어용 fallback: union 결과가 0이면 range로만 1회 구제.
+    if (!(busy_ms > 0.0) || !std::isfinite(busy_ms)) {
+        double range_ms = 0.0;
+        if (max_end_ts > min_start_ts &&
+            min_start_ts != std::numeric_limits<uint64_t>::max()) {
+            const uint64_t range_ticks = max_end_ts - min_start_ts;
+            range_ms = double(range_ticks) * double(ctx->ts_period_ns) * 1e-6;
+        }
+        if (range_ms > 0.0 && std::isfinite(range_ms)) {
+            busy_ms = range_ms;
+        }
+    }
+
+    if (!(busy_ms > 0.0) || !std::isfinite(busy_ms))
+        return AndroidGpuReadStatus::Error;
+
+    *out_gpu_ms = (float)busy_ms;
     return AndroidGpuReadStatus::Ready;
 }
 
