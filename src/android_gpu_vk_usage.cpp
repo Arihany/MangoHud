@@ -18,7 +18,7 @@
 namespace {
 // Hard safety caps (OOM/폭주 방지). 프리징(ms 커짐)은 정상이고 입력 크기만 막는다.
 constexpr uint32_t kSubmitCountHardCap = 1024;
-constexpr uint64_t kFlattenHardCap     = 8192;
+constexpr uint64_t kFlattenHardCap     = 4096;
 
 // Sample policy
 constexpr uint32_t kMaxPairsPerSampledFrame = 16;
@@ -179,7 +179,6 @@ struct AndroidVkGpuContext {
     std::chrono::steady_clock::time_point suspend_until{};
     // NotReady 연속/오류 연속 카운트 (복구 정책용)
     uint32_t notready_streak = 0;
-    uint32_t error_streak    = 0;
 
     // Suspended에서 too-hot loop 방지용: 마지막 probe 시각
     std::chrono::steady_clock::time_point last_probe{};
@@ -682,33 +681,29 @@ android_gpu_usage_queue_submit_impl(AndroidVkGpuContext* ctx,
 namespace {
 static bool android_gpu_usage_env_enabled()
 {
-        // -1 = unknown, 0 = disabled, 1 = enabled
-        static std::atomic<int> cached{-1};
+    // -1 = unknown, 0 = disabled, 1 = enabled
+    static std::atomic<int> cached{-1};
 
-        int v = cached.load(std::memory_order_acquire);
-        if (v != -1)
-            return v != 0;
+    int v = cached.load(std::memory_order_acquire);
+    if (v != -1) return v != 0;
 
-        const char* env = std::getenv("MANGOHUD_VKP");
-        const bool enabled = (env && env[0] == '1' && env[1] == '\0');
-        const int  newv    = enabled ? 1 : 0;
+    const char* env = std::getenv("MANGOHUD_VKP");
+    const bool enabled = (env && env[0] == '1' && env[1] == '\0');
+    const int newv = enabled ? 1 : 0;
 
-        int expected = -1;
-        if (cached.compare_exchange_strong(expected, newv,
-                                           std::memory_order_release,
-                                           std::memory_order_relaxed))
-        {
-            // 최초 결정한 스레드만 로그 1회
-            if (!enabled) {
-                SPDLOG_INFO("MANGOHUD_VKP!=1 -> Vulkan GPU usage backend disabled (fdinfo + kgsl remains default)");
-            } else {
-                SPDLOG_INFO("MANGOHUD_VKP=1 -> Vulkan GPU usage backend enabled");
-            }
-            return enabled;
-        }
-
-        // 누군가 먼저 결정했으면 그 결과를 따른다
-        return cached.load(std::memory_order_acquire) != 0;
+    int expected = -1;
+    if (cached.compare_exchange_strong(expected, newv,
+                                       std::memory_order_release,
+                                       std::memory_order_relaxed)) {
+        // 최초 결정한 스레드만 로그 1회
+        if (!enabled)
+            SPDLOG_INFO("MANGOHUD_VKP!=1 -> Vulkan GPU usage backend disabled (fdinfo + kgsl remains default)");
+        else
+            SPDLOG_INFO("MANGOHUD_VKP=1 -> Vulkan GPU usage backend enabled");
+        return enabled;
+    }
+    // 누군가 먼저 결정했으면 그 결과를 따른다
+    return cached.load(std::memory_order_acquire) != 0;
 }
 } // namespace
 
@@ -761,19 +756,17 @@ android_gpu_usage_destroy_timestamp_resources(AndroidVkGpuContext* ctx)
     if (!ctx || ctx->device == VK_NULL_HANDLE)
         return;
 
-    if (ctx->disp.DestroyCommandPool) {
-        for (uint32_t i = 0; i < AndroidVkGpuContext::MAX_FRAMES; ++i) {
-            auto& fr = ctx->frames[i];
-            if (fr.cmd_pool != VK_NULL_HANDLE) {
-                ctx->disp.DestroyCommandPool(ctx->device, fr.cmd_pool, nullptr);
-                fr.cmd_pool = VK_NULL_HANDLE;
-                fr.timestamp_cmds.clear();
-            }
-            fr.query_used = 0;
-            fr.has_queries = false;
-            fr.valid_pairs_mask = 0;
-            fr.frame_serial = std::numeric_limits<uint64_t>::max();
+    for (uint32_t i = 0; i < AndroidVkGpuContext::MAX_FRAMES; ++i) {
+        auto& fr = ctx->frames[i];
+        if (ctx->disp.DestroyCommandPool && fr.cmd_pool != VK_NULL_HANDLE) {
+            ctx->disp.DestroyCommandPool(ctx->device, fr.cmd_pool, nullptr);
         }
+        fr.cmd_pool = VK_NULL_HANDLE;
+        fr.timestamp_cmds.clear();
+        fr.query_used = 0;
+        fr.has_queries = false;
+        fr.valid_pairs_mask = 0;
+        fr.frame_serial = std::numeric_limits<uint64_t>::max();
     }
 
     if (ctx->query_pool != VK_NULL_HANDLE && ctx->disp.DestroyQueryPool) {
@@ -1207,7 +1200,7 @@ android_gpu_usage_create(VkPhysicalDevice            phys_dev,
     // [PATCH] submit2 함수 포인터 정규화: 런타임 분기 제거
     // - KHR만 있는 환경에서도 QueueSubmit2 하나로 호출 가능하게 만든다.
     if (!ctx->disp.QueueSubmit2 && ctx->disp.QueueSubmit2KHR)
-        ctx->disp.QueueSubmit2 = ctx->disp.QueueSubmit2KHR;
+        ctx->disp.QueueSubmit2 = ctx->disp.QueueSubmit2KHR; // normalize once
     
     // 정책: 기본 OFF. MANGOHUD_VKP=1일 때만 Vulkan 경로 활성.
     if (!android_gpu_usage_env_enabled()) {
@@ -1228,9 +1221,8 @@ android_gpu_usage_create(VkPhysicalDevice            phys_dev,
     ctx->last_usage    = 0.0f;
 
     bool has_submit =
-        (disp.QueueSubmit  != nullptr) ||
-        (disp.QueueSubmit2 != nullptr) ||
-        (disp.QueueSubmit2KHR != nullptr);
+        (disp.QueueSubmit != nullptr) ||
+        (ctx->disp.QueueSubmit2 != nullptr);
 
     bool dispatch_ok =
         has_submit &&
@@ -1354,9 +1346,7 @@ android_gpu_usage_queue_submit2(AndroidVkGpuContext* ctx,
     if (!ctx) return VK_ERROR_INITIALIZATION_FAILED;
     AndroidGpuApiGuard guard(ctx);
 
-    PFN_vkQueueSubmit2 fpSubmit2 = ctx->disp.QueueSubmit2
-                                ? ctx->disp.QueueSubmit2
-                                : ctx->disp.QueueSubmit2KHR;
+    PFN_vkQueueSubmit2 fpSubmit2 = ctx->disp.QueueSubmit2;
     if (!fpSubmit2 || !pSubmits || submitCount == 0)
         return fpSubmit2 ? fpSubmit2(queue, submitCount, pSubmits, fence)
                          : VK_ERROR_INITIALIZATION_FAILED;
@@ -1584,7 +1574,6 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
                 }
             }
             else if (st == AndroidGpuReadStatus::Error) {
-                ctx->error_streak++;
                 android_gpu_usage_suspend_locked(ctx,
                     "GetQueryPoolResults ERROR -> suspend (no consume/reuse)",
                     std::chrono::milliseconds(1500));
