@@ -16,6 +16,7 @@
 
 #include <spdlog/spdlog.h>
 
+// ===== Chapter: Internal constants =====
 namespace {
 constexpr uint32_t kSubmitCountHardCap      = 1024u;
 constexpr uint64_t kFlattenHardCap          = 4096u;
@@ -114,26 +115,23 @@ plan_instrumentation(const SubmitT* submits,
     for (uint32_t i = 0; i < n; ++i) {
         const uint32_t base = SubmitTraits<SubmitT>::base_count(submits[i]);
         const bool can =
-            SubmitTraits<SubmitT>::has_cmds(submits[i]) &&
-            (planned < pairs_left);
+            (planned < pairs_left) &&
+            SubmitTraits<SubmitT>::has_cmds(submits[i]);
 
-        if (can) {
-            const uint64_t need64 = uint64_t(base) + 2u; // begin + end
-            if (need64 <= uint64_t(kFlattenHardCap) &&
-                (total_flat + need64) <= uint64_t(kFlattenHardCap)) {
-                inst[i] = 1;
-                counts[i] = static_cast<uint32_t>(need64);
-                total_flat += need64;
-                ++planned;
-                any = true;
-            } else {
-                inst[i] = 0;
-                counts[i] = 0;
-            }
-        } else {
-            inst[i] = 0;
-            counts[i] = 0;
-        }
+        inst[i] = 0;
+        counts[i] = 0;
+        if (!can) continue;
+
+        const uint64_t need64 = uint64_t(base) + 2u; // begin + end
+        if (!need64) continue;
+        if (need64 > uint64_t(kFlattenHardCap)) continue;
+        if (total_flat + need64 > uint64_t(kFlattenHardCap)) continue;
+
+        inst[i] = 1;
+        counts[i] = static_cast<uint32_t>(need64);
+        total_flat += need64;
+        ++planned;
+        any = true;
     }
 
     return any;
@@ -303,7 +301,7 @@ rollback_slot_if_safe_locked(AndroidVkGpuContext* ctx,
     return true;
 }
 
-inline void
+inline void // LOCK: ctx->lock held.
 finalize_submit_locked(AndroidVkGpuContext* ctx,
                        AndroidVkGpuContext::FrameResources& fr,
                        VkResult vr,
@@ -347,6 +345,17 @@ struct TlsScratch {
         uint32_t        q0    = 0;
     };
     std::vector<RecordJob>                         jobs;
+
+    void prepare(uint32_t submitCount) {
+        jobs.clear();
+        inst.reserve(submitCount);
+        counts.reserve(submitCount);
+        wrapped.reserve(submitCount);
+        offsets.reserve(submitCount);
+
+        if (flat.capacity() < static_cast<size_t>(kFlattenHardCap))
+            flat.reserve(static_cast<size_t>(kFlattenHardCap));
+    }
 };
 
 inline void
@@ -405,7 +414,7 @@ android_gpu_usage_reserve_timestamp_pair_locked(AndroidVkGpuContext* ctx,
     return true;
 }
 
-bool
+bool // LOCK: ctx->lock NOT held. (serial_snapshot, q0 must be stable)
 android_gpu_usage_record_timestamp_pair_unlocked(AndroidVkGpuContext* ctx,
                                                  VkCommandBuffer cmd_begin,
                                                  VkCommandBuffer cmd_end,
@@ -530,13 +539,7 @@ android_gpu_usage_queue_submit_impl(AndroidVkGpuContext* ctx,
     
     try {
         static thread_local TlsScratch<SubmitT> tls;
-        tls.jobs.clear();
-        const size_t flat_hard_cap = static_cast<size_t>(kFlattenHardCap);
-        if (tls.flat.capacity() < flat_hard_cap) tls.flat.reserve(flat_hard_cap);
-        tls.inst.reserve(submitCount);
-        tls.counts.reserve(submitCount);
-        tls.wrapped.reserve(submitCount);
-        tls.offsets.reserve(submitCount);
+        tls.prepare(submitCount);
         {
             std::lock_guard<std::mutex> g(ctx->lock);
             do {
