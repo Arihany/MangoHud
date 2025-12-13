@@ -77,9 +77,10 @@ template <> struct SubmitTraits<VkSubmitInfo2> {
         info.sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
         info.pNext         = nullptr;
         info.commandBuffer = buf;
-        info.deviceMask    = (src.commandBufferInfoCount && src.pCommandBufferInfos)
-                           ? src.pCommandBufferInfos[0].deviceMask
-                           : 0x1u;
+        uint32_t m = (src.commandBufferInfoCount && src.pCommandBufferInfos)
+                   ? src.pCommandBufferInfos[0].deviceMask
+                   : 0x1u;
+        info.deviceMask = (m != 0) ? m : 0x1u;
         return info;
     }
     static inline void push_begin(FlatT* out, uint32_t& idx, VkCommandBuffer cmd, const VkSubmitInfo2& src) noexcept {
@@ -630,12 +631,19 @@ android_gpu_usage_queue_submit_impl(AndroidVkGpuContext* ctx,
             std::lock_guard<std::mutex> g3(ctx->lock);
             auto& fr3 = ctx->frames[armed_slot_idx];
             disarm_in_submit_locked(ctx, armed_slot, armed_slot_idx);
-            rollback_slot_if_safe_locked(ctx, fr3, serial_snapshot,
-                                         saved_query_used, saved_has_queries,
-                                         reserved_delta_queries);
-            // 부분 녹화로 cmd buffer state가 꼬였을 수 있으니 slot 커맨드풀 리셋(안전빵)
-            if (ctx->disp.ResetCommandPool && fr3.cmd_pool != VK_NULL_HANDLE) {
-                ctx->disp.ResetCommandPool(ctx->device, fr3.cmd_pool, 0);
+            const bool had_pending_before = saved_has_queries || (fr3.valid_pairs_mask != 0);
+            if (!had_pending_before) {
+                // 이 슬롯에 제출된 timestamp CB가 없을 때만 안전하게 되돌리고 리셋 가능
+                rollback_slot_if_safe_locked(ctx, fr3, serial_snapshot,
+                                             saved_query_used, saved_has_queries,
+                                             reserved_delta_queries);
+                if (ctx->disp.ResetCommandPool && fr3.cmd_pool != VK_NULL_HANDLE) {
+                    ctx->disp.ResetCommandPool(ctx->device, fr3.cmd_pool, 0);
+                }
+            } else {
+                // pending이 있을 수 있으니 reset/rollback 금지: 이번 예약분은 "버림"
+                // (query_used는 유지, valid_mask에는 커밋 안 됐으므로 읽기에서 자동 무시됨)
+                fr3.has_queries = true; // 기존 pending 유지 의미 (보수적으로)
             }
             android_gpu_usage_suspend_locked(ctx, "record timestamp CB failed", kCooldownRecordFail);
             return submit_fn(submitCount, pSubmits, fence);
@@ -652,14 +660,18 @@ android_gpu_usage_queue_submit_impl(AndroidVkGpuContext* ctx,
             auto& fr2 = ctx->frames[armed_slot_idx];
             disarm_in_submit_locked(ctx, armed_slot, armed_slot_idx);
             if (!res.instrumented_executed) {
-                // 원본 submit 성공이더라도 계측 커밋은 하면 안 됨.
-                rollback_slot_if_safe_locked(ctx, fr2, serial_snapshot,
-                                             saved_query_used, saved_has_queries,
-                                             reserved_delta_queries);
-               // 녹화된 CB들이 남아있을 수 있으니 안전빵으로 리셋
-               if (ctx->disp.ResetCommandPool && fr2.cmd_pool != VK_NULL_HANDLE) {
-                   ctx->disp.ResetCommandPool(ctx->device, fr2.cmd_pool, 0);
-               }
+                const bool had_pending_before = saved_has_queries || (fr2.valid_pairs_mask != 0);
+                if (!had_pending_before) {
+                    rollback_slot_if_safe_locked(ctx, fr2, serial_snapshot,
+                                                 saved_query_used, saved_has_queries,
+                                                 reserved_delta_queries);
+                    if (ctx->disp.ResetCommandPool && fr2.cmd_pool != VK_NULL_HANDLE) {
+                        ctx->disp.ResetCommandPool(ctx->device, fr2.cmd_pool, 0);
+                    }
+                } else {
+                    // 기존 pending 보호: rollback/reset 금지, 이번 예약분은 버림
+                    fr2.has_queries = true;
+                }
                 android_gpu_usage_suspend_locked(ctx,
                     "instrumented submit failed, fallback used",
                     kCooldownSubmitFail);
@@ -1629,7 +1641,7 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
                 ctx->window_start = now;
             }
 
-            if (st == AndroidGpuReadStatus::Ready && frame_gpu_ms > 0.0f && read.cpu_ms > 0.0f) {
+            if (st == AndroidGpuReadStatus::Ready && read.cpu_ms > 0.0f) {
                 ctx->acc_cpu_ms_sampled += read.cpu_ms;
                 ctx->acc_frames_sampled += 1;
                 ctx->acc_gpu_ms         += frame_gpu_ms;
