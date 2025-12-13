@@ -119,7 +119,8 @@ plan_instrumentation(const SubmitT* submits,
             any = true;
         } else {
             inst[i] = 0;
-            counts[i] = base;
+            // 비계측 submit은 flat 버퍼가 필요 없다 (wrapped[i]=src로 그대로 사용)
+            counts[i] = 0;
         }
 
         total_flat += (uint64_t)counts[i];
@@ -274,17 +275,6 @@ disarm_in_submit_locked(AndroidVkGpuContext* ctx, bool& armed, uint32_t slot_idx
     armed = false;
 }
 
-static inline void
-rollback_slot_if_safe_locked(AndroidVkGpuContext* ctx,
-                             AndroidVkGpuContext::FrameResources& fr,
-                             uint64_t serial_snapshot,
-                             uint32_t saved_query_used,
-                             bool saved_has_queries,
-                             uint32_t reserved_delta_queries) noexcept
-{
-    // BUGFIX: 이 함수는 bool을 리턴해야 호출부와 의미가 맞는다.
-}
-
 static inline bool
 rollback_slot_if_safe_locked(AndroidVkGpuContext* ctx,
                              AndroidVkGpuContext::FrameResources& fr,
@@ -405,7 +395,7 @@ android_gpu_usage_record_timestamp_pair_unlocked(AndroidVkGpuContext* ctx,
 
     // end CB: BOTTOM timestamp
     if (ctx->disp.BeginCommandBuffer(cmd_end, &bi) != VK_SUCCESS) return false;
-    ctx->disp.CmdWriteTimestamp(cmd_end, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+    ctx->disp.CmdWriteTimestamp(cmd_end, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                 ctx->query_pool, query_first + 1u);
     if (ctx->disp.EndCommandBuffer(cmd_end) != VK_SUCCESS) return false;
 
@@ -446,14 +436,8 @@ build_wrapped_submits_locked(AndroidVkGpuContext* ctx,
 
         if (!android_gpu_usage_reserve_timestamp_pair_locked(ctx, fr, query_first, pair_index,
                                                              cmd_begin, cmd_end)) {
-            const uint32_t base = SubmitTraits<SubmitT>::base_count(src);
-            const auto*    ptr  = SubmitTraits<SubmitT>::cmd_ptr(src);
-            for (uint32_t j = 0; j < base; ++j) dst[idx++] = ptr[j];
-
-            SubmitT dst_submit = src;
-            SubmitTraits<SubmitT>::set_cmds(dst_submit, dst, idx);
-            wrapped[i] = dst_submit;
-            inst[i] = 0;
+            // reserve 실패면 그냥 원본 submit 사용. 복사/재작성 불필요.
+            wrapped[i] = src;
             continue;
         }
 
@@ -550,8 +534,6 @@ android_gpu_usage_queue_submit_impl(AndroidVkGpuContext* ctx,
             const uint32_t n = submitCount;
             tls.wrapped.resize(n);
             tls.offsets.resize(n);
-            tls.counts.resize(n);
-            tls.inst.resize(n);
 
             const uint32_t pairs_left = calc_pairs_left(fr.query_used, fr.query_capacity);
             if (!pairs_left)
@@ -560,7 +542,6 @@ android_gpu_usage_queue_submit_impl(AndroidVkGpuContext* ctx,
             uint64_t total_flat64 = 0;
             const bool any_inst =
                 plan_instrumentation(pSubmits, n,
-                                     fr.query_used, fr.query_capacity,
                                      pairs_left,
                                      tls.inst, tls.counts, total_flat64);
 
