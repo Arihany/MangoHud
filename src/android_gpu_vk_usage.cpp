@@ -267,13 +267,6 @@ android_gpu_usage_begin_frame(AndroidVkGpuContext* ctx,
                               uint32_t frame_idx,
                               uint64_t frame_serial);
 
-static bool
-android_gpu_usage_record_timestamp_pair(AndroidVkGpuContext* ctx,
-                                        AndroidVkGpuContext::FrameResources& fr,
-                                        uint32_t& out_query_first,
-                                        VkCommandBuffer& out_cmd_begin,
-                                        VkCommandBuffer& out_cmd_end);
-// (삭제) 위 선언은 더 이상 사용되지 않는다. reserve+record_unlocked로 완전 전환됨.
 // ====================== submit commit/rollback helpers ======================
 namespace {
 static inline void
@@ -507,7 +500,6 @@ android_gpu_usage_queue_submit_impl(AndroidVkGpuContext* ctx,
     uint32_t armed_slot_idx = 0;
 
     const SubmitT* submit_ptr = pSubmits;
-    uint32_t       submit_n   = submitCount;
     
     try {
         static thread_local TlsScratch<SubmitT> tls;
@@ -536,6 +528,11 @@ android_gpu_usage_queue_submit_impl(AndroidVkGpuContext* ctx,
             fr_ptr = &ctx->frames[curr_idx];
             auto& fr = *fr_ptr;
 
+            // 2-phase 구간 동안 다른 wrapper가 같은 slot을 더 예약하면 rollback이 깨진다.
+            // 안전빵: 누군가 out-of-lock 작업 중이면 이번 submit은 계측 포기(패스스루).
+            if (fr.in_submit.load(std::memory_order_acquire) != 0)
+                goto pass_through_locked;
+            
             if (!android_gpu_usage_begin_frame(ctx, curr_idx, frame_serial))
                 goto pass_through_locked;
 
@@ -587,7 +584,6 @@ android_gpu_usage_queue_submit_impl(AndroidVkGpuContext* ctx,
             fr.in_submit.fetch_add(1, std::memory_order_acq_rel);
 
             submit_ptr = tls.wrapped.data();
-            submit_n   = submitCount;
 
             goto wrapped_ready_locked;
 
@@ -642,7 +638,7 @@ android_gpu_usage_queue_submit_impl(AndroidVkGpuContext* ctx,
         }
 
         auto res = submit_with_fallback(submit_fn,
-                                        submit_n, submit_ptr,
+                                        submitCount, submit_ptr,
                                         submitCount, pSubmits,
                                         fence);
         VkResult vr = res.vr;
@@ -814,8 +810,6 @@ android_gpu_usage_init_timestamp_resources(AndroidVkGpuContext* ctx,
         return true;
     }
 
-    ctx->queue_family_index = queue_family_index;
-
     uint32_t qf_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(ctx->phys_dev, &qf_count, nullptr);
     if (queue_family_index >= qf_count) {
@@ -927,6 +921,8 @@ android_gpu_usage_init_timestamp_resources(AndroidVkGpuContext* ctx,
 
         fr.timestamp_cmds.assign(tmp.begin(), tmp.end());
     }
+
+    ctx->queue_family_index = queue_family_index; // init 성공 후에만 확정
 
     SPDLOG_INFO(
         "Android GPU usage: timestamp resources initialized (qf_index={} qpool={} slots={} qpf={})",
@@ -1450,12 +1446,6 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
         cs.ms     = frame_cpu_ms;
     }
 
-    auto cpu_ms_for_serial = [&](uint64_t serial) -> float {
-        std::lock_guard<std::mutex> mg(ctx->metrics_mtx);
-        const auto& cs2 = ctx->cpu_ring[serial & (AndroidVkGpuContext::CPU_RING - 1u)];
-        return (cs2.serial == serial) ? cs2.ms : 0.0f;
-    };
-
     try {
         // --------- (A) 짧은 락: CPU dt 갱신 + 후보 슬롯 선택 + init ---------
         {
@@ -1508,8 +1498,6 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
                             read.q_start  = fr.query_start;
                             read.q_count  = fr.query_used;
                             read.valid_mask = fr.valid_pairs_mask;
-            
-                            read.cpu_ms = cpu_ms_for_serial(serial);
                             break;
                         }
                     }
@@ -1535,8 +1523,6 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
                         read.q_start  = fr.query_start;
                         read.q_count  = fr.query_used;
                         read.valid_mask = fr.valid_pairs_mask;
-            
-                        read.cpu_ms = cpu_ms_for_serial(read.serial);
                     } else {
                         // pending이 없으면 회복
                         ctx->mode.store(BackendMode::Active, std::memory_order_relaxed);
@@ -1548,6 +1534,13 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
             }
         }
 
+        // ctx->lock 잡은 상태에서 metrics_mtx를 다시 잡으면 교착 가능.
+        // (metrics->lock vs lock->metrics) 순서 뒤집힘을 제거: 여기서 cpu_ms 채움.
+        if (read.have) {
+            std::lock_guard<std::mutex> mg(ctx->metrics_mtx);
+            const auto& cs2 = ctx->cpu_ring[read.serial & (AndroidVkGpuContext::CPU_RING - 1u)];
+            read.cpu_ms = (cs2.serial == read.serial) ? cs2.ms : 0.0f;
+        }
         float frame_gpu_ms = 0.0f;
         AndroidGpuReadStatus st = AndroidGpuReadStatus::NotReady;
         const bool attempted_read = read.have;
