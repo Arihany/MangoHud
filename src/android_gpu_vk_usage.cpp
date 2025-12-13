@@ -2,6 +2,7 @@
 #include "android_gpu_vk_usage.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -363,7 +364,10 @@ rollback_and_maybe_reset_locked(AndroidVkGpuContext* ctx,
     // pending이 없던 슬롯이면 안전할 때만 풀 리셋해서 CB 재사용 상태를 깔끔히 만든다.
     if (!had_pending_before) {
         if (rolled && ctx->disp.ResetCommandPool && fr.cmd_pool != VK_NULL_HANDLE) {
-            ctx->disp.ResetCommandPool(ctx->device, fr.cmd_pool, 0);
+            VkResult rr = ctx->disp.ResetCommandPool(ctx->device, fr.cmd_pool, 0);
+            if (rr != VK_SUCCESS) {
+                android_gpu_usage_suspend_locked(ctx, "ResetCommandPool failed", kCooldownRecordFail);
+            }
         }
     } else {
         // pending이 있던 슬롯은 has_queries만 일관되게 유지
@@ -924,9 +928,9 @@ android_gpu_usage_init_timestamp_resources(AndroidVkGpuContext* ctx,
         ai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         ai.commandPool        = fr.cmd_pool;
         ai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        ai.commandBufferCount = kMaxPairsPerSampledFrame * 2u;
+        std::array<VkCommandBuffer, kMaxPairsPerSampledFrame * 2u> tmp{};
+        ai.commandBufferCount = static_cast<uint32_t>(tmp.size());
 
-        std::vector<VkCommandBuffer> tmp(ai.commandBufferCount, VK_NULL_HANDLE);
         if (ctx->disp.AllocateCommandBuffers(ctx->device, &ai, tmp.data()) != VK_SUCCESS) {
             SPDLOG_WARN("Android GPU usage: prealloc AllocateCommandBuffers failed at slot {} -> disable", i);
             android_gpu_usage_destroy_timestamp_resources(ctx);
@@ -985,7 +989,11 @@ android_gpu_usage_begin_frame(AndroidVkGpuContext* ctx,
     // timestamp CB가 하나라도 있으면 커맨드풀 리셋
     if (ctx->disp.ResetCommandPool && fr.cmd_pool != VK_NULL_HANDLE &&
         !fr.timestamp_cmds.empty()) {
-        ctx->disp.ResetCommandPool(ctx->device, fr.cmd_pool, 0);
+        VkResult rr = ctx->disp.ResetCommandPool(ctx->device, fr.cmd_pool, 0);
+        if (rr != VK_SUCCESS) {
+            android_gpu_usage_suspend_locked(ctx, "ResetCommandPool failed", kCooldownRecordFail);
+            return false;
+        }
     }
 
     return true;
@@ -1019,10 +1027,9 @@ android_gpu_usage_query_range_gpu_ms(AndroidVkGpuContext* ctx,
     if (query_count > AndroidVkGpuContext::MAX_QUERIES_PER_FRAME)
         return AndroidGpuReadStatus::Error;
 
-    thread_local std::vector<uint64_t> scratch;
+    // query_count <= MAX_QUERIES_PER_FRAME (<=32) 이므로 필요한 u64는 최대 64개.
+    thread_local std::array<uint64_t, AndroidVkGpuContext::MAX_QUERIES_PER_FRAME * 2u> scratch{};
     const uint32_t needed_u64 = query_count * 2u;
-    if (scratch.size() < needed_u64)
-        scratch.resize(needed_u64);
 
     VkResult r = ctx->disp.GetQueryPoolResults(
         ctx->device,
@@ -1070,9 +1077,8 @@ android_gpu_usage_query_range_gpu_ms(AndroidVkGpuContext* ctx,
         uint64_t s_m;   // masked start
         uint64_t dur;   // duration in ticks (mod wrap diff)
     };
-    thread_local std::vector<Seg> segs;
-    segs.clear();
-    segs.reserve(pair_count);
+    std::array<Seg, kMaxPairsPerSampledFrame> segs{};
+    uint32_t seg_n = 0;
 
     for (uint32_t i = 0; i < pair_count; ++i) {
         if (((valid_pairs_mask >> i) & 1ULL) == 0ULL)
@@ -1094,76 +1100,71 @@ android_gpu_usage_query_range_gpu_ms(AndroidVkGpuContext* ctx,
             // 어노말리 방어: 프레임 내 wrap 다중 발생 같은 "망한 값" 컷
             if (dur > (wrap >> 1)) continue;
         }
-        segs.push_back({ s_m, dur });
+        if (seg_n < segs.size())
+            segs[seg_n++] = { s_m, dur };
     }
 
-    if (segs.empty()) {
+    if (seg_n == 0) {
         *out_gpu_ms = 0.0f;
         return AndroidGpuReadStatus::Ready;
     }
 
     struct Interval { uint64_t s; uint64_t e; };
-    thread_local std::vector<Interval> iv;
-    iv.clear();
-    iv.reserve(segs.size());
+    std::array<Interval, kMaxPairsPerSampledFrame> iv{};
+    uint32_t iv_n = 0;
 
     uint64_t min_start_u = std::numeric_limits<uint64_t>::max();
     uint64_t max_end_u   = 0;
 
-    if (!has_wrap || segs.size() == 1) {
+    if (!has_wrap || seg_n == 1) {
         // wrap이 없거나 interval이 1개면 기존처럼 단순 처리
-        for (const auto& seg : segs) {
+        for (uint32_t si = 0; si < seg_n; ++si) {
+            const auto& seg = segs[si];
             const uint64_t s_u = seg.s_m;
             const uint64_t e_u = s_u + seg.dur;
             if (e_u <= s_u) continue;
             if (s_u < min_start_u) min_start_u = s_u;
             if (e_u > max_end_u)   max_end_u   = e_u;
-            iv.push_back({ s_u, e_u });
+            iv[iv_n++] = { s_u, e_u };
         }
     } else {
-        // (핵심) start들을 원형에서 한 축으로 unwrap
-        // - start를 정렬하고, 가장 큰 gap을 wrap 경계로 선택
-        // - 그 경계 다음 값을 pivot으로 잡고, delta = (s - pivot) & mask 로 한 줄에 펼친다.
-        thread_local std::vector<uint64_t> starts;
-        starts.clear();
-        starts.reserve(segs.size());
-        for (const auto& seg : segs) starts.push_back(seg.s_m);
-        std::sort(starts.begin(), starts.end());
+        std::array<uint64_t, kMaxPairsPerSampledFrame> starts{};
+        for (uint32_t si = 0; si < seg_n; ++si) starts[si] = segs[si].s_m;
+        std::sort(starts.begin(), starts.begin() + seg_n);
 
         uint64_t max_gap = 0;
         size_t   max_i   = 0;
-        for (size_t i = 0; i + 1 < starts.size(); ++i) {
+        for (size_t i = 0; i + 1 < seg_n; ++i) {
             const uint64_t gap = starts[i + 1] - starts[i];
             if (gap > max_gap) { max_gap = gap; max_i = i; }
         }
         // 마지막->처음 wrap gap
-        const uint64_t last_gap = (starts[0] + wrap) - starts.back();
-        if (last_gap > max_gap) { max_gap = last_gap; max_i = starts.size() - 1; }
+        const uint64_t last_gap = (starts[0] + wrap) - starts[seg_n - 1];
+        if (last_gap > max_gap) { max_gap = last_gap; max_i = seg_n - 1; }
 
-        uint64_t pivot = starts[(max_i + 1) % starts.size()];
+        uint64_t pivot = starts[(max_i + 1) % seg_n];
         const uint64_t span = wrap - max_gap; // unwrap 후 데이터가 차지하는 길이
-        // span이 wrap에 너무 가까우면(데이터가 원형 전체에 퍼짐) 경계 선택이 의미 없다.
-        // 이 경우는 어차피 신뢰도 박살 환경이므로, pivot 고정을 통해 폭발만 막는다.
         const uint64_t thr = wrap - (wrap >> 2); // wrap*3/4 (overflow-free)
         if (span > thr) pivot = starts[0];
 
-        for (const auto& seg : segs) {
+        for (uint32_t si = 0; si < seg_n; ++si) {
+            const auto& seg = segs[si];
             const uint64_t delta = (seg.s_m - pivot) & mask;
             const uint64_t s_u   = pivot + delta;
             const uint64_t e_u   = s_u + seg.dur;
             if (e_u <= s_u) continue;
             if (s_u < min_start_u) min_start_u = s_u;
             if (e_u > max_end_u)   max_end_u   = e_u;
-            iv.push_back({ s_u, e_u });
+            iv[iv_n++] = { s_u, e_u };
         }
     }
 
-    if (iv.empty()) {
+    if (iv_n == 0) {
         *out_gpu_ms = 0.0f;
         return AndroidGpuReadStatus::Ready;
     }
 
-    std::sort(iv.begin(), iv.end(),
+    std::sort(iv.begin(), iv.begin() + iv_n,
               [](const Interval& a, const Interval& b) {
                   if (a.s != b.s) return a.s < b.s;
                   return a.e < b.e;
@@ -1172,7 +1173,7 @@ android_gpu_usage_query_range_gpu_ms(AndroidVkGpuContext* ctx,
     uint64_t busy_ticks = 0;
     uint64_t cur_s = iv[0].s;
     uint64_t cur_e = iv[0].e;
-    for (size_t k = 1; k < iv.size(); ++k) {
+    for (uint32_t k = 1; k < iv_n; ++k) {
         const uint64_t s = iv[k].s;
         const uint64_t e = iv[k].e;
         if (s <= cur_e) {
@@ -1629,9 +1630,10 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
                         }
                     }
                 } else {
-                    // 슬롯 상태가 바뀐 레이스: 이번 샘플 무효
-                    frame_gpu_ms = 0.0f;
-                    st = AndroidGpuReadStatus::NotReady;
+                    // 슬롯 상태가 바뀐 레이스: "GPU NOT_READY"가 아니다.
+                    // streak/suspend에 반영하면 억울하게 멈춘다. 그냥 샘플 버리고 진행.
+                    bump_frame_index();
+                    return;
                 }
             }
             else if (st == AndroidGpuReadStatus::Error) {
