@@ -31,6 +31,7 @@ constexpr auto kCooldownStaleSlot    = std::chrono::milliseconds(1000);
 constexpr auto kCooldownRecordFail   = std::chrono::milliseconds(1500);
 constexpr auto kSuspendedProbeEvery  = std::chrono::milliseconds(250);
 constexpr uint32_t kNotReadyLimit    = 120;
+constexpr auto     kNotReadyMaxTime = std::chrono::milliseconds(2500);
 
 static inline uint32_t
 calc_pairs_left(uint32_t query_used, uint32_t query_capacity) noexcept
@@ -183,6 +184,7 @@ struct AndroidVkGpuContext {
     std::chrono::steady_clock::time_point suspend_until{};
     // NotReady 연속/오류 연속 카운트 (복구 정책용)
     uint32_t notready_streak = 0;
+    std::chrono::steady_clock::time_point notready_since{};
 
     // Suspended에서 too-hot loop 방지용: 마지막 probe 시각
     std::chrono::steady_clock::time_point last_probe{};
@@ -220,8 +222,6 @@ struct AndroidVkGpuContext {
     uint32_t                                        acc_frames_sampled = 0;
     double                                          acc_gpu_ms     = 0.0;
     uint32_t                                        acc_gpu_samples= 0;
-    float                                           smooth_gpu_ms = 0.0f;
-    float                                           smooth_usage  = 0.0f;
     float                                           last_gpu_ms   = 0.0f;
     float                                           last_usage    = 0.0f;
     bool                                            have_metrics  = false;
@@ -745,6 +745,7 @@ android_gpu_usage_suspend_locked(AndroidVkGpuContext* ctx,
     ctx->suspend_until = now + cooldown;
     ctx->last_probe = {};              // 재진입 probe 폭주 방지용
     ctx->notready_streak = 0;          // 재개 직후 즉시 재정지 방지
+    ctx->notready_since = {};          // 시간 기반 NotReady도 리셋
     ctx->read_serial = ctx->frame_index.load(std::memory_order_relaxed);
 
     SPDLOG_WARN("Android GPU usage: SUSPEND ({}) -> stop instrumentation, keep last metrics", reason);
@@ -1521,8 +1522,10 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
 
                             // submit/record 진행 중 슬롯은 읽지 않는다 (NOT_READY 스팸 + 오판 suspend 방지)
                             if (fr.in_submit.load(std::memory_order_acquire) != 0) {
-                                ctx->read_serial++;
-                                continue;
+                                // 계측 submit/record가 아직 진행 중이면
+                                // read_serial을 올려서 "영구 스킵"하면 안 된다.
+                                // 다음 present에서 같은 serial을 다시 시도하게 둔다.
+                                break;
                             }
                             if (!(fr.frame_serial == serial && fr.has_queries &&
                                   fr.valid_pairs_mask != 0 && fr.query_used >= 2)) {
@@ -1616,6 +1619,7 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
             
                     // Ready면 결과가 0ms여도 "드레인 성공"이다.
                     ctx->notready_streak = 0;
+                    ctx->notready_since = {};
             
                     // Suspended probe 드레인 중이면 pending 다 비었을 때 resume
                     if (ctx->mode.load(std::memory_order_relaxed) == BackendMode::Suspended) {
@@ -1642,13 +1646,23 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
                     kCooldownSubmitFail);
                 frame_gpu_ms = 0.0f;
             }
-            else { // NotReady 또는 (Ready but frame_gpu_ms==0)
+            else { // NotReady
+                if (ctx->notready_streak == 0)
+                    ctx->notready_since = now;
+
                 ctx->notready_streak++;
-                if (ctx->notready_streak >= kNotReadyLimit) {
+
+                const bool too_many_frames = (ctx->notready_streak >= kNotReadyLimit);
+                const bool too_much_time =
+                    (ctx->notready_since.time_since_epoch().count() != 0) &&
+                    ((now - ctx->notready_since) >= kNotReadyMaxTime);
+
+                if (too_many_frames || too_much_time) {
                     android_gpu_usage_suspend_locked(ctx,
                         "GetQueryPoolResults NOT_READY too long",
                         kCooldownNotReadyLong);
                     ctx->notready_streak = 0;
+                    ctx->notready_since = {};
                 }
                 frame_gpu_ms = 0.0f;
             }
@@ -1686,14 +1700,12 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
 
                     const float alpha = 0.5f;
                     if (!ctx->have_metrics) {
-                        ctx->smooth_usage  = usage;
-                        ctx->smooth_gpu_ms = static_cast<float>(avg_gpu_ms);
+                        ctx->last_usage  = usage;
+                        ctx->last_gpu_ms = static_cast<float>(avg_gpu_ms);
                     } else {
-                        ctx->smooth_usage  = ctx->smooth_usage * (1.0f - alpha) + usage * alpha;
-                        ctx->smooth_gpu_ms = ctx->smooth_gpu_ms * (1.0f - alpha) + static_cast<float>(avg_gpu_ms) * alpha;
+                        ctx->last_usage  = ctx->last_usage  * (1.0f - alpha) + usage * alpha;
+                        ctx->last_gpu_ms = ctx->last_gpu_ms * (1.0f - alpha) + static_cast<float>(avg_gpu_ms) * alpha;
                     }
-                    ctx->last_usage   = ctx->smooth_usage;
-                    ctx->last_gpu_ms  = ctx->smooth_gpu_ms;
                     ctx->have_metrics = true;
                 }
 
