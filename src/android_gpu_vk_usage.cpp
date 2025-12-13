@@ -132,18 +132,25 @@ plan_instrumentation(const SubmitT* submits,
 }
 
 template <typename SubmitFn, typename SubmitT>
-static inline VkResult
+struct SubmitAttempt {
+    VkResult vr;
+    bool     instrumented_executed; // 계측 삽입 submit이 실제로 성공 실행됐는가
+};
+
+template <typename SubmitFn, typename SubmitT>
+static inline SubmitAttempt
 submit_with_fallback(SubmitFn&& submit_fn,
                      uint32_t n_inst, const SubmitT* s_inst,
                      uint32_t n_orig, const SubmitT* s_orig,
                      VkFence fence) noexcept
 {
     VkResult vr = submit_fn(n_inst, s_inst, fence);
-    if (vr != VK_SUCCESS && vr != VK_ERROR_DEVICE_LOST) {
-        VkResult vr2 = submit_fn(n_orig, s_orig, fence);
-        if (vr2 == VK_SUCCESS) vr = vr2;
-    }
-    return vr;
+    if (vr == VK_SUCCESS) return { vr, true };
+    if (vr == VK_ERROR_DEVICE_LOST) return { vr, true };
+
+    VkResult vr2 = submit_fn(n_orig, s_orig, fence);
+    if (vr2 == VK_SUCCESS) return { vr2, false }; // 게임은 성공, 계측은 실패
+    return { vr2, false }; // 둘 다 실패면 원본 에러를 리턴(어차피 게임도 실패)
 }
 } // namespace
 
@@ -634,19 +641,30 @@ android_gpu_usage_queue_submit_impl(AndroidVkGpuContext* ctx,
             return submit_fn(submitCount, pSubmits, fence);
         }
 
-        VkResult vr = submit_with_fallback(submit_fn,
-                                           submit_n, submit_ptr,
-                                           submitCount, pSubmits,
-                                           fence);
+        auto res = submit_with_fallback(submit_fn,
+                                        submit_n, submit_ptr,
+                                        submitCount, pSubmits,
+                                        fence);
+        VkResult vr = res.vr;
 
         {
             std::lock_guard<std::mutex> g2(ctx->lock);
             auto& fr2 = ctx->frames[armed_slot_idx];
             disarm_in_submit_locked(ctx, armed_slot, armed_slot_idx);
-            finalize_submit_locked(ctx, fr2, vr,
-                                   serial_snapshot, saved_query_used, saved_has_queries,
-                                   reserved_delta_queries, new_valid_mask,
-                                   fail_reason);
+            if (!res.instrumented_executed) {
+                // 원본 submit 성공이더라도 계측 커밋은 하면 안 됨.
+                rollback_slot_if_safe_locked(ctx, fr2, serial_snapshot,
+                                             saved_query_used, saved_has_queries,
+                                             reserved_delta_queries);
+                android_gpu_usage_suspend_locked(ctx,
+                    "instrumented submit failed, fallback used",
+                    kCooldownSubmitFail);
+            } else {
+                finalize_submit_locked(ctx, fr2, vr,
+                                       serial_snapshot, saved_query_used, saved_has_queries,
+                                       reserved_delta_queries, new_valid_mask,
+                                       fail_reason);
+            }
         }
         return vr;
     } catch (const std::exception& e) {
@@ -1021,7 +1039,8 @@ android_gpu_usage_query_range_gpu_ms(AndroidVkGpuContext* ctx,
         uint64_t s;
         uint64_t e;
     };
-    std::vector<Interval> iv;
+    thread_local std::vector<Interval> iv;
+    iv.clear();
     iv.reserve(pair_count);
 
     uint64_t min_start_ts = std::numeric_limits<uint64_t>::max();
@@ -1047,8 +1066,10 @@ android_gpu_usage_query_range_gpu_ms(AndroidVkGpuContext* ctx,
         iv.push_back({ start_ts, end_ts });
     }
 
-    if (iv.empty())
-        return AndroidGpuReadStatus::Error;
+    if (iv.empty()) {
+        *out_gpu_ms = 0.0f;
+        return AndroidGpuReadStatus::Ready;
+    }
 
     std::sort(iv.begin(), iv.end(),
               [](const Interval& a, const Interval& b) {
@@ -1090,10 +1111,10 @@ android_gpu_usage_query_range_gpu_ms(AndroidVkGpuContext* ctx,
         }
     }
 
-    if (!(busy_ms > 0.0) || !std::isfinite(busy_ms))
+    if (!std::isfinite(busy_ms) || busy_ms < 0.0)
         return AndroidGpuReadStatus::Error;
 
-    *out_gpu_ms = (float)busy_ms;
+    *out_gpu_ms = (float)busy_ms; // 0도 허용
     return AndroidGpuReadStatus::Ready;
 }
 
@@ -1213,7 +1234,6 @@ android_gpu_usage_destroy(AndroidVkGpuContext* ctx)
         ctx->ts_supported.store(false, std::memory_order_relaxed);
     }
     { std::lock_guard<std::mutex> mg(ctx->metrics_mtx); ctx->have_metrics = false; }
-    // 누수 금지: 여기서 실제로 정리한다. (OOM 방지)
     android_gpu_usage_destroy_timestamp_resources(ctx);
     SPDLOG_INFO("Android GPU usage: destroy -> Vulkan resources destroyed");
 
@@ -1344,29 +1364,34 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
         uint64_t valid_mask = 0;
         float    cpu_ms     = 0.0f;
     } read{};
-
+    // (A) metrics lock: CPU dt + ring 기록 (submit과 분리)
     float frame_cpu_ms = 16.0f;
+    const uint64_t cur_serial = ctx->frame_index.load(std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> mg(ctx->metrics_mtx);
+        if (ctx->last_present.time_since_epoch().count() != 0) {
+            const double dt_ms =
+                std::chrono::duration<double, std::milli>(now - ctx->last_present).count();
+            frame_cpu_ms = static_cast<float>(dt_ms > 0.001 ? dt_ms : 0.001);
+        }
+        ctx->last_present = now;
+
+        auto& cs = ctx->cpu_ring[cur_serial & (AndroidVkGpuContext::CPU_RING - 1u)];
+        cs.serial = cur_serial;
+        cs.ms     = frame_cpu_ms;
+    }
+
+    auto cpu_ms_for_serial = [&](uint64_t serial) -> float {
+        std::lock_guard<std::mutex> mg(ctx->metrics_mtx);
+        const auto& cs2 = ctx->cpu_ring[serial & (AndroidVkGpuContext::CPU_RING - 1u)];
+        return (cs2.serial == serial) ? cs2.ms : 0.0f;
+    };
 
     try {
         // --------- (A) 짧은 락: CPU dt 갱신 + 후보 슬롯 선택 + init ---------
         {
             std::lock_guard<std::mutex> g(ctx->lock);
             if (ctx->destroying.load(std::memory_order_relaxed)) return;
-
-            // CPU 기준 프레임 시간
-            if (ctx->last_present.time_since_epoch().count() != 0) {
-                const double dt_ms =
-                    std::chrono::duration<double, std::milli>(now - ctx->last_present).count();
-                // 0 나눗셈만 막자. 0.001ms(=1us)면 충분.
-                frame_cpu_ms = static_cast<float>(dt_ms > 0.001 ? dt_ms : 0.001);
-            }
-            ctx->last_present = now;
-
-            // [PATCH] CPU dt를 "현재 serial" 슬롯에 저장해서, 나중에 GPU serial이랑 매칭한다.
-            const uint64_t cur_serial = ctx->frame_index.load(std::memory_order_relaxed);
-            auto& cs = ctx->cpu_ring[cur_serial & (AndroidVkGpuContext::CPU_RING - 1u)];
-            cs.serial = cur_serial;
-            cs.ms     = frame_cpu_ms;
 
             // --- Suspended 상태: 주기적으로 pending을 "안전하게" drain(=읽고 consume)해서 회복한다.
             const BackendMode mode = ctx->mode.load(std::memory_order_relaxed);
@@ -1415,8 +1440,7 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
                             read.q_count  = fr.query_used;
                             read.valid_mask = fr.valid_pairs_mask;
             
-                            const auto& cs2 = ctx->cpu_ring[serial & (AndroidVkGpuContext::CPU_RING - 1u)];
-                            read.cpu_ms = (cs2.serial == serial) ? cs2.ms : 0.0f;
+                            read.cpu_ms = cpu_ms_for_serial(serial);
                             break;
                         }
                     }
@@ -1443,8 +1467,7 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
                         read.q_count  = fr.query_used;
                         read.valid_mask = fr.valid_pairs_mask;
             
-                        const auto& cs2 = ctx->cpu_ring[read.serial & (AndroidVkGpuContext::CPU_RING - 1u)];
-                        read.cpu_ms = (cs2.serial == read.serial) ? cs2.ms : 0.0f;
+                        read.cpu_ms = cpu_ms_for_serial(read.serial);
                     } else {
                         // pending이 없으면 회복
                         ctx->mode.store(BackendMode::Active, std::memory_order_relaxed);
@@ -1463,7 +1486,7 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
             st = android_gpu_usage_query_range_gpu_ms(ctx, read.q_start, read.q_count, read.valid_mask, &frame_gpu_ms);
         }
 
-        // --------- (C) 짧은 락: 슬롯 소비(Ready일 때만) + smoothing 누적 ---------
+        // --------- (C) state lock: 슬롯 소비/서스펜드/리드시리얼/프레임인덱스 ---------
         {
             std::lock_guard<std::mutex> g(ctx->lock);
 
@@ -1473,7 +1496,7 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
                 SPDLOG_WARN("Android GPU usage: DEVICE_LOST on GetQueryPoolResults -> disable backend (no destroy)");
                 frame_gpu_ms = 0.0f;
             }
-            else if (st == AndroidGpuReadStatus::Ready && frame_gpu_ms > 0.0f) {
+            else if (st == AndroidGpuReadStatus::Ready) {
                 auto& fr = ctx->frames[read.slot_idx];
                 if (fr.frame_serial == read.serial && fr.has_queries && fr.query_used == read.q_count) {
                     android_gpu_usage_consume_slot(fr);
@@ -1484,7 +1507,7 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
                         ctx->read_serial = std::max<uint64_t>(ctx->read_serial, read.serial + 1);
                     }
             
-                    // 성공했으면 streak 리셋
+                    // Ready면 결과가 0ms여도 "드레인 성공"이다.
                     ctx->notready_streak = 0;
                     ctx->error_streak = 0;
             
@@ -1524,8 +1547,12 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
                 }
                 frame_gpu_ms = 0.0f;
             }
+            ctx->frame_index++;
+        }
 
-            // 500ms 윈도우 누적
+        // --------- (D) metrics lock: smoothing/last metrics (submit과 분리) ---------
+        {
+            std::lock_guard<std::mutex> mg(ctx->metrics_mtx);
             if (ctx->window_start.time_since_epoch().count() == 0) {
                 ctx->window_start = now;
             }
@@ -1533,65 +1560,45 @@ android_gpu_usage_on_present(AndroidVkGpuContext*    ctx,
             if (st == AndroidGpuReadStatus::Ready && frame_gpu_ms > 0.0f && read.cpu_ms > 0.0f) {
                 ctx->acc_cpu_ms_sampled += read.cpu_ms;
                 ctx->acc_frames_sampled += 1;
-            
                 ctx->acc_gpu_ms         += frame_gpu_ms;
                 ctx->acc_gpu_samples    += 1;
-            } else {
-                // NotReady/Error면 아무것도 누적 안 함 (CPU만 쌓아두면 bias 생김)
             }
 
             constexpr auto WINDOW = std::chrono::milliseconds(500);
-            const auto elapsed = now - ctx->window_start;
-            
-            if (elapsed >= WINDOW) {
-            
-                // GPU 샘플이 한 번도 없으면 이번 윈도우는 "업데이트 스킵"
-                // (0으로 덮어써서 튀는 것보다 이전 값 유지가 실전에서 덜 빡침)
+            if ((now - ctx->window_start) >= WINDOW) {
                 if (ctx->acc_gpu_samples > 0 && ctx->acc_frames_sampled > 0 && ctx->acc_cpu_ms_sampled > 0.0) {
-            
                     const double avg_cpu_ms =
                         ctx->acc_cpu_ms_sampled / static_cast<double>(ctx->acc_frames_sampled);
-            
                     const double avg_gpu_ms =
                         ctx->acc_gpu_ms / static_cast<double>(ctx->acc_gpu_samples);
-            
+
                     float usage = 0.0f;
                     if (avg_cpu_ms > 0.0 && avg_gpu_ms > 0.0)
                         usage = static_cast<float>((avg_gpu_ms / avg_cpu_ms) * 100.0);
-            
                     if (!std::isfinite(usage)) usage = 0.0f;
                     if (usage < 0.0f) usage = 0.0f;
                     if (usage > 100.0f) usage = 100.0f;
-            
+
                     const float alpha = 0.5f;
-            
                     if (!ctx->have_metrics) {
                         ctx->smooth_usage  = usage;
                         ctx->smooth_gpu_ms = static_cast<float>(avg_gpu_ms);
                     } else {
                         ctx->smooth_usage  = ctx->smooth_usage * (1.0f - alpha) + usage * alpha;
-                        ctx->smooth_gpu_ms = ctx->smooth_gpu_ms * (1.0f - alpha) +
-                                             static_cast<float>(avg_gpu_ms) * alpha;
+                        ctx->smooth_gpu_ms = ctx->smooth_gpu_ms * (1.0f - alpha) + static_cast<float>(avg_gpu_ms) * alpha;
                     }
-            
                     ctx->last_usage   = ctx->smooth_usage;
                     ctx->last_gpu_ms  = ctx->smooth_gpu_ms;
                     ctx->have_metrics = true;
                 }
-            
-                // 윈도우 리셋 (업데이트를 했든 말든 시간 창은 굴러야 함)
+
                 ctx->acc_cpu_ms_sampled = 0.0;
                 ctx->acc_frames_sampled = 0;
-            
                 ctx->acc_gpu_ms      = 0.0;
                 ctx->acc_gpu_samples = 0;
-            
                 ctx->window_start = now;
             }
-
-            // 다음 프레임 serial
-            ctx->frame_index++;
-        }
+        }        
     } catch (const std::exception& e) {
         SPDLOG_WARN("Android GPU usage: on_present exception: {}", e.what());
     } catch (...) {
@@ -1616,7 +1623,7 @@ android_gpu_usage_get_metrics(AndroidVkGpuContext* ctx,
     if (ctx->destroying.load(std::memory_order_acquire))
         return false;
 
-    std::lock_guard<std::mutex> g(ctx->lock);
+    std::lock_guard<std::mutex> mg(ctx->metrics_mtx);
 
     if (!ctx->have_metrics)
         return false;
