@@ -91,7 +91,7 @@ struct AndroidVkGpuDispatch {
     PFN_vkCreateQueryPool         CreateQueryPool;
     PFN_vkDestroyQueryPool        DestroyQueryPool;
     PFN_vkGetQueryPoolResults     GetQueryPoolResults;
-
+    PFN_vkDeviceWaitIdle          DeviceWaitIdle;
     // 커맨드 풀 / 버퍼
     PFN_vkCreateCommandPool       CreateCommandPool;
     PFN_vkDestroyCommandPool      DestroyCommandPool;
